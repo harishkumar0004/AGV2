@@ -223,6 +223,17 @@ def wrap_angle_deg(angle):
     return angle
 
 
+def fold_axis_angle_deg(angle):
+    angle = wrap_angle_deg(angle)
+
+    if angle > 90.0:
+        angle -= 180.0
+    elif angle < -90.0:
+        angle += 180.0
+
+    return angle
+
+
 def compute_tag_measurement(det, frame_width, tag_size_cm):
     parts = get_detection_parts(det)
     if parts is None:
@@ -240,7 +251,7 @@ def compute_tag_measurement(det, frame_width, tag_size_cm):
 
     tag_x_axis = right_mid - left_mid
     raw_yaw_image_deg = math.degrees(math.atan2(tag_x_axis[1], tag_x_axis[0]))
-    yaw_error_deg = wrap_angle_deg(raw_yaw_image_deg + 180.0)
+    yaw_error_deg = fold_axis_angle_deg(raw_yaw_image_deg)
 
     tag_width_px = 0.5 * (side_length(lb, rb) + side_length(lt, rt))
     pixels_per_cm = tag_width_px / tag_size_cm if tag_size_cm > 0.0 else 0.0
@@ -483,7 +494,7 @@ def main():
     print("Enter commands in the terminal, or press keys in the camera window.")
     print("Sign convention:")
     print("  lateral_offset_px/cm positive = tag appears right of image center")
-    print("  yaw_error_deg is normalized so aligned tags are near 0 deg")
+    print("  yaw_error_deg is folded to +/-90 deg, so aligned tags are near 0 deg")
     print("  raw_yaw_image_deg keeps the original image angle for debugging")
     print(f"Logging to: {log_path}")
 
