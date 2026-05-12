@@ -43,6 +43,7 @@ FIELDNAMES = [
     "lateral_offset_px",
     "lateral_offset_norm",
     "yaw_error_deg",
+    "raw_yaw_image_deg",
     "center_x_px",
     "center_y_px",
     "tag_width_px",
@@ -212,6 +213,16 @@ def side_length(p1, p2):
     return math.hypot(float(p2[0] - p1[0]), float(p2[1] - p1[1]))
 
 
+def wrap_angle_deg(angle):
+    while angle > 180.0:
+        angle -= 360.0
+
+    while angle < -180.0:
+        angle += 360.0
+
+    return angle
+
+
 def compute_tag_measurement(det, frame_width, tag_size_cm):
     parts = get_detection_parts(det)
     if parts is None:
@@ -228,7 +239,8 @@ def compute_tag_measurement(det, frame_width, tag_size_cm):
     right_mid = (rb + rt) * 0.5
 
     tag_x_axis = right_mid - left_mid
-    yaw_error_deg = math.degrees(math.atan2(tag_x_axis[1], tag_x_axis[0]))
+    raw_yaw_image_deg = math.degrees(math.atan2(tag_x_axis[1], tag_x_axis[0]))
+    yaw_error_deg = wrap_angle_deg(raw_yaw_image_deg + 180.0)
 
     tag_width_px = 0.5 * (side_length(lb, rb) + side_length(lt, rt))
     pixels_per_cm = tag_width_px / tag_size_cm if tag_size_cm > 0.0 else 0.0
@@ -249,6 +261,7 @@ def compute_tag_measurement(det, frame_width, tag_size_cm):
         "lateral_offset_norm": lateral_offset_norm,
         "lateral_offset_cm": lateral_offset_cm,
         "yaw_error_deg": yaw_error_deg,
+        "raw_yaw_image_deg": raw_yaw_image_deg,
         "tag_width_px": tag_width_px,
     }
 
@@ -336,6 +349,7 @@ def build_log_row(now_s, frame_index, tag_count, measurement, mega_snapshot):
         "lateral_offset_px": "",
         "lateral_offset_norm": "",
         "yaw_error_deg": "",
+        "raw_yaw_image_deg": "",
         "center_x_px": "",
         "center_y_px": "",
         "tag_width_px": "",
@@ -361,6 +375,7 @@ def build_log_row(now_s, frame_index, tag_count, measurement, mega_snapshot):
         "lateral_offset_px": fmt(measurement["lateral_offset_px"]),
         "lateral_offset_norm": fmt(measurement["lateral_offset_norm"], 5),
         "yaw_error_deg": fmt(measurement["yaw_error_deg"]),
+        "raw_yaw_image_deg": fmt(measurement["raw_yaw_image_deg"]),
         "center_x_px": fmt(measurement["center_x_px"]),
         "center_y_px": fmt(measurement["center_y_px"]),
         "tag_width_px": fmt(measurement["tag_width_px"]),
@@ -468,7 +483,8 @@ def main():
     print("Enter commands in the terminal, or press keys in the camera window.")
     print("Sign convention:")
     print("  lateral_offset_px/cm positive = tag appears right of image center")
-    print("  yaw_error_deg positive = tag right side appears lower in image")
+    print("  yaw_error_deg is normalized so aligned tags are near 0 deg")
+    print("  raw_yaw_image_deg keeps the original image angle for debugging")
     print(f"Logging to: {log_path}")
 
     frame_index = 0
