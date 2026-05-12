@@ -40,7 +40,7 @@ def send_command(ser: serial.Serial, command: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="AGV forward/stop serial master")
-    parser.add_argument("--port", default="/dev/ttyACM0", help="Arduino Mega serial port")
+    parser.add_argument("--port", default="/dev/ttyUSB0", help="Arduino Mega serial port")
     parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate")
     args = parser.parse_args()
 
@@ -87,4 +87,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
