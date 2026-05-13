@@ -29,6 +29,28 @@ def create_detector():
     return apriltag.Detector(options)
 
 
+def configure_camera(cap, args):
+    if args.backend_fourcc:
+        fourcc = cv2.VideoWriter_fourcc(*args.backend_fourcc)
+        cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap.set(cv2.CAP_PROP_FPS, args.target_fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+
+def get_camera_fourcc(cap):
+    value = int(cap.get(cv2.CAP_PROP_FOURCC))
+    chars = [
+        chr(value & 0xFF),
+        chr((value >> 8) & 0xFF),
+        chr((value >> 16) & 0xFF),
+        chr((value >> 24) & 0xFF),
+    ]
+    return "".join(chars)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check camera FPS and optional AprilTag detection FPS.")
     parser.add_argument("--camera", type=int, default=0)
@@ -38,19 +60,21 @@ def main():
     parser.add_argument("--seconds", type=float, default=10.0)
     parser.add_argument("--detect-tags", action="store_true")
     parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--backend-fourcc", default="MJPG",
+                        help="Camera pixel format, usually MJPG or YUYV. Use empty string to skip.")
+    parser.add_argument("--max-failures", type=int, default=10)
     args = parser.parse_args()
 
-    cap = cv2.VideoCapture(args.camera)
+    cap = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {args.camera}")
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, args.target_fps)
+    configure_camera(cap, args)
 
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     reported_fps = cap.get(cv2.CAP_PROP_FPS)
+    reported_fourcc = get_camera_fourcc(cap)
 
     detector = create_detector() if args.detect_tags else None
 
@@ -58,6 +82,7 @@ def main():
     print(f"Requested: {args.width}x{args.height} @ {args.target_fps} FPS")
     print(f"Actual:    {actual_width}x{actual_height}")
     print(f"Reported camera FPS: {reported_fps:.2f}")
+    print(f"Reported FOURCC: {reported_fourcc}")
     print(f"Detect tags: {args.detect_tags}")
     print("Press q in the preview window to stop.")
 
@@ -67,6 +92,7 @@ def main():
     detect_count = 0
     detected_tag_frames = 0
     total_detect_time = 0.0
+    consecutive_failures = 0
 
     try:
         while True:
@@ -76,8 +102,14 @@ def main():
 
             ret, frame = cap.read()
             if not ret:
-                print("Frame read failed")
-                break
+                consecutive_failures += 1
+                print(f"Frame read failed ({consecutive_failures}/{args.max_failures})")
+                if consecutive_failures >= args.max_failures:
+                    break
+                time.sleep(0.05)
+                continue
+
+            consecutive_failures = 0
 
             frame_count += 1
             tag_count = 0
