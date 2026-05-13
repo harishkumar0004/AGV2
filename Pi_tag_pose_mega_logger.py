@@ -16,6 +16,7 @@ import argparse
 import csv
 import math
 import select
+import subprocess
 import sys
 import threading
 import time
@@ -27,7 +28,7 @@ import numpy as np
 import serial
 
 
-DEFAULT_TAG_SIZE_CM = 2.0
+DEFAULT_TAG_SIZE_CM = 3.0
 DEFAULT_CAMERA_INDEX = 0
 DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
 DEFAULT_BAUD = 115200
@@ -35,6 +36,10 @@ DEFAULT_FRAME_WIDTH = 640
 DEFAULT_FRAME_HEIGHT = 480
 DEFAULT_TARGET_FPS = 30
 DEFAULT_CAMERA_FOURCC = "MJPG"
+DEFAULT_CAMERA_WARMUP_SEC = 3.0
+DEFAULT_EXPOSURE = 40
+DEFAULT_GAIN = 64
+DEFAULT_POWER_LINE_FREQUENCY = 1
 
 
 FIELDNAMES = [
@@ -449,6 +454,54 @@ def key_to_command(key):
     return None
 
 
+def camera_device_path(camera_index):
+    return f"/dev/video{camera_index}"
+
+
+def set_v4l2_control(device, name, value):
+    command = ["v4l2-ctl", "-d", device, f"--set-ctrl={name}={value}"]
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        print("v4l2-ctl not found; skipping camera controls.")
+        return False
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        print(f"Could not set {name}={value}: {message}")
+        return False
+
+    return True
+
+
+def apply_v4l2_controls(args):
+    if args.skip_v4l2_controls:
+        print("Skipping v4l2 camera controls.")
+        return
+
+    device = camera_device_path(args.camera)
+    controls = [
+        ("power_line_frequency", args.power_line_frequency),
+        ("exposure_dynamic_framerate", 0),
+        ("auto_exposure", 1),
+        ("exposure_time_absolute", args.exposure),
+    ]
+
+    if args.gain >= 0:
+        controls.append(("gain", args.gain))
+
+    print(f"Applying camera controls on {device}...")
+    for name, value in controls:
+        set_v4l2_control(device, name, value)
+
+
 def configure_camera(cap, args):
     if args.backend_fourcc:
         fourcc = cv2.VideoWriter_fourcc(*args.backend_fourcc)
@@ -471,6 +524,32 @@ def get_camera_fourcc(cap):
     return "".join(chars)
 
 
+def warmup_camera(cap, seconds, max_failures):
+    if seconds <= 0.0:
+        return
+
+    print(f"Warming camera for {seconds:.1f}s before logging...")
+    end_time = time.time() + seconds
+    warmup_frames = 0
+    consecutive_failures = 0
+
+    while time.time() < end_time:
+        ret, _ = cap.read()
+        if not ret:
+            consecutive_failures += 1
+            print(f"Warmup frame failed ({consecutive_failures}/{max_failures})")
+            if consecutive_failures >= max_failures:
+                print("Warmup stopped because camera failure limit was reached.")
+                break
+            time.sleep(0.05)
+            continue
+
+        warmup_frames += 1
+        consecutive_failures = 0
+
+    print(f"Warmup frames discarded: {warmup_frames}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Log Raspberry Pi AprilTag pose and Mega gyro/motor telemetry."
@@ -482,6 +561,13 @@ def main():
     parser.add_argument("--backend-fourcc", default=DEFAULT_CAMERA_FOURCC,
                         help="Camera pixel format, usually MJPG or YUYV. Use empty string to skip.")
     parser.add_argument("--max-camera-failures", type=int, default=10)
+    parser.add_argument("--camera-warmup-sec", type=float, default=DEFAULT_CAMERA_WARMUP_SEC)
+    parser.add_argument("--exposure", type=int, default=DEFAULT_EXPOSURE)
+    parser.add_argument("--gain", type=int, default=DEFAULT_GAIN,
+                        help="Camera gain. Use -1 to leave unchanged.")
+    parser.add_argument("--power-line-frequency", type=int, default=DEFAULT_POWER_LINE_FREQUENCY,
+                        help="1=50 Hz, 2=60 Hz for most UVC cameras.")
+    parser.add_argument("--skip-v4l2-controls", action="store_true")
     parser.add_argument("--port", default=DEFAULT_SERIAL_PORT,
                         help="Mega serial port. Use --port none to disable serial.")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
@@ -500,12 +586,15 @@ def main():
     serial_port = None if args.port.lower() == "none" else args.port
     ser = open_serial(serial_port, args.baud)
 
+    apply_v4l2_controls(args)
+
     cap = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
     if not cap.isOpened():
         if ser is not None:
             ser.close()
         raise RuntimeError(f"Could not open camera index {args.camera}")
     configure_camera(cap, args)
+    warmup_camera(cap, args.camera_warmup_sec, args.max_camera_failures)
 
     detector = create_detector()
 
