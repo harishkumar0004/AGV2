@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import subprocess
 import time
 
 import cv2
@@ -27,6 +28,54 @@ def create_detector():
 
     options = apriltag.DetectorOptions(families="tag36h11")
     return apriltag.Detector(options)
+
+
+def camera_device_path(camera_index):
+    return f"/dev/video{camera_index}"
+
+
+def set_v4l2_control(device, name, value):
+    command = ["v4l2-ctl", "-d", device, f"--set-ctrl={name}={value}"]
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        print("v4l2-ctl not found; skipping camera controls.")
+        return False
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        print(f"Could not set {name}={value}: {message}")
+        return False
+
+    return True
+
+
+def apply_v4l2_controls(args):
+    if args.skip_v4l2_controls:
+        print("Skipping v4l2 camera controls.")
+        return
+
+    device = camera_device_path(args.camera)
+    controls = [
+        ("power_line_frequency", args.power_line_frequency),
+        ("exposure_dynamic_framerate", 0),
+        ("auto_exposure", 1),
+        ("exposure_time_absolute", args.exposure),
+    ]
+
+    if args.gain >= 0:
+        controls.append(("gain", args.gain))
+
+    print(f"Applying camera controls on {device}...")
+    for name, value in controls:
+        set_v4l2_control(device, name, value)
 
 
 def configure_camera(cap, args):
@@ -51,6 +100,32 @@ def get_camera_fourcc(cap):
     return "".join(chars)
 
 
+def warmup_camera(cap, seconds, max_failures):
+    if seconds <= 0.0:
+        return
+
+    print(f"Warming camera for {seconds:.1f}s...")
+    end_time = time.time() + seconds
+    warmup_frames = 0
+    consecutive_failures = 0
+
+    while time.time() < end_time:
+        ret, _ = cap.read()
+        if not ret:
+            consecutive_failures += 1
+            print(f"Warmup frame failed ({consecutive_failures}/{max_failures})")
+            if consecutive_failures >= max_failures:
+                print("Warmup stopped because camera failure limit was reached.")
+                break
+            time.sleep(0.05)
+            continue
+
+        warmup_frames += 1
+        consecutive_failures = 0
+
+    print(f"Warmup frames discarded: {warmup_frames}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check camera FPS and optional AprilTag detection FPS.")
     parser.add_argument("--camera", type=int, default=0)
@@ -63,13 +138,23 @@ def main():
     parser.add_argument("--backend-fourcc", default="MJPG",
                         help="Camera pixel format, usually MJPG or YUYV. Use empty string to skip.")
     parser.add_argument("--max-failures", type=int, default=10)
+    parser.add_argument("--camera-warmup-sec", type=float, default=3.0)
+    parser.add_argument("--exposure", type=int, default=40)
+    parser.add_argument("--gain", type=int, default=64,
+                        help="Camera gain. Use -1 to leave unchanged.")
+    parser.add_argument("--power-line-frequency", type=int, default=1,
+                        help="1=50 Hz, 2=60 Hz for most UVC cameras.")
+    parser.add_argument("--skip-v4l2-controls", action="store_true")
     args = parser.parse_args()
+
+    apply_v4l2_controls(args)
 
     cap = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera index {args.camera}")
 
     configure_camera(cap, args)
+    warmup_camera(cap, args.camera_warmup_sec, args.max_failures)
 
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
