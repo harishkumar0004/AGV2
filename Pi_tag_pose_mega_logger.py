@@ -31,6 +31,10 @@ DEFAULT_TAG_SIZE_CM = 2.0
 DEFAULT_CAMERA_INDEX = 0
 DEFAULT_SERIAL_PORT = "/dev/ttyUSB0"
 DEFAULT_BAUD = 115200
+DEFAULT_FRAME_WIDTH = 640
+DEFAULT_FRAME_HEIGHT = 480
+DEFAULT_TARGET_FPS = 30
+DEFAULT_CAMERA_FOURCC = "MJPG"
 
 
 FIELDNAMES = [
@@ -445,11 +449,39 @@ def key_to_command(key):
     return None
 
 
+def configure_camera(cap, args):
+    if args.backend_fourcc:
+        fourcc = cv2.VideoWriter_fourcc(*args.backend_fourcc)
+        cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap.set(cv2.CAP_PROP_FPS, args.target_fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+
+def get_camera_fourcc(cap):
+    value = int(cap.get(cv2.CAP_PROP_FOURCC))
+    chars = [
+        chr(value & 0xFF),
+        chr((value >> 8) & 0xFF),
+        chr((value >> 16) & 0xFF),
+        chr((value >> 24) & 0xFF),
+    ]
+    return "".join(chars)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Log Raspberry Pi AprilTag pose and Mega gyro/motor telemetry."
     )
     parser.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX)
+    parser.add_argument("--width", type=int, default=DEFAULT_FRAME_WIDTH)
+    parser.add_argument("--height", type=int, default=DEFAULT_FRAME_HEIGHT)
+    parser.add_argument("--target-fps", type=int, default=DEFAULT_TARGET_FPS)
+    parser.add_argument("--backend-fourcc", default=DEFAULT_CAMERA_FOURCC,
+                        help="Camera pixel format, usually MJPG or YUYV. Use empty string to skip.")
+    parser.add_argument("--max-camera-failures", type=int, default=10)
     parser.add_argument("--port", default=DEFAULT_SERIAL_PORT,
                         help="Mega serial port. Use --port none to disable serial.")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
@@ -468,11 +500,12 @@ def main():
     serial_port = None if args.port.lower() == "none" else args.port
     ser = open_serial(serial_port, args.baud)
 
-    cap = cv2.VideoCapture(args.camera)
+    cap = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
     if not cap.isOpened():
         if ser is not None:
             ser.close()
         raise RuntimeError(f"Could not open camera index {args.camera}")
+    configure_camera(cap, args)
 
     detector = create_detector()
 
@@ -496,10 +529,18 @@ def main():
     print("  lateral_offset_px/cm positive = tag appears right of image center")
     print("  yaw_error_deg is folded to +/-90 deg, so aligned tags are near 0 deg")
     print("  raw_yaw_image_deg keeps the original image angle for debugging")
+    print(
+        "Camera: "
+        f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+        f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} "
+        f"@ {cap.get(cv2.CAP_PROP_FPS):.2f} FPS "
+        f"FOURCC={get_camera_fourcc(cap)}"
+    )
     print(f"Logging to: {log_path}")
 
     frame_index = 0
     last_print_time = 0.0
+    camera_failures = 0
 
     try:
         with open(log_path, "w", newline="") as log_file:
@@ -509,8 +550,18 @@ def main():
             while not stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret:
-                    print("Camera frame read failed.")
-                    break
+                    camera_failures += 1
+                    print(
+                        "Camera frame read failed "
+                        f"({camera_failures}/{args.max_camera_failures})."
+                    )
+                    if camera_failures >= args.max_camera_failures:
+                        print("Camera failure limit reached.")
+                        break
+                    time.sleep(0.05)
+                    continue
+
+                camera_failures = 0
 
                 frame_index += 1
                 now_s = time.time() - start_time
