@@ -15,8 +15,10 @@ Upload `03_Manual_debug_distance_angle_control.ino` to the Mega before running t
 
 import argparse
 import csv
+import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,7 +37,7 @@ DEFAULT_TAG_K_LAT_DEG_PER_CM = 1.0
 DEFAULT_TAG_K_YAW = 0.25
 DEFAULT_TAG_COMMAND_INTERVAL_SEC = 0.08
 DEFAULT_TAG_CORRECTION_HOLD_SEC = 0.30
-DEFAULT_DEBUG_PRINT_INTERVAL_SEC = 0.20
+DEFAULT_DEBUG_PRINT_INTERVAL_SEC = 0.0
 
 ROUTE_FIELDNAMES = [
     "route_state",
@@ -49,6 +51,9 @@ ROUTE_FIELDNAMES = [
     "tag_corr_cmd_deg",
     "camera_x_offset_cm",
     "agv_center_deviation_cm",
+    "tag_in_gate",
+    "tag_gate_dx_px",
+    "tag_gate_dy_px",
     "tag_k_lat_deg_per_cm",
     "tag_k_yaw",
     "pending_turn_tag_id",
@@ -97,6 +102,10 @@ def build_arg_parser():
     parser.add_argument("--tag-correction-hold-sec", type=float,
                         default=DEFAULT_TAG_CORRECTION_HOLD_SEC,
                         help="Keep the last tag correction alive for this long after losing the tag.")
+    parser.add_argument("--gate-width-px", type=int, default=320,
+                        help="Centered tag acceptance box width in pixels.")
+    parser.add_argument("--gate-height-px", type=int, default=320,
+                        help="Centered tag acceptance box height in pixels.")
     parser.add_argument("--debug-print-interval-sec", type=float,
                         default=DEFAULT_DEBUG_PRINT_INTERVAL_SEC)
     parser.add_argument("--output-dir", default="Pi_csv_outputs")
@@ -137,6 +146,51 @@ def select_best_measurement(detections, frame_width, tag_size_cm):
 
     measurements.sort(key=lambda item: item["tag_width_px"], reverse=True)
     return measurements[0]
+
+
+def compute_gate_info(measurement, frame_width, frame_height, args):
+    gate_w = max(1, int(args.gate_width_px))
+    gate_h = max(1, int(args.gate_height_px))
+    center_x = frame_width * 0.5
+    center_y = frame_height * 0.5
+    left = center_x - gate_w * 0.5
+    right = center_x + gate_w * 0.5
+    top = center_y - gate_h * 0.5
+    bottom = center_y + gate_h * 0.5
+
+    info = {
+        "left": int(left),
+        "right": int(right),
+        "top": int(top),
+        "bottom": int(bottom),
+        "inside": False,
+        "dx_px": None,
+        "dy_px": None,
+    }
+
+    if measurement is None:
+        return info
+
+    cx = measurement["center_x_px"]
+    cy = measurement["center_y_px"]
+    info["dx_px"] = cx - center_x
+    info["dy_px"] = cy - center_y
+    info["inside"] = left <= cx <= right and top <= cy <= bottom
+    return info
+
+
+def draw_gate_box(frame, gate_info):
+    color = (0, 180, 255)
+    if gate_info.get("inside"):
+        color = (0, 220, 0)
+
+    cv2.rectangle(
+        frame,
+        (gate_info["left"], gate_info["top"]),
+        (gate_info["right"], gate_info["bottom"]),
+        color,
+        2,
+    )
 
 
 def update_stable_tag(current_tag_id, previous_tag_id, stable_count):
@@ -199,6 +253,18 @@ def make_camera_args(args):
     )
 
 
+@contextmanager
+def suppress_native_stderr():
+    saved_stderr_fd = os.dup(2)
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stderr_fd)
+
+
 def send_route_command(ser, state, state_lock, command):
     base.send_command(ser, state, state_lock, command)
 
@@ -236,7 +302,8 @@ def route_serial_reader(ser, stop_event, state, state_lock, start_time):
             elif line in ("ACK:TURN_R_DEG", "ACK:TURN_L_DEG"):
                 state["motion_state"] = "TURNING"
 
-        print("[MEGA]", line)
+        if not line.startswith("TEL:"):
+            print("[MEGA]", line)
 
 
 def send_tag_correction(ser, state, state_lock, correction_deg):
@@ -251,13 +318,12 @@ def send_tag_correction(ser, state, state_lock, correction_deg):
     with state_lock:
         state["last_command"] = command
 
-    print("[PI]", command)
 
 
 def add_route_fields(row, route_state, stable_tag_id, stable_count, route_action,
                      handled_turn_tags, tag_corr_active, tag_corr_sent,
                      tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
-                     pending_turn_tag_id, pending_turn_command, args):
+                     gate_info, pending_turn_tag_id, pending_turn_command, args):
     row.update({
         "route_state": route_state,
         "stable_tag_id": stable_tag_id,
@@ -270,6 +336,9 @@ def add_route_fields(row, route_state, stable_tag_id, stable_count, route_action
         "tag_corr_cmd_deg": base.fmt(tag_corr_cmd_deg),
         "camera_x_offset_cm": base.fmt(args.camera_x_offset_cm),
         "agv_center_deviation_cm": base.fmt(agv_center_deviation_cm(measurement, args)),
+        "tag_in_gate": 1 if gate_info.get("inside") else 0,
+        "tag_gate_dx_px": base.fmt(gate_info.get("dx_px")),
+        "tag_gate_dy_px": base.fmt(gate_info.get("dy_px")),
         "tag_k_lat_deg_per_cm": base.fmt(args.tag_k_lat),
         "tag_k_yaw": base.fmt(args.tag_k_yaw),
         "pending_turn_tag_id": pending_turn_tag_id if pending_turn_tag_id is not None else "",
@@ -295,7 +364,8 @@ def main():
         raise RuntimeError(f"Could not open camera index {args.camera}")
 
     base.configure_camera(cap, camera_args)
-    base.warmup_camera(cap, args.camera_warmup_sec, args.max_camera_failures)
+    with suppress_native_stderr():
+        base.warmup_camera(cap, args.camera_warmup_sec, args.max_camera_failures)
     detector = base.create_detector()
 
     state = base.make_initial_mega_state()
@@ -317,6 +387,7 @@ def main():
     print(f"Forward chunk: {args.forward_chunk_cm:.1f} cm")
     print(f"Pre-turn forward: {args.pre_turn_forward_cm:.1f} cm")
     print(f"Post-turn forward: {args.post_turn_forward_cm:.1f} cm")
+    print(f"Gate box: {args.gate_width_px}x{args.gate_height_px} px at image center")
     print("Tag correction:")
     print(
         f"  raw_cmd = {args.tag_k_lat:.3f} * (lateral_cm + {args.camera_x_offset_cm:.3f}) "
@@ -360,7 +431,8 @@ def main():
             writer.writeheader()
 
             while not stop_event.is_set():
-                ret, frame = cap.read()
+                with suppress_native_stderr():
+                    ret, frame = cap.read()
                 if not ret:
                     camera_failures += 1
                     print(
@@ -378,6 +450,7 @@ def main():
                 now_s = time.time() - start_time
                 now_wall = time.time()
                 frame_width = frame.shape[1]
+                frame_height = frame.shape[0]
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 detections = detector.detect(gray)
@@ -385,6 +458,12 @@ def main():
                     detections,
                     frame_width=frame_width,
                     tag_size_cm=args.tag_size_cm,
+                )
+                gate_info = compute_gate_info(
+                    measurement,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    args=args,
                 )
 
                 current_tag_id = measurement["tag_id"] if measurement else None
@@ -479,6 +558,7 @@ def main():
                 stable_tag_visible = (
                     route_state == "MOVING"
                     and measurement is not None
+                    and gate_info["inside"]
                     and stable_count >= args.min_stable_frames
                 )
 
@@ -545,6 +625,7 @@ def main():
 
                 key_command = None
                 if not args.no_display:
+                    draw_gate_box(frame, gate_info)
                     if measurement:
                         base.draw_measurement(frame, measurement)
                     base.draw_status(frame, mega_snapshot)
@@ -610,12 +691,16 @@ def main():
                         row, route_state, stable_tag_id, stable_count, route_action,
                         handled_turn_tags, tag_corr_active, tag_corr_sent,
                         tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
+                        gate_info,
                         pending_turn_tag_id, pending_turn_command, args
                     )
                     writer.writerow(row)
                     break
 
-                if now_wall - last_debug_print_time >= args.debug_print_interval_sec:
+                if (
+                    args.debug_print_interval_sec > 0.0
+                    and now_wall - last_debug_print_time >= args.debug_print_interval_sec
+                ):
                     lat_text = ""
                     agv_text = ""
                     yaw_text = ""
@@ -644,6 +729,7 @@ def main():
                         row, route_state, stable_tag_id, stable_count, route_action,
                         handled_turn_tags, tag_corr_active, tag_corr_sent,
                         tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
+                        gate_info,
                         pending_turn_tag_id, pending_turn_command, args
                     )
                     writer.writerow(row)
