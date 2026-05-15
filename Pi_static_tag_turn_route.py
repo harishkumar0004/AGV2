@@ -33,11 +33,12 @@ TURN_TAGS = {
 }
 FINAL_TAG_ID = 7
 DEFAULT_MIN_STABLE_FRAMES = 1
-DEFAULT_TAG_K_LAT_DEG_PER_CM = 1.0
+DEFAULT_TAG_K_LAT_DEG_PER_CM = -1.0
 DEFAULT_TAG_K_YAW = 0.25
 DEFAULT_TAG_COMMAND_INTERVAL_SEC = 0.08
 DEFAULT_TAG_CORRECTION_HOLD_SEC = 0.30
 DEFAULT_DEBUG_PRINT_INTERVAL_SEC = 0.0
+DEFAULT_CAMERA_X_OFFSET_CM = 1.5
 
 ROUTE_FIELDNAMES = [
     "route_state",
@@ -90,9 +91,9 @@ def build_arg_parser():
                         help="Move forward this many cm after the pivot turn finishes.")
     parser.add_argument("--turn-deg", type=float, default=90.0,
                         help="Pivot angle used for turn tags.")
-    parser.add_argument("--camera-x-offset-cm", type=float, default=1.5,
-                        help=("Signed camera offset from AGV center in cm. Positive means camera "
-                              "is mounted to the right of AGV center."))
+    parser.add_argument("--camera-x-offset-cm", type=float, default=DEFAULT_CAMERA_X_OFFSET_CM,
+                        help=("AGV-center compensation in cm added to the tag lateral offset. "
+                              "Use +1.5 when the camera is mounted 1.5 cm left of AGV center."))
     parser.add_argument("--tag-k-lat", type=float, default=DEFAULT_TAG_K_LAT_DEG_PER_CM,
                         help="Degrees of heading command per cm lateral offset.")
     parser.add_argument("--tag-k-yaw", type=float, default=DEFAULT_TAG_K_YAW,
@@ -208,6 +209,8 @@ def compute_tag_correction(measurement, args):
     if lateral_cm is None:
         lateral_cm = 0.0
 
+    # Positive camera_x_offset_cm means the AGV center is to the right of the
+    # camera optical center. This matches a camera mounted on the left side.
     agv_center_cm = lateral_cm + args.camera_x_offset_cm
     yaw_error_deg = measurement.get("yaw_error_deg") or 0.0
     raw_cmd = (args.tag_k_lat * agv_center_cm) + (args.tag_k_yaw * yaw_error_deg)
@@ -389,12 +392,17 @@ def main():
     print(f"Post-turn forward: {args.post_turn_forward_cm:.1f} cm")
     print(f"Gate box: {args.gate_width_px}x{args.gate_height_px} px at image center")
     print("Tag correction:")
+    print(f"  camera left-of-center compensation: +{args.camera_x_offset_cm:.3f} cm")
     print(
-        f"  raw_cmd = {args.tag_k_lat:.3f} * (lateral_cm + {args.camera_x_offset_cm:.3f}) "
+        f"  agv_center_cm = tag_lateral_cm + {args.camera_x_offset_cm:.3f}"
+    )
+    print(
+        f"  raw_cmd = {args.tag_k_lat:.3f} * agv_center_cm "
         f"+ {args.tag_k_yaw:.3f} * yaw_deg"
     )
     print("  tag correction command is not degree-limited")
     print("  motor RPM is still limited inside the Mega sketch by INITIAL_RPM/MAX_RPM")
+    print("  Positive right-side AGV offset now commands right turn: left RPM should become greater than right RPM.")
     print("  If correction goes opposite, change --tag-k-lat sign first.")
     print(f"  tag correction hold after losing tag: {args.tag_correction_hold_sec:.2f} sec")
     print(
