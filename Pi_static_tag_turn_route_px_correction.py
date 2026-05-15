@@ -37,7 +37,7 @@ FINAL_TAG_ID = 7
 DEFAULT_MIN_STABLE_FRAMES = 1
 DEFAULT_TAG_K_LAT_DEG_PER_CM = -1.0
 DEFAULT_TAG_K_PX_DEG_PER_PX = 0.02
-DEFAULT_TAG_K_YAW = 0.25
+DEFAULT_TAG_K_YAW = 0.0
 DEFAULT_TAG_COMMAND_INTERVAL_SEC = 0.08
 DEFAULT_TAG_CORRECTION_HOLD_SEC = 0.30
 DEFAULT_DEBUG_PRINT_INTERVAL_SEC = 0.0
@@ -103,7 +103,8 @@ def build_arg_parser():
                         help=("Degrees of TAG_CORR per pixel offset. Positive value means "
                               "negative px sends negative TAG_CORR, producing left RPM > right RPM."))
     parser.add_argument("--tag-k-yaw", type=float, default=DEFAULT_TAG_K_YAW,
-                        help="Degrees of heading command per degree of tag yaw error.")
+                        help=("Degrees of heading command per degree of tag yaw error. Default is 0 "
+                              "because turn tags appear near +/-90 deg after a pivot."))
     parser.add_argument("--tag-command-interval-sec", type=float,
                         default=DEFAULT_TAG_COMMAND_INTERVAL_SEC)
     parser.add_argument("--tag-correction-hold-sec", type=float,
@@ -404,6 +405,7 @@ def main():
             f"  raw_cmd = {args.tag_k_px:.4f} * lateral_px "
             f"+ {args.tag_k_yaw:.3f} * yaw_deg"
         )
+        print("  default yaw gain is 0, so post-turn +/-90 deg tag yaw does not create a huge correction")
         print("  negative px -> negative TAG_CORR -> left RPM greater than right RPM")
         print("  tag correction command is not degree-limited")
         print("  motor RPM is still limited inside the Mega sketch by INITIAL_RPM/MAX_RPM")
