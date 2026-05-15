@@ -45,6 +45,7 @@ DEFAULT_CAMERA_X_OFFSET_CM = 0.0
 
 ROUTE_FIELDNAMES = [
     "route_state",
+    "route_active",
     "stable_tag_id",
     "stable_count",
     "route_action",
@@ -141,6 +142,33 @@ def normalize_terminal_command(text):
         return "STOP"
     if cmd in ("q", "quit", "exit"):
         return "QUIT"
+
+    parts = cmd.split()
+    if len(parts) != 2:
+        print("Use: f, f <cm>, b <cm>, r <deg>, l <deg>, s, q")
+        return None
+
+    key, value_text = parts
+    try:
+        value = float(value_text)
+    except ValueError:
+        print("Value must be numeric. Example: f 50")
+        return None
+
+    if value <= 0.0:
+        print("Value must be greater than zero.")
+        return None
+
+    if key in ("f", "forward"):
+        return f"FWD_CM:{value:.3f}"
+    if key in ("b", "back", "backward"):
+        return f"BACK_CM:{value:.3f}"
+    if key in ("r", "right"):
+        return f"TURN_R_DEG:{value:.3f}"
+    if key in ("l", "left"):
+        return f"TURN_L_DEG:{value:.3f}"
+
+    print("Use: f, f <cm>, b <cm>, r <deg>, l <deg>, s, q")
     return None
 
 
@@ -330,12 +358,13 @@ def send_tag_correction(ser, state, state_lock, correction_deg):
 
 
 
-def add_route_fields(row, route_state, stable_tag_id, stable_count, route_action,
+def add_route_fields(row, route_state, route_active, stable_tag_id, stable_count, route_action,
                      handled_turn_tags, tag_corr_active, tag_corr_sent,
                      tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
                      gate_info, pending_turn_tag_id, pending_turn_command, args):
     row.update({
         "route_state": route_state,
+        "route_active": 1 if route_active else 0,
         "stable_tag_id": stable_tag_id,
         "stable_count": stable_count,
         "route_action": route_action,
@@ -393,7 +422,7 @@ def main():
         )
         reader.start()
 
-    print("Controls: f=START ROUTE, s=STOP, q=STOP+QUIT")
+    print("Controls: f=START ROUTE, f <cm>=manual forward, b <cm>=manual backward, r <deg>, l <deg>, s=STOP, q=STOP+QUIT")
     print(f"Route: tag 3 -> right {args.turn_deg:.1f}, tag 5 -> right {args.turn_deg:.1f}, tag 7 -> stop")
     print(f"Forward chunk: {args.forward_chunk_cm:.1f} cm")
     print(f"Pre-turn forward: {args.pre_turn_forward_cm:.1f} cm")
@@ -425,6 +454,7 @@ def main():
     print(f"Logging to: {log_path}")
 
     route_state = "IDLE"
+    route_active = False
     handled_turn_tags = set()
     previous_tag_id = None
     stable_tag_id = None
@@ -505,7 +535,8 @@ def main():
                     event_time_s = mega_snapshot.get("event_time_s", mega_snapshot.get("time_s"))
 
                     if (
-                        route_state == "PRE_TURN_FORWARD"
+                        route_active
+                        and route_state == "PRE_TURN_FORWARD"
                         and mega_event == "EVT:MOVE_DONE"
                         and event_time_s is not None
                         and event_time_s >= route_step_start_time_s
@@ -517,7 +548,8 @@ def main():
                         route_action = f"pre_turn_done_{pending_turn_command.lower()}"
 
                     elif (
-                        route_state == "TURNING"
+                        route_active
+                        and route_state == "TURNING"
                         and mega_event == "EVT:TURN_DONE"
                         and event_time_s is not None
                         and event_time_s >= pending_turn_start_time_s
@@ -539,7 +571,8 @@ def main():
                             route_action = "turn_done_forward_chunk"
 
                     elif (
-                        route_state == "POST_TURN_FORWARD"
+                        route_active
+                        and route_state == "POST_TURN_FORWARD"
                         and mega_event == "EVT:MOVE_DONE"
                         and event_time_s is not None
                         and event_time_s >= route_step_start_time_s
@@ -554,7 +587,8 @@ def main():
                         route_action = "post_turn_done_forward_chunk"
 
                     elif (
-                        route_state == "MOVING"
+                        route_active
+                        and route_state == "MOVING"
                         and mega_event == "EVT:MOVE_DONE"
                         and event_time_s is not None
                         and event_time_s >= route_step_start_time_s
@@ -564,9 +598,30 @@ def main():
                         route_step_start_time_s = now_s
                         route_action = "forward_chunk_restart"
 
+                    elif (
+                        not route_active
+                        and route_state in ("MOVING", "PRE_TURN_FORWARD", "POST_TURN_FORWARD")
+                        and mega_event == "EVT:MOVE_DONE"
+                        and event_time_s is not None
+                        and event_time_s >= route_step_start_time_s
+                    ):
+                        route_state = "STOPPED"
+                        route_action = "manual_move_done"
+
+                    elif (
+                        not route_active
+                        and route_state == "TURNING"
+                        and mega_event == "EVT:TURN_DONE"
+                        and event_time_s is not None
+                        and event_time_s >= route_step_start_time_s
+                    ):
+                        route_state = "STOPPED"
+                        route_action = "manual_turn_done"
+
                     elif route_state == "TURNING" and mega_event == "EVT:TURN_TIMEOUT":
                         send_route_command(ser, state, state_lock, "STOP")
                         route_state = "ERROR"
+                        route_active = False
                         pending_turn_tag_id = None
                         pending_turn_command = ""
                         pending_post_turn_forward = False
@@ -582,15 +637,16 @@ def main():
                 if stable_tag_visible:
                     tag_action_key = (stable_tag_id, route_state)
 
-                    if stable_tag_id == FINAL_TAG_ID and tag_action_key != last_route_tag_action:
+                    if route_active and stable_tag_id == FINAL_TAG_ID and tag_action_key != last_route_tag_action:
                         send_tag_correction(ser, state, state_lock, 0.0)
                         send_route_command(ser, state, state_lock, "STOP")
                         tag_correction_was_active = False
                         route_state = "DONE"
+                        route_active = False
                         route_action = f"tag_{FINAL_TAG_ID}_stop"
                         last_route_tag_action = tag_action_key
 
-                    elif stable_tag_id in TURN_TAGS and stable_tag_id not in handled_turn_tags:
+                    elif route_active and stable_tag_id in TURN_TAGS and stable_tag_id not in handled_turn_tags:
                         send_tag_correction(ser, state, state_lock, 0.0)
                         pending_turn_tag_id = stable_tag_id
                         pending_turn_command = turn_command_from_direction(
@@ -674,6 +730,7 @@ def main():
 
                 requested_command = terminal_command or key_command
                 if requested_command == "START_ROUTE":
+                    route_active = True
                     handled_turn_tags.clear()
                     previous_tag_id = None
                     stable_tag_id = None
@@ -693,6 +750,7 @@ def main():
                     route_step_start_time_s = now_s
                     route_action = "manual_start_forward"
                 elif requested_command == "STOP":
+                    route_active = False
                     send_tag_correction(ser, state, state_lock, 0.0)
                     send_route_command(ser, state, state_lock, "STOP")
                     tag_correction_was_active = False
@@ -702,13 +760,14 @@ def main():
                     route_state = "STOPPED"
                     route_action = "manual_stop"
                 elif requested_command == "QUIT":
+                    route_active = False
                     send_tag_correction(ser, state, state_lock, 0.0)
                     send_route_command(ser, state, state_lock, "STOP")
                     pending_post_turn_forward = False
                     route_action = "manual_quit_stop"
                     row = base.build_log_row(now_s, frame_index, len(detections), measurement, mega_snapshot)
                     row = add_route_fields(
-                        row, route_state, stable_tag_id, stable_count, route_action,
+                        row, route_state, route_active, stable_tag_id, stable_count, route_action,
                         handled_turn_tags, tag_corr_active, tag_corr_sent,
                         tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
                         gate_info,
@@ -716,6 +775,26 @@ def main():
                     )
                     writer.writerow(row)
                     break
+                elif requested_command and requested_command.startswith(("FWD_CM:", "BACK_CM:", "TURN_R_DEG:", "TURN_L_DEG:")):
+                    route_active = False
+                    handled_turn_tags.clear()
+                    previous_tag_id = None
+                    stable_tag_id = None
+                    stable_count = 0
+                    last_route_tag_action = None
+                    pending_turn_tag_id = None
+                    pending_turn_command = ""
+                    pending_turn_start_time_s = -1.0
+                    pending_post_turn_forward = False
+                    tag_correction_was_active = False
+                    send_tag_correction(ser, state, state_lock, 0.0)
+                    send_route_command(ser, state, state_lock, requested_command)
+                    route_step_start_time_s = now_s
+                    if requested_command.startswith(("FWD_CM:", "BACK_CM:")):
+                        route_state = "MOVING"
+                    else:
+                        route_state = "TURNING"
+                    route_action = f"manual_{requested_command.lower().replace(':', '_')}"
 
                 if (
                     args.debug_print_interval_sec > 0.0
@@ -746,7 +825,7 @@ def main():
                 if measurement or args.log_every_frame or route_action:
                     row = base.build_log_row(now_s, frame_index, len(detections), measurement, mega_snapshot)
                     row = add_route_fields(
-                        row, route_state, stable_tag_id, stable_count, route_action,
+                        row, route_state, route_active, stable_tag_id, stable_count, route_action,
                         handled_turn_tags, tag_corr_active, tag_corr_sent,
                         tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
                         gate_info,
