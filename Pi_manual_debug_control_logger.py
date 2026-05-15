@@ -40,6 +40,8 @@ FIELDNAMES = [
     "tag_center_y_px",
     "tag_lateral_offset_px",
     "tag_center_deviation_cm",
+    "camera_x_offset_cm",
+    "agv_center_deviation_cm",
     "tag_in_gate",
     "tag_gate_dx_px",
     "tag_gate_dy_px",
@@ -70,6 +72,16 @@ def build_arg_parser():
     parser.add_argument("--power-line-frequency", type=int, default=base.DEFAULT_POWER_LINE_FREQUENCY)
     parser.add_argument("--skip-v4l2-controls", action="store_true")
     parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--camera-x-offset-cm", type=float, default=1.5,
+                        help=("Signed camera offset from AGV center in cm. "
+                              "Positive means camera is mounted to the right of AGV center."))
+    parser.add_argument("--pre-turn-forward-cm", type=float, default=2.0,
+                        help=("If a tag is visible when a turn is requested, move forward "
+                              "this many cm before starting the turn. Use 0 to disable."))
+    parser.add_argument("--turn-tag-memory-sec", type=float, default=0.4,
+                        help="Treat a tag as recently visible for this long when a turn is requested.")
+    parser.add_argument("--post-turn-back-cm", type=float, default=0.0,
+                        help="Optional backward move after a turn finishes. Default is disabled.")
     parser.add_argument("--gate-width-px", type=int, default=180,
                         help="Centered tag acceptance box width in pixels.")
     parser.add_argument("--gate-height-px", type=int, default=180,
@@ -150,11 +162,16 @@ def compute_gate_info(measurement, frame_width, frame_height, args):
     return info
 
 
-def compute_tag_correction(measurement, args):
+def agv_center_deviation_cm(measurement, args):
     lateral_cm = measurement.get("lateral_offset_cm")
     if lateral_cm is None:
         lateral_cm = 0.0
 
+    return lateral_cm + args.camera_x_offset_cm
+
+
+def compute_tag_correction(measurement, args):
+    lateral_cm = agv_center_deviation_cm(measurement, args)
     yaw_error_deg = measurement.get("yaw_error_deg") or 0.0
     return (args.tag_k_lat * lateral_cm) + (args.tag_k_yaw * yaw_error_deg)
 
@@ -217,7 +234,7 @@ def parse_terminal_command(text):
 
 
 def build_row(now_s, frame_index, user_input, command_sent, measurement,
-              gate_info, tag_corr_deg, tag_corr_sent, mega_snapshot):
+              gate_info, tag_corr_deg, tag_corr_sent, mega_snapshot, args):
     row = {
         "time_s": base.fmt(now_s),
         "frame_index": frame_index,
@@ -230,6 +247,8 @@ def build_row(now_s, frame_index, user_input, command_sent, measurement,
         "tag_center_y_px": "",
         "tag_lateral_offset_px": "",
         "tag_center_deviation_cm": "",
+        "camera_x_offset_cm": base.fmt(args.camera_x_offset_cm),
+        "agv_center_deviation_cm": "",
         "tag_in_gate": 1 if gate_info.get("inside") else 0,
         "tag_gate_dx_px": base.fmt(gate_info.get("dx_px")),
         "tag_gate_dy_px": base.fmt(gate_info.get("dy_px")),
@@ -248,6 +267,7 @@ def build_row(now_s, frame_index, user_input, command_sent, measurement,
             "tag_center_y_px": base.fmt(measurement["center_y_px"]),
             "tag_lateral_offset_px": base.fmt(measurement["lateral_offset_px"]),
             "tag_center_deviation_cm": base.fmt(measurement["lateral_offset_cm"]),
+            "agv_center_deviation_cm": base.fmt(agv_center_deviation_cm(measurement, args)),
         })
 
     return row
@@ -362,6 +382,10 @@ def main():
         f"FOURCC={base.get_camera_fourcc(cap)}"
     )
     print(f"Tag size used for cm conversion: {args.tag_size_cm:.2f} cm")
+    print(f"Camera X offset compensation: {args.camera_x_offset_cm:.2f} cm")
+    print(f"Pre-turn forward: {args.pre_turn_forward_cm:.2f} cm when tag is visible")
+    print(f"Turn tag memory: {args.turn_tag_memory_sec:.2f} sec")
+    print(f"Post-turn backup: {args.post_turn_back_cm:.2f} cm")
     print(f"Gate box: {args.gate_width_px}x{args.gate_height_px} px at image center")
     print(f"Tag correction: {args.tag_k_lat:.2f}*offset_cm + {args.tag_k_yaw:.2f}*tag_yaw_deg")
     print(f"Logging to: {output_path}")
@@ -371,6 +395,11 @@ def main():
     last_user_input = ""
     last_command_sent = ""
     last_tag_command_time = 0.0
+    last_tag_seen_time_s = -1.0
+    pending_pre_turn_command = ""
+    pre_turn_move_time_s = -1.0
+    pending_post_turn_back = False
+    turn_command_time_s = -1.0
 
     try:
         with output_path.open("w", newline="") as log_file:
@@ -409,7 +438,54 @@ def main():
                         frame_height=frame.shape[0],
                         args=args,
                     )
+                    if measurement is not None:
+                        last_tag_seen_time_s = now_s
                     mega_snapshot = base.snapshot_mega_state(state, state_lock)
+                    command_sent_this_frame = ""
+
+                    if pending_pre_turn_command:
+                        event_time_s = mega_snapshot.get("time_s")
+                        if (
+                            mega_snapshot.get("event") == "EVT:MOVE_DONE"
+                            and event_time_s is not None
+                            and event_time_s >= pre_turn_move_time_s
+                        ):
+                            auto_cmd = pending_pre_turn_command
+                            send_manual_command(ser, state, state_lock, auto_cmd)
+                            last_user_input = "auto_pre_turn"
+                            last_command_sent = auto_cmd
+                            command_sent_this_frame = auto_cmd
+                            pending_pre_turn_command = ""
+                            if args.post_turn_back_cm > 0.0:
+                                pending_post_turn_back = True
+                                turn_command_time_s = now_s
+                        elif (
+                            mega_snapshot.get("event") in ("ACK:STOP", "EVT:TURN_TIMEOUT")
+                            and event_time_s is not None
+                            and event_time_s >= pre_turn_move_time_s
+                        ):
+                            pending_pre_turn_command = ""
+
+                    if pending_post_turn_back:
+                        event_time_s = mega_snapshot.get("time_s")
+                        if (
+                            mega_snapshot.get("event") == "EVT:TURN_DONE"
+                            and event_time_s is not None
+                            and event_time_s >= turn_command_time_s
+                        ):
+                            if args.post_turn_back_cm > 0.0:
+                                auto_cmd = f"BACK_CM:{args.post_turn_back_cm:.3f}"
+                                send_manual_command(ser, state, state_lock, auto_cmd)
+                                last_user_input = "auto_post_turn_back"
+                                last_command_sent = auto_cmd
+                                command_sent_this_frame = auto_cmd
+                            pending_post_turn_back = False
+                        elif (
+                            mega_snapshot.get("event") == "EVT:TURN_TIMEOUT"
+                            and event_time_s is not None
+                            and event_time_s >= turn_command_time_s
+                        ):
+                            pending_post_turn_back = False
 
                     tag_corr_deg = None
                     tag_corr_sent = False
@@ -427,13 +503,45 @@ def main():
 
                     text = base.read_terminal_command()
                     user_input, command, should_quit = parse_terminal_command(text)
-                    command_sent_this_frame = ""
 
                     if command:
-                        send_manual_command(ser, state, state_lock, command)
-                        last_user_input = user_input or ""
-                        last_command_sent = command
-                        command_sent_this_frame = command
+                        upper_command = command.upper()
+                        is_turn_command = upper_command.startswith(("TURN_R_DEG:", "TURN_L_DEG:"))
+                        has_recent_tag = (
+                            measurement is not None
+                            or (
+                                args.turn_tag_memory_sec > 0.0
+                                and last_tag_seen_time_s >= 0.0
+                                and now_s - last_tag_seen_time_s <= args.turn_tag_memory_sec
+                            )
+                        )
+                        should_pre_move = (
+                            is_turn_command
+                            and has_recent_tag
+                            and args.pre_turn_forward_cm > 0.0
+                        )
+
+                        if should_pre_move:
+                            pre_cmd = f"FWD_CM:{args.pre_turn_forward_cm:.3f}"
+                            send_manual_command(ser, state, state_lock, pre_cmd)
+                            pending_pre_turn_command = command
+                            pre_turn_move_time_s = now_s
+                            pending_post_turn_back = False
+                            last_user_input = user_input or ""
+                            last_command_sent = pre_cmd
+                            command_sent_this_frame = pre_cmd
+                        else:
+                            send_manual_command(ser, state, state_lock, command)
+                            last_user_input = user_input or ""
+                            last_command_sent = command
+                            command_sent_this_frame = command
+
+                            if is_turn_command:
+                                pending_post_turn_back = args.post_turn_back_cm > 0.0
+                                turn_command_time_s = now_s
+                            elif upper_command == "STOP":
+                                pending_pre_turn_command = ""
+                                pending_post_turn_back = False
 
                     if not args.no_display:
                         draw_gate_box(frame, gate_info)
@@ -444,11 +552,15 @@ def main():
                         key = cv2.waitKey(1) & 0xFF
                         if key in (ord("s"), ord("S")):
                             send_manual_command(ser, state, state_lock, "STOP")
+                            pending_pre_turn_command = ""
+                            pending_post_turn_back = False
                             last_user_input = "s"
                             last_command_sent = "STOP"
                             command_sent_this_frame = "STOP"
                         elif key in (ord("q"), ord("Q"), 27):
                             send_manual_command(ser, state, state_lock, "STOP")
+                            pending_pre_turn_command = ""
+                            pending_post_turn_back = False
                             last_user_input = "q"
                             last_command_sent = "STOP"
                             command_sent_this_frame = "STOP"
@@ -464,6 +576,7 @@ def main():
                         tag_corr_deg,
                         tag_corr_sent,
                         mega_snapshot,
+                        args,
                     )
                     writer.writerow(row)
 
