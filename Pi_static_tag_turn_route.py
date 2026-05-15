@@ -4,8 +4,10 @@ Static AprilTag route runner with live tag alignment correction.
 
 Behavior:
   - Between tags, the Mega gyro controller holds the current heading.
-  - When any path tag is visible while moving, Pi sends TAG_CORR from:
-      AGV center lateral offset and tag yaw error.
+  - Between normal path tags, only the Mega gyro controller keeps the AGV
+    straight. Normal tags are used as checkpoints/log points by default.
+  - Optional straight-tag correction can be enabled from the command line,
+    but it is disabled by default.
   - tag 3 -> pre-turn forward, right 90 degree pivot, post-turn forward
   - tag 5 -> pre-turn forward, right 90 degree pivot, post-turn forward
   - tag 7 -> stop
@@ -103,6 +105,9 @@ def build_arg_parser():
     parser.add_argument("--tag-correction-hold-sec", type=float,
                         default=DEFAULT_TAG_CORRECTION_HOLD_SEC,
                         help="Keep the last tag correction alive for this long after losing the tag.")
+    parser.add_argument("--enable-straight-tag-correction", action="store_true",
+                        help=("Send TAG_CORR on normal straight checkpoint tags. Disabled by "
+                              "default so gyro holds heading between tags."))
     parser.add_argument("--gate-width-px", type=int, default=320,
                         help="Centered tag acceptance box width in pixels.")
     parser.add_argument("--gate-height-px", type=int, default=320,
@@ -391,20 +396,23 @@ def main():
     print(f"Pre-turn forward: {args.pre_turn_forward_cm:.1f} cm")
     print(f"Post-turn forward: {args.post_turn_forward_cm:.1f} cm")
     print(f"Gate box: {args.gate_width_px}x{args.gate_height_px} px at image center")
-    print("Tag correction:")
-    print(f"  camera left-of-center compensation: +{args.camera_x_offset_cm:.3f} cm")
-    print(
-        f"  agv_center_cm = tag_lateral_cm + {args.camera_x_offset_cm:.3f}"
-    )
-    print(
-        f"  raw_cmd = {args.tag_k_lat:.3f} * agv_center_cm "
-        f"+ {args.tag_k_yaw:.3f} * yaw_deg"
-    )
-    print("  tag correction command is not degree-limited")
-    print("  motor RPM is still limited inside the Mega sketch by INITIAL_RPM/MAX_RPM")
-    print("  Positive right-side AGV offset now commands right turn: left RPM should become greater than right RPM.")
-    print("  If correction goes opposite, change --tag-k-lat sign first.")
-    print(f"  tag correction hold after losing tag: {args.tag_correction_hold_sec:.2f} sec")
+    if args.enable_straight_tag_correction:
+        print("Straight tag correction: ENABLED")
+        print(f"  camera left-of-center compensation: +{args.camera_x_offset_cm:.3f} cm")
+        print(
+            f"  agv_center_cm = tag_lateral_cm + {args.camera_x_offset_cm:.3f}"
+        )
+        print(
+            f"  raw_cmd = {args.tag_k_lat:.3f} * agv_center_cm "
+            f"+ {args.tag_k_yaw:.3f} * yaw_deg"
+        )
+        print("  tag correction command is not degree-limited")
+        print("  motor RPM is still limited inside the Mega sketch by INITIAL_RPM/MAX_RPM")
+        print("  If correction goes opposite, change --tag-k-lat sign first.")
+        print(f"  tag correction hold after losing tag: {args.tag_correction_hold_sec:.2f} sec")
+    else:
+        print("Straight tag correction: DISABLED. Gyro holds heading between tags.")
+        print("  Normal tags are logged/checkpoints only; turn tags still run the 2cm + turn + 2cm sequence.")
     print(
         "Camera: "
         f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
@@ -605,15 +613,18 @@ def main():
                         last_route_tag_action = tag_action_key
 
                     else:
-                        tag_corr_raw_deg, tag_corr_cmd_deg = compute_tag_correction(measurement, args)
-                        tag_corr_active = True
-                        force_tag_command = tag_action_key != last_route_tag_action
-                        if force_tag_command or now_wall - last_tag_command_time >= args.tag_command_interval_sec:
-                            send_tag_correction(ser, state, state_lock, tag_corr_cmd_deg)
-                            last_tag_command_time = now_wall
-                            tag_corr_sent = True
-                            tag_correction_was_active = True
-                            route_action = f"tag_{stable_tag_id}_corr"
+                        if args.enable_straight_tag_correction:
+                            tag_corr_raw_deg, tag_corr_cmd_deg = compute_tag_correction(measurement, args)
+                            tag_corr_active = True
+                            force_tag_command = tag_action_key != last_route_tag_action
+                            if force_tag_command or now_wall - last_tag_command_time >= args.tag_command_interval_sec:
+                                send_tag_correction(ser, state, state_lock, tag_corr_cmd_deg)
+                                last_tag_command_time = now_wall
+                                tag_corr_sent = True
+                                tag_correction_was_active = True
+                                route_action = f"tag_{stable_tag_id}_corr"
+                        elif tag_action_key != last_route_tag_action:
+                            route_action = f"tag_{stable_tag_id}_checkpoint"
 
                         if tag_action_key != last_route_tag_action:
                             print(f"[ROUTE] checkpoint/correction tag {stable_tag_id}")
