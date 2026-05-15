@@ -15,8 +15,10 @@ Upload `03_Manual_debug_distance_angle_control.ino` to the Mega before running.
 
 import argparse
 import csv
+import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -180,6 +182,19 @@ def send_manual_command(ser, state, state_lock, command):
     base.send_command(ser, state, state_lock, command)
 
 
+
+@contextmanager
+def suppress_native_stderr():
+    saved_stderr_fd = os.dup(2)
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stderr_fd)
+
+
 def quiet_serial_reader(ser, stop_event, state, state_lock, start_time):
     while not stop_event.is_set():
         try:
@@ -212,7 +227,8 @@ def main():
         raise RuntimeError(f"Could not open camera index {args.camera}")
 
     base.configure_camera(cap, camera_args)
-    base.warmup_camera(cap, args.camera_warmup_sec, args.max_camera_failures)
+    with suppress_native_stderr():
+        base.warmup_camera(cap, args.camera_warmup_sec, args.max_camera_failures)
     detector = base.create_detector()
 
     state = base.make_initial_mega_state()
@@ -256,73 +272,74 @@ def main():
             writer = csv.DictWriter(log_file, fieldnames=FIELDNAMES)
             writer.writeheader()
 
-            while not stop_event.is_set():
-                ret, frame = cap.read()
-                if not ret:
-                    camera_failures += 1
-                    print(
-                        "Camera frame read failed "
-                        f"({camera_failures}/{args.max_camera_failures})."
+            with suppress_native_stderr():
+                while not stop_event.is_set():
+                    ret, frame = cap.read()
+                    if not ret:
+                        camera_failures += 1
+                        print(
+                            "Camera frame read failed "
+                            f"({camera_failures}/{args.max_camera_failures})."
+                        )
+                        if camera_failures >= args.max_camera_failures:
+                            send_manual_command(ser, state, state_lock, "STOP")
+                            break
+                        time.sleep(0.05)
+                        continue
+
+                    camera_failures = 0
+                    frame_index += 1
+                    now_s = time.time() - start_time
+
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    detections = detector.detect(gray)
+                    measurement = select_best_measurement(
+                        detections,
+                        frame_width=frame.shape[1],
+                        tag_size_cm=args.tag_size_cm,
                     )
-                    if camera_failures >= args.max_camera_failures:
-                        send_manual_command(ser, state, state_lock, "STOP")
+                    mega_snapshot = base.snapshot_mega_state(state, state_lock)
+
+                    text = base.read_terminal_command()
+                    user_input, command, should_quit = parse_terminal_command(text)
+                    command_sent_this_frame = ""
+
+                    if command:
+                        send_manual_command(ser, state, state_lock, command)
+                        last_user_input = user_input or ""
+                        last_command_sent = command
+                        command_sent_this_frame = command
+
+                    if not args.no_display:
+                        if measurement:
+                            base.draw_measurement(frame, measurement)
+                        base.draw_status(frame, mega_snapshot)
+                        cv2.imshow("Manual Debug Control Logger", frame)
+                        key = cv2.waitKey(1) & 0xFF
+                        if key in (ord("s"), ord("S")):
+                            send_manual_command(ser, state, state_lock, "STOP")
+                            last_user_input = "s"
+                            last_command_sent = "STOP"
+                            command_sent_this_frame = "STOP"
+                        elif key in (ord("q"), ord("Q"), 27):
+                            send_manual_command(ser, state, state_lock, "STOP")
+                            last_user_input = "q"
+                            last_command_sent = "STOP"
+                            command_sent_this_frame = "STOP"
+                            should_quit = True
+
+                    row = build_row(
+                        now_s,
+                        frame_index,
+                        command_sent_this_frame and last_user_input,
+                        command_sent_this_frame,
+                        measurement,
+                        mega_snapshot,
+                    )
+                    writer.writerow(row)
+
+                    if should_quit:
                         break
-                    time.sleep(0.05)
-                    continue
-
-                camera_failures = 0
-                frame_index += 1
-                now_s = time.time() - start_time
-
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                detections = detector.detect(gray)
-                measurement = select_best_measurement(
-                    detections,
-                    frame_width=frame.shape[1],
-                    tag_size_cm=args.tag_size_cm,
-                )
-                mega_snapshot = base.snapshot_mega_state(state, state_lock)
-
-                text = base.read_terminal_command()
-                user_input, command, should_quit = parse_terminal_command(text)
-                command_sent_this_frame = ""
-
-                if command:
-                    send_manual_command(ser, state, state_lock, command)
-                    last_user_input = user_input or ""
-                    last_command_sent = command
-                    command_sent_this_frame = command
-
-                if not args.no_display:
-                    if measurement:
-                        base.draw_measurement(frame, measurement)
-                    base.draw_status(frame, mega_snapshot)
-                    cv2.imshow("Manual Debug Control Logger", frame)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (ord("s"), ord("S")):
-                        send_manual_command(ser, state, state_lock, "STOP")
-                        last_user_input = "s"
-                        last_command_sent = "STOP"
-                        command_sent_this_frame = "STOP"
-                    elif key in (ord("q"), ord("Q"), 27):
-                        send_manual_command(ser, state, state_lock, "STOP")
-                        last_user_input = "q"
-                        last_command_sent = "STOP"
-                        command_sent_this_frame = "STOP"
-                        should_quit = True
-
-                row = build_row(
-                    now_s,
-                    frame_index,
-                    command_sent_this_frame and last_user_input,
-                    command_sent_this_frame,
-                    measurement,
-                    mega_snapshot,
-                )
-                writer.writerow(row)
-
-                if should_quit:
-                    break
 
     finally:
         stop_event.set()
