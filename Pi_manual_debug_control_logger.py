@@ -80,6 +80,8 @@ def build_arg_parser():
                               "this many cm before starting the turn. Use 0 to disable."))
     parser.add_argument("--turn-tag-memory-sec", type=float, default=0.4,
                         help="Treat a tag as recently visible for this long when a turn is requested.")
+    parser.add_argument("--post-turn-forward-cm", type=float, default=2.0,
+                        help="Automatic forward move after a turn finishes. Use 0 to disable.")
     parser.add_argument("--post-turn-back-cm", type=float, default=0.0,
                         help="Optional backward move after a turn finishes. Default is disabled.")
     parser.add_argument("--gate-width-px", type=int, default=180,
@@ -385,6 +387,7 @@ def main():
     print(f"Camera X offset compensation: {args.camera_x_offset_cm:.2f} cm")
     print(f"Pre-turn forward: {args.pre_turn_forward_cm:.2f} cm when tag is visible")
     print(f"Turn tag memory: {args.turn_tag_memory_sec:.2f} sec")
+    print(f"Post-turn forward: {args.post_turn_forward_cm:.2f} cm")
     print(f"Post-turn backup: {args.post_turn_back_cm:.2f} cm")
     print(f"Gate box: {args.gate_width_px}x{args.gate_height_px} px at image center")
     print(f"Tag correction: {args.tag_k_lat:.2f}*offset_cm + {args.tag_k_yaw:.2f}*tag_yaw_deg")
@@ -398,6 +401,7 @@ def main():
     last_tag_seen_time_s = -1.0
     pending_pre_turn_command = ""
     pre_turn_move_time_s = -1.0
+    pending_post_turn_forward = False
     pending_post_turn_back = False
     turn_command_time_s = -1.0
 
@@ -456,35 +460,48 @@ def main():
                             last_command_sent = auto_cmd
                             command_sent_this_frame = auto_cmd
                             pending_pre_turn_command = ""
-                            if args.post_turn_back_cm > 0.0:
-                                pending_post_turn_back = True
-                                turn_command_time_s = now_s
+                            pending_post_turn_forward = args.post_turn_forward_cm > 0.0
+                            pending_post_turn_back = (
+                                not pending_post_turn_forward
+                                and args.post_turn_back_cm > 0.0
+                            )
+                            turn_command_time_s = now_s
                         elif (
                             mega_snapshot.get("event") in ("ACK:STOP", "EVT:TURN_TIMEOUT")
                             and event_time_s is not None
                             and event_time_s >= pre_turn_move_time_s
                         ):
                             pending_pre_turn_command = ""
+                            pending_post_turn_forward = False
+                            pending_post_turn_back = False
 
-                    if pending_post_turn_back:
+                    if pending_post_turn_forward or pending_post_turn_back:
                         event_time_s = mega_snapshot.get("time_s")
                         if (
                             mega_snapshot.get("event") == "EVT:TURN_DONE"
                             and event_time_s is not None
                             and event_time_s >= turn_command_time_s
                         ):
-                            if args.post_turn_back_cm > 0.0:
+                            if pending_post_turn_forward:
+                                auto_cmd = f"FWD_CM:{args.post_turn_forward_cm:.3f}"
+                                send_manual_command(ser, state, state_lock, auto_cmd)
+                                last_user_input = "auto_post_turn_forward"
+                                last_command_sent = auto_cmd
+                                command_sent_this_frame = auto_cmd
+                            elif pending_post_turn_back:
                                 auto_cmd = f"BACK_CM:{args.post_turn_back_cm:.3f}"
                                 send_manual_command(ser, state, state_lock, auto_cmd)
                                 last_user_input = "auto_post_turn_back"
                                 last_command_sent = auto_cmd
                                 command_sent_this_frame = auto_cmd
+                            pending_post_turn_forward = False
                             pending_post_turn_back = False
                         elif (
                             mega_snapshot.get("event") == "EVT:TURN_TIMEOUT"
                             and event_time_s is not None
                             and event_time_s >= turn_command_time_s
                         ):
+                            pending_post_turn_forward = False
                             pending_post_turn_back = False
 
                     tag_corr_deg = None
@@ -526,6 +543,7 @@ def main():
                             send_manual_command(ser, state, state_lock, pre_cmd)
                             pending_pre_turn_command = command
                             pre_turn_move_time_s = now_s
+                            pending_post_turn_forward = False
                             pending_post_turn_back = False
                             last_user_input = user_input or ""
                             last_command_sent = pre_cmd
@@ -537,10 +555,15 @@ def main():
                             command_sent_this_frame = command
 
                             if is_turn_command:
-                                pending_post_turn_back = args.post_turn_back_cm > 0.0
+                                pending_post_turn_forward = args.post_turn_forward_cm > 0.0
+                                pending_post_turn_back = (
+                                    not pending_post_turn_forward
+                                    and args.post_turn_back_cm > 0.0
+                                )
                                 turn_command_time_s = now_s
                             elif upper_command == "STOP":
                                 pending_pre_turn_command = ""
+                                pending_post_turn_forward = False
                                 pending_post_turn_back = False
 
                     if not args.no_display:
@@ -553,6 +576,7 @@ def main():
                         if key in (ord("s"), ord("S")):
                             send_manual_command(ser, state, state_lock, "STOP")
                             pending_pre_turn_command = ""
+                            pending_post_turn_forward = False
                             pending_post_turn_back = False
                             last_user_input = "s"
                             last_command_sent = "STOP"
@@ -560,6 +584,7 @@ def main():
                         elif key in (ord("q"), ord("Q"), 27):
                             send_manual_command(ser, state, state_lock, "STOP")
                             pending_pre_turn_command = ""
+                            pending_post_turn_forward = False
                             pending_post_turn_back = False
                             last_user_input = "q"
                             last_command_sent = "STOP"
@@ -602,6 +627,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
