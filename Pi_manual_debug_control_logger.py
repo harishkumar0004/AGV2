@@ -25,7 +25,6 @@ import cv2
 
 import Pi_tag_pose_mega_logger as base
 
-DEFAULT_DEBUG_PRINT_INTERVAL_SEC = 0.20
 
 FIELDNAMES = [
     "time_s",
@@ -64,8 +63,6 @@ def build_arg_parser():
     parser.add_argument("--power-line-frequency", type=int, default=base.DEFAULT_POWER_LINE_FREQUENCY)
     parser.add_argument("--skip-v4l2-controls", action="store_true")
     parser.add_argument("--no-display", action="store_true")
-    parser.add_argument("--debug-print-interval-sec", type=float,
-                        default=DEFAULT_DEBUG_PRINT_INTERVAL_SEC)
     parser.add_argument("--output-dir", default="Pi_csv_outputs")
     return parser
 
@@ -183,6 +180,21 @@ def send_manual_command(ser, state, state_lock, command):
     base.send_command(ser, state, state_lock, command)
 
 
+def quiet_serial_reader(ser, stop_event, state, state_lock, start_time):
+    while not stop_event.is_set():
+        try:
+            line = ser.readline().decode("utf-8", errors="replace").strip()
+        except base.serial.SerialException as exc:
+            line = f"SERIAL_READ_ERROR:{exc}"
+            stop_event.set()
+
+        if not line:
+            continue
+
+        with state_lock:
+            base.update_mega_state_from_line(state, line, start_time)
+
+
 def main():
     args = build_arg_parser().parse_args()
     output_path = log_path(args.output_dir)
@@ -211,7 +223,7 @@ def main():
     reader = None
     if ser is not None:
         reader = threading.Thread(
-            target=base.serial_reader,
+            target=quiet_serial_reader,
             args=(ser, stop_event, state, state_lock, start_time),
             daemon=True,
         )
@@ -236,7 +248,6 @@ def main():
 
     frame_index = 0
     camera_failures = 0
-    last_debug_print_time = 0.0
     last_user_input = ""
     last_command_sent = ""
 
@@ -262,7 +273,6 @@ def main():
                 camera_failures = 0
                 frame_index += 1
                 now_s = time.time() - start_time
-                now_wall = time.time()
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 detections = detector.detect(gray)
@@ -310,27 +320,6 @@ def main():
                     mega_snapshot,
                 )
                 writer.writerow(row)
-
-                if now_wall - last_debug_print_time >= args.debug_print_interval_sec:
-                    tag_yaw = ""
-                    tag_px = ""
-                    center_dev_cm = ""
-                    if measurement is not None:
-                        tag_yaw = base.fmt(measurement.get("yaw_error_deg"), 2)
-                        tag_px = base.fmt(measurement.get("lateral_offset_px"), 1)
-                        center_dev_cm = base.fmt(measurement.get("lateral_offset_cm"), 2)
-                    print(
-                        "[DBG] "
-                        f"cmd={last_command_sent} "
-                        f"tag={measurement['tag_id'] if measurement else ''} "
-                        f"tag_yaw={tag_yaw} "
-                        f"tag_px={tag_px} "
-                        f"center_dev_cm={center_dev_cm} "
-                        f"gyro_yaw={base.fmt(mega_snapshot.get('H'), 2)} "
-                        f"gyro_dev={base.fmt(mega_snapshot.get('E'), 2)} "
-                        f"event={mega_snapshot.get('event')}"
-                    )
-                    last_debug_print_time = now_wall
 
                 if should_quit:
                     break
