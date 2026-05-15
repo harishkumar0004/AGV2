@@ -41,6 +41,8 @@ DEFAULT_TAG_COMMAND_INTERVAL_SEC = 0.08
 DEFAULT_TAG_CORRECTION_HOLD_SEC = 0.30
 DEFAULT_DEBUG_PRINT_INTERVAL_SEC = 0.0
 DEFAULT_CAMERA_X_OFFSET_CM = 1.5
+DEFAULT_DECELERATION_START_CHUNK = 2
+DEFAULT_DECELERATION_FORWARD_CM = 50.0
 
 ROUTE_FIELDNAMES = [
     "route_state",
@@ -61,6 +63,8 @@ ROUTE_FIELDNAMES = [
     "tag_k_yaw",
     "pending_turn_tag_id",
     "pending_turn_command",
+    "forward_chunks_sent",
+    "in_deceleration_phase",
 ] + base.FIELDNAMES
 
 
@@ -116,6 +120,12 @@ def build_arg_parser():
                         default=DEFAULT_DEBUG_PRINT_INTERVAL_SEC)
     parser.add_argument("--output-dir", default="Pi_csv_outputs")
     parser.add_argument("--log-every-frame", action="store_true")
+    parser.add_argument("--deceleration-start-chunk", type=int, default=DEFAULT_DECELERATION_START_CHUNK,
+                        help=("After this many forward chunks, start deceleration before turn tags. "
+                              "E.g., 2 means after 2x300cm chunks, use smaller chunks (50cm default) "
+                              "to gradually slow down before tags 3 and 5."))
+    parser.add_argument("--deceleration-forward-cm", type=float, default=DEFAULT_DECELERATION_FORWARD_CM,
+                        help="Forward distance in cm used during deceleration phase before turn tags.")
     return parser
 
 
@@ -331,7 +341,8 @@ def send_tag_correction(ser, state, state_lock, correction_deg):
 def add_route_fields(row, route_state, stable_tag_id, stable_count, route_action,
                      handled_turn_tags, tag_corr_active, tag_corr_sent,
                      tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
-                     gate_info, pending_turn_tag_id, pending_turn_command, args):
+                     gate_info, pending_turn_tag_id, pending_turn_command, 
+                     forward_chunks_sent, in_deceleration_phase, args):
     row.update({
         "route_state": route_state,
         "stable_tag_id": stable_tag_id,
@@ -351,6 +362,8 @@ def add_route_fields(row, route_state, stable_tag_id, stable_count, route_action
         "tag_k_yaw": base.fmt(args.tag_k_yaw),
         "pending_turn_tag_id": pending_turn_tag_id if pending_turn_tag_id is not None else "",
         "pending_turn_command": pending_turn_command,
+        "forward_chunks_sent": forward_chunks_sent,
+        "in_deceleration_phase": 1 if in_deceleration_phase else 0,
     })
     return row
 
@@ -393,9 +406,15 @@ def main():
     print("Controls: f=START ROUTE, s=STOP, q=STOP+QUIT")
     print(f"Route: tag 3 -> right {args.turn_deg:.1f}, tag 5 -> right {args.turn_deg:.1f}, tag 7 -> stop")
     print(f"Forward chunk: {args.forward_chunk_cm:.1f} cm")
+    print(f"Deceleration: starts after {args.deceleration_start_chunk} chunks, uses {args.deceleration_forward_cm:.1f} cm forward")
     print(f"Pre-turn forward: {args.pre_turn_forward_cm:.1f} cm")
     print(f"Post-turn forward: {args.post_turn_forward_cm:.1f} cm")
     print(f"Gate box: {args.gate_width_px}x{args.gate_height_px} px at image center")
+    print("")
+    print("HEADING CONTROL VERIFICATION:")
+    print("  Between tags: GYRO HEADING is PRIMARY (no tag correction)")
+    print("  During tag detection: TAG PIXEL CORRECTION adjusts heading (if enabled)")
+    print("  Turn tags 3 & 5: Execute forward-turn-forward sequence with deceleration")
     if args.enable_straight_tag_correction:
         print("Straight tag correction: ENABLED")
         print(f"  camera left-of-center compensation: +{args.camera_x_offset_cm:.3f} cm")
@@ -440,6 +459,8 @@ def main():
     pending_turn_start_time_s = -1.0
     pending_post_turn_forward = False
     route_step_start_time_s = -1.0
+    forward_chunks_sent = 0
+    in_deceleration_phase = False
 
     try:
         with log_path.open("w", newline="") as log_file:
@@ -535,6 +556,8 @@ def main():
                             pending_turn_tag_id = None
                             pending_turn_command = ""
                             pending_post_turn_forward = False
+                            forward_chunks_sent = 0
+                            in_deceleration_phase = False
                             route_action = "turn_done_forward_chunk"
 
                     elif (
@@ -543,6 +566,8 @@ def main():
                         and event_time_s is not None
                         and event_time_s >= route_step_start_time_s
                     ):
+                        forward_chunks_sent = 0
+                        in_deceleration_phase = False
                         next_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
                         send_route_command(ser, state, state_lock, next_cmd)
                         route_state = "MOVING"
@@ -558,10 +583,18 @@ def main():
                         and event_time_s is not None
                         and event_time_s >= route_step_start_time_s
                     ):
-                        next_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
+                        forward_chunks_sent += 1
+                        in_deceleration_phase = forward_chunks_sent >= args.deceleration_start_chunk
+                        
+                        if in_deceleration_phase:
+                            next_cmd = f"FWD_CM:{args.deceleration_forward_cm:.3f}"
+                            route_action = f"forward_chunk_restart_decel_{args.deceleration_forward_cm:.0f}cm"
+                        else:
+                            next_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
+                            route_action = f"forward_chunk_restart_{args.forward_chunk_cm:.0f}cm"
+                        
                         send_route_command(ser, state, state_lock, next_cmd)
                         route_step_start_time_s = now_s
-                        route_action = "forward_chunk_restart"
 
                     elif route_state == "TURNING" and mega_event == "EVT:TURN_TIMEOUT":
                         send_route_command(ser, state, state_lock, "STOP")
@@ -685,6 +718,8 @@ def main():
                     pending_turn_command = ""
                     pending_turn_start_time_s = -1.0
                     pending_post_turn_forward = False
+                    forward_chunks_sent = 0
+                    in_deceleration_phase = False
                     send_tag_correction(ser, state, state_lock, 0.0)
                     start_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
                     send_route_command(ser, state, state_lock, start_cmd)
@@ -698,6 +733,8 @@ def main():
                     pending_turn_tag_id = None
                     pending_turn_command = ""
                     pending_post_turn_forward = False
+                    forward_chunks_sent = 0
+                    in_deceleration_phase = False
                     route_state = "STOPPED"
                     route_action = "manual_stop"
                 elif requested_command == "QUIT":
@@ -711,7 +748,8 @@ def main():
                         handled_turn_tags, tag_corr_active, tag_corr_sent,
                         tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
                         gate_info,
-                        pending_turn_tag_id, pending_turn_command, args
+                        pending_turn_tag_id, pending_turn_command,
+                        forward_chunks_sent, in_deceleration_phase, args
                     )
                     writer.writerow(row)
                     break
@@ -749,7 +787,8 @@ def main():
                         handled_turn_tags, tag_corr_active, tag_corr_sent,
                         tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
                         gate_info,
-                        pending_turn_tag_id, pending_turn_command, args
+                        pending_turn_tag_id, pending_turn_command,
+                        forward_chunks_sent, in_deceleration_phase, args
                     )
                     writer.writerow(row)
 
