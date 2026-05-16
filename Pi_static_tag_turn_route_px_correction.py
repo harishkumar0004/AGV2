@@ -42,6 +42,11 @@ DEFAULT_TAG_COMMAND_INTERVAL_SEC = 0.08
 DEFAULT_TAG_CORRECTION_HOLD_SEC = 0.30
 DEFAULT_DEBUG_PRINT_INTERVAL_SEC = 0.0
 DEFAULT_CAMERA_X_OFFSET_CM = 0.0
+DEFAULT_NORMAL_MOVE_RPM = 20.0
+DEFAULT_TURN_APPROACH_RPM = 6.0
+DEFAULT_TURN_CENTER_TOLERANCE_PX = 15.0
+DEFAULT_TURN_ALIGN_STEP_CM = 1.0
+DEFAULT_TURN_ALIGN_TIMEOUT_SEC = 8.0
 
 ROUTE_FIELDNAMES = [
     "route_state",
@@ -64,6 +69,11 @@ ROUTE_FIELDNAMES = [
     "tag_k_yaw",
     "pending_turn_tag_id",
     "pending_turn_command",
+    "turn_centered",
+    "turn_center_tolerance_px",
+    "turn_align_step_cm",
+    "turn_align_timeout_sec",
+    "move_rpm_command",
 ] + base.FIELDNAMES
 
 
@@ -96,6 +106,16 @@ def build_arg_parser():
                         help="Move forward this many cm after the pivot turn finishes.")
     parser.add_argument("--turn-deg", type=float, default=90.0,
                         help="Pivot angle used for turn tags.")
+    parser.add_argument("--normal-move-rpm", type=float, default=DEFAULT_NORMAL_MOVE_RPM,
+                        help="Mega MOVE_RPM used for normal forward chunks.")
+    parser.add_argument("--turn-approach-rpm", type=float, default=DEFAULT_TURN_APPROACH_RPM,
+                        help="Mega MOVE_RPM used while centering on a turn tag and during 2 cm approach moves.")
+    parser.add_argument("--turn-center-tolerance-px", type=float, default=DEFAULT_TURN_CENTER_TOLERANCE_PX,
+                        help="Turn tag is considered centered when abs(tag center x - image center x) is below this many pixels.")
+    parser.add_argument("--turn-align-step-cm", type=float, default=DEFAULT_TURN_ALIGN_STEP_CM,
+                        help="Small slow forward step used while aligning to a turn tag.")
+    parser.add_argument("--turn-align-timeout-sec", type=float, default=DEFAULT_TURN_ALIGN_TIMEOUT_SEC,
+                        help="Stop with ERROR if turn-tag centering takes longer than this.")
     parser.add_argument("--camera-x-offset-cm", type=float, default=DEFAULT_CAMERA_X_OFFSET_CM,
                         help="Only logged in this pixel-correction variant; not used for correction.")
     parser.add_argument("--tag-k-lat", type=float, default=DEFAULT_TAG_K_LAT_DEG_PER_CM,
@@ -270,6 +290,20 @@ def turn_command_from_direction(direction, degrees):
     return f"TURN_R_DEG:{degrees:.3f}"
 
 
+def is_turn_tag_centered(gate_info, args):
+    dx_px = gate_info.get("dx_px")
+    if dx_px is None:
+        return False
+
+    return abs(dx_px) <= args.turn_center_tolerance_px
+
+
+def send_move_rpm(ser, state, state_lock, rpm):
+    command = f"MOVE_RPM:{rpm:.2f}"
+    send_route_command(ser, state, state_lock, command)
+    return command
+
+
 def route_log_path(output_dir):
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -361,7 +395,8 @@ def send_tag_correction(ser, state, state_lock, correction_deg):
 def add_route_fields(row, route_state, route_active, stable_tag_id, stable_count, route_action,
                      handled_turn_tags, tag_corr_active, tag_corr_sent,
                      tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
-                     gate_info, pending_turn_tag_id, pending_turn_command, args):
+                     gate_info, pending_turn_tag_id, pending_turn_command,
+                     turn_centered, move_rpm_command, args):
     row.update({
         "route_state": route_state,
         "route_active": 1 if route_active else 0,
@@ -383,6 +418,11 @@ def add_route_fields(row, route_state, route_active, stable_tag_id, stable_count
         "tag_k_yaw": base.fmt(args.tag_k_yaw),
         "pending_turn_tag_id": pending_turn_tag_id if pending_turn_tag_id is not None else "",
         "pending_turn_command": pending_turn_command,
+        "turn_centered": 1 if turn_centered else 0,
+        "turn_center_tolerance_px": base.fmt(args.turn_center_tolerance_px),
+        "turn_align_step_cm": base.fmt(args.turn_align_step_cm),
+        "turn_align_timeout_sec": base.fmt(args.turn_align_timeout_sec),
+        "move_rpm_command": move_rpm_command,
     })
     return row
 
@@ -427,6 +467,9 @@ def main():
     print(f"Forward chunk: {args.forward_chunk_cm:.1f} cm")
     print(f"Pre-turn forward: {args.pre_turn_forward_cm:.1f} cm")
     print(f"Post-turn forward: {args.post_turn_forward_cm:.1f} cm")
+    print(f"Normal move RPM: {args.normal_move_rpm:.1f}")
+    print(f"Turn approach/alignment RPM: {args.turn_approach_rpm:.1f}")
+    print(f"Turn centering: abs(dx) <= {args.turn_center_tolerance_px:.1f} px, step {args.turn_align_step_cm:.1f} cm")
     print(f"Gate box: {args.gate_width_px}x{args.gate_height_px} px at image center")
     if not args.disable_straight_tag_correction:
         print("Straight tag correction: ENABLED with pixel offset")
@@ -471,6 +514,7 @@ def main():
     pending_turn_start_time_s = -1.0
     pending_post_turn_forward = False
     route_step_start_time_s = -1.0
+    turn_align_start_time_s = -1.0
 
     try:
         with log_path.open("w", newline="") as log_file:
@@ -527,6 +571,8 @@ def main():
                 tag_corr_cmd_deg = None
                 tag_corr_active = False
                 tag_corr_sent = False
+                turn_centered = is_turn_tag_centered(gate_info, args)
+                move_rpm_command = ""
 
                 mega_event = mega_snapshot.get("event", "")
                 mega_event_seq = mega_snapshot.get("event_seq", 0)
@@ -535,6 +581,17 @@ def main():
                     event_time_s = mega_snapshot.get("event_time_s", mega_snapshot.get("time_s"))
 
                     if (
+                        route_active
+                        and route_state == "ALIGN_TURN_STEP"
+                        and mega_event == "EVT:MOVE_DONE"
+                        and event_time_s is not None
+                        and event_time_s >= route_step_start_time_s
+                    ):
+                        route_state = "ALIGN_TURN_TAG"
+                        route_step_start_time_s = now_s
+                        route_action = "turn_align_step_done"
+
+                    elif (
                         route_active
                         and route_state == "PRE_TURN_FORWARD"
                         and mega_event == "EVT:MOVE_DONE"
@@ -561,6 +618,7 @@ def main():
                             route_step_start_time_s = now_s
                             route_action = "turn_done_post_forward"
                         else:
+                            move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
                             next_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
                             send_route_command(ser, state, state_lock, next_cmd)
                             route_state = "MOVING"
@@ -577,6 +635,7 @@ def main():
                         and event_time_s is not None
                         and event_time_s >= route_step_start_time_s
                     ):
+                        move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
                         next_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
                         send_route_command(ser, state, state_lock, next_cmd)
                         route_state = "MOVING"
@@ -593,6 +652,7 @@ def main():
                         and event_time_s is not None
                         and event_time_s >= route_step_start_time_s
                     ):
+                        move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
                         next_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
                         send_route_command(ser, state, state_lock, next_cmd)
                         route_step_start_time_s = now_s
@@ -627,12 +687,12 @@ def main():
                         pending_post_turn_forward = False
                         route_action = "turn_timeout_stop"
 
-                stable_tag_visible = (
-                    route_state == "MOVING"
-                    and measurement is not None
+                tag_visible_in_gate = (
+                    measurement is not None
                     and gate_info["inside"]
                     and stable_count >= args.min_stable_frames
                 )
+                stable_tag_visible = route_state == "MOVING" and tag_visible_in_gate
 
                 if stable_tag_visible:
                     tag_action_key = (stable_tag_id, route_state)
@@ -648,24 +708,17 @@ def main():
 
                     elif route_active and stable_tag_id in TURN_TAGS and stable_tag_id not in handled_turn_tags:
                         send_tag_correction(ser, state, state_lock, 0.0)
+                        move_rpm_command = send_move_rpm(ser, state, state_lock, args.turn_approach_rpm)
+                        send_route_command(ser, state, state_lock, "STOP")
                         pending_turn_tag_id = stable_tag_id
                         pending_turn_command = turn_command_from_direction(
                             TURN_TAGS[stable_tag_id],
                             args.turn_deg,
                         )
-                        pre_turn_cmd = f"FWD_CM:{args.pre_turn_forward_cm:.3f}"
-                        if args.pre_turn_forward_cm > 0.0:
-                            send_route_command(ser, state, state_lock, pre_turn_cmd)
-                            route_state = "PRE_TURN_FORWARD"
-                            route_step_start_time_s = now_s
-                            route_action = f"tag_{stable_tag_id}_pre_turn_forward"
-                        else:
-                            send_route_command(ser, state, state_lock, pending_turn_command)
-                            route_state = "TURNING"
-                            pending_turn_start_time_s = now_s
-                            route_step_start_time_s = now_s
-                            route_action = f"tag_{stable_tag_id}_{pending_turn_command.lower()}"
-                        handled_turn_tags.add(stable_tag_id)
+                        route_state = "ALIGN_TURN_TAG"
+                        route_step_start_time_s = now_s
+                        turn_align_start_time_s = now_s
+                        route_action = f"tag_{stable_tag_id}_align_start"
                         tag_correction_was_active = False
                         last_route_tag_action = tag_action_key
 
@@ -687,8 +740,55 @@ def main():
                             print(f"[ROUTE] checkpoint/correction tag {stable_tag_id}")
                             last_route_tag_action = tag_action_key
 
+                elif route_active and route_state == "ALIGN_TURN_TAG":
+                    if (
+                        turn_align_start_time_s >= 0.0
+                        and now_s - turn_align_start_time_s > args.turn_align_timeout_sec
+                    ):
+                        send_tag_correction(ser, state, state_lock, 0.0)
+                        send_route_command(ser, state, state_lock, "STOP")
+                        route_state = "ERROR"
+                        route_active = False
+                        tag_correction_was_active = False
+                        route_action = "turn_align_timeout_stop"
+                    elif tag_visible_in_gate and stable_tag_id == pending_turn_tag_id:
+                        tag_corr_raw_deg, tag_corr_cmd_deg = compute_tag_correction(measurement, args)
+                        tag_corr_active = True
+
+                        if turn_centered:
+                            send_tag_correction(ser, state, state_lock, 0.0)
+                            tag_corr_sent = True
+                            tag_correction_was_active = False
+                            handled_turn_tags.add(pending_turn_tag_id)
+
+                            if args.pre_turn_forward_cm > 0.0:
+                                pre_turn_cmd = f"FWD_CM:{args.pre_turn_forward_cm:.3f}"
+                                send_route_command(ser, state, state_lock, pre_turn_cmd)
+                                route_state = "PRE_TURN_FORWARD"
+                                route_step_start_time_s = now_s
+                                route_action = f"tag_{pending_turn_tag_id}_centered_pre_turn_forward"
+                            else:
+                                send_route_command(ser, state, state_lock, pending_turn_command)
+                                route_state = "TURNING"
+                                pending_turn_start_time_s = now_s
+                                route_step_start_time_s = now_s
+                                route_action = f"tag_{pending_turn_tag_id}_{pending_turn_command.lower()}"
+                        else:
+                            send_tag_correction(ser, state, state_lock, tag_corr_cmd_deg)
+                            last_tag_command_time = now_wall
+                            tag_corr_sent = True
+                            tag_correction_was_active = True
+                            align_step_cm = max(0.1, args.turn_align_step_cm)
+                            send_route_command(ser, state, state_lock, f"FWD_CM:{align_step_cm:.3f}")
+                            route_state = "ALIGN_TURN_STEP"
+                            route_step_start_time_s = now_s
+                            route_action = f"tag_{pending_turn_tag_id}_align_step"
+                    else:
+                        route_action = "turn_align_wait_tag"
+
                 elif (
                     tag_correction_was_active
+                    and route_state not in ("ALIGN_TURN_TAG", "ALIGN_TURN_STEP")
                     and now_wall - last_tag_command_time > args.tag_correction_hold_sec
                 ):
                     send_tag_correction(ser, state, state_lock, 0.0)
@@ -743,7 +843,9 @@ def main():
                     pending_turn_command = ""
                     pending_turn_start_time_s = -1.0
                     pending_post_turn_forward = False
+                    turn_align_start_time_s = -1.0
                     send_tag_correction(ser, state, state_lock, 0.0)
+                    move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
                     start_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
                     send_route_command(ser, state, state_lock, start_cmd)
                     route_state = "MOVING"
@@ -771,7 +873,8 @@ def main():
                         handled_turn_tags, tag_corr_active, tag_corr_sent,
                         tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
                         gate_info,
-                        pending_turn_tag_id, pending_turn_command, args
+                        pending_turn_tag_id, pending_turn_command,
+                        turn_centered, move_rpm_command, args
                     )
                     writer.writerow(row)
                     break
@@ -788,6 +891,8 @@ def main():
                     pending_post_turn_forward = False
                     tag_correction_was_active = False
                     send_tag_correction(ser, state, state_lock, 0.0)
+                    if requested_command.startswith(("FWD_CM:", "BACK_CM:")):
+                        move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
                     send_route_command(ser, state, state_lock, requested_command)
                     route_step_start_time_s = now_s
                     if requested_command.startswith(("FWD_CM:", "BACK_CM:")):
@@ -829,7 +934,8 @@ def main():
                         handled_turn_tags, tag_corr_active, tag_corr_sent,
                         tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
                         gate_info,
-                        pending_turn_tag_id, pending_turn_command, args
+                        pending_turn_tag_id, pending_turn_command,
+                        turn_centered, move_rpm_command, args
                     )
                     writer.writerow(row)
 
