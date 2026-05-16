@@ -700,17 +700,23 @@ def main():
                         pending_post_turn_forward = False
                         route_action = "turn_timeout_stop"
 
-                tag_visible_in_gate = (
+                tag_stable_visible = (
                     measurement is not None
-                    and gate_info["inside"]
                     and stable_count >= args.min_stable_frames
                 )
-                stable_tag_visible = route_state == "MOVING" and tag_visible_in_gate
+                tag_visible_in_gate = tag_stable_visible and gate_info["inside"]
+                turn_tag_visible = (
+                    route_state == "MOVING"
+                    and tag_stable_visible
+                    and stable_tag_id in TURN_TAGS
+                    and stable_tag_id not in handled_turn_tags
+                )
+                stable_tag_visible = route_state == "MOVING" and (tag_visible_in_gate or turn_tag_visible)
 
                 if stable_tag_visible:
                     tag_action_key = (stable_tag_id, route_state)
 
-                    if route_active and stable_tag_id == FINAL_TAG_ID and tag_action_key != last_route_tag_action:
+                    if route_active and stable_tag_id == FINAL_TAG_ID and tag_visible_in_gate and tag_action_key != last_route_tag_action:
                         send_tag_correction(ser, state, state_lock, 0.0)
                         send_route_command(ser, state, state_lock, "STOP")
                         tag_correction_was_active = False
@@ -731,7 +737,10 @@ def main():
                         route_state = "ALIGN_TURN_TAG"
                         route_step_start_time_s = now_s
                         turn_align_start_time_s = now_s
-                        route_action = f"tag_{stable_tag_id}_align_start"
+                        if gate_info["inside"]:
+                            route_action = f"tag_{stable_tag_id}_align_start"
+                        else:
+                            route_action = f"tag_{stable_tag_id}_outside_gate_align_start"
                         tag_correction_was_active = False
                         last_route_tag_action = tag_action_key
 
@@ -778,7 +787,7 @@ def main():
                         route_active = False
                         tag_correction_was_active = False
                         route_action = "turn_align_timeout_stop"
-                    elif tag_visible_in_gate and stable_tag_id == pending_turn_tag_id:
+                    elif tag_stable_visible and stable_tag_id == pending_turn_tag_id:
                         tag_corr_raw_deg, tag_corr_cmd_deg = compute_tag_correction(measurement, args)
                         tag_corr_active = True
 
