@@ -56,6 +56,7 @@ DEFAULT_POST_TURN_MAX_EXTRA_TURN_DEG = 6.0
 DEFAULT_POST_TURN_CENTER_TOLERANCE_PX = 70.0
 DEFAULT_POST_TURN_ALIGN_TIMEOUT_SEC = 20.0
 DEFAULT_POST_TURN_TAG_CORR_GAIN = 2.0
+DEFAULT_POST_TURN_LOST_TAG_FALLBACK_SEC = 3.0
 
 ROUTE_FIELDNAMES = [
     "route_state",
@@ -133,6 +134,9 @@ def build_arg_parser():
     parser.add_argument("--post-turn-tag-corr-gain", type=float,
                         default=DEFAULT_POST_TURN_TAG_CORR_GAIN,
                         help="Extra TAG_CORR multiplier used only during post-turn alignment steps.")
+    parser.add_argument("--post-turn-lost-tag-fallback-sec", type=float,
+                        default=DEFAULT_POST_TURN_LOST_TAG_FALLBACK_SEC,
+                        help="If the turn tag is lost after the post-turn move, continue forward after this many seconds instead of waiting forever.")
     parser.add_argument("--turn-deg", type=float, default=90.0,
                         help="Pivot angle used for turn tags.")
     parser.add_argument("--normal-move-rpm", type=float, default=DEFAULT_NORMAL_MOVE_RPM,
@@ -414,6 +418,14 @@ def choose_post_turn_align_motion(gate_info, args):
         return "FWD_CM"
 
     return choose_turn_align_motion(gate_info, args)
+
+
+def start_forward_chunk_after_turn(ser, state, state_lock, args):
+    send_tag_correction(ser, state, state_lock, 0.0)
+    move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
+    next_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
+    send_route_command(ser, state, state_lock, next_cmd)
+    return move_rpm_command
 
 
 def send_move_rpm(ser, state, state_lock, rpm):
@@ -911,19 +923,20 @@ def main():
                         turn_align_start_time_s >= 0.0
                         and now_s - turn_align_start_time_s > args.post_turn_align_timeout_sec
                     ):
-                        send_tag_correction(ser, state, state_lock, 0.0)
-                        send_route_command(ser, state, state_lock, "STOP")
-                        route_state = "ERROR"
-                        route_active = False
+                        move_rpm_command = start_forward_chunk_after_turn(ser, state, state_lock, args)
+                        tag_corr_sent = True
                         tag_correction_was_active = False
+                        route_state = "MOVING"
+                        route_step_start_time_s = now_s
                         pending_turn_tag_id = None
                         pending_turn_command = ""
-                        route_action = "post_turn_align_timeout_stop"
+                        pending_post_turn_forward = False
+                        route_action = "post_turn_align_timeout_forward_chunk"
                     elif tag_stable_visible and stable_tag_id == pending_turn_tag_id:
                         yaw_error_after_turn = post_turn_yaw_error_deg(measurement, pending_turn_command)
                         extra_turn_cmd = post_turn_extra_turn_command(yaw_error_after_turn, args)
 
-                        if extra_turn_cmd:
+                        if extra_turn_cmd and is_post_turn_centered(gate_info, args):
                             send_tag_correction(ser, state, state_lock, 0.0)
                             tag_corr_sent = True
                             tag_correction_was_active = False
@@ -965,7 +978,21 @@ def main():
                             route_step_start_time_s = now_s
                             route_action = f"post_turn_xy_align_{align_direction.lower()}"
                     else:
-                        route_action = "post_turn_align_wait_tag"
+                        if (
+                            turn_align_start_time_s >= 0.0
+                            and now_s - turn_align_start_time_s > args.post_turn_lost_tag_fallback_sec
+                        ):
+                            move_rpm_command = start_forward_chunk_after_turn(ser, state, state_lock, args)
+                            tag_corr_sent = True
+                            tag_correction_was_active = False
+                            route_state = "MOVING"
+                            route_step_start_time_s = now_s
+                            pending_turn_tag_id = None
+                            pending_turn_command = ""
+                            pending_post_turn_forward = False
+                            route_action = "post_turn_tag_lost_forward_chunk"
+                        else:
+                            route_action = "post_turn_align_wait_tag"
 
                 elif stable_tag_visible:
                     tag_action_key = (stable_tag_id, route_state)
@@ -1135,28 +1162,39 @@ def main():
 
                 requested_command = terminal_command or key_command
                 if requested_command == "START_ROUTE":
-                    route_active = True
-                    handled_turn_tags.clear()
-                    slowed_for_turn_tags.clear()
-                    previous_tag_id = None
-                    stable_tag_id = None
-                    stable_count = 0
-                    current_event_seq = base.snapshot_mega_state(state, state_lock).get("event_seq", 0)
-                    last_mega_event_seq = current_event_seq
-                    last_route_tag_action = None
-                    tag_correction_was_active = False
-                    pending_turn_tag_id = None
-                    pending_turn_command = ""
-                    pending_turn_start_time_s = -1.0
-                    pending_post_turn_forward = False
-                    turn_align_start_time_s = -1.0
-                    send_tag_correction(ser, state, state_lock, 0.0)
-                    move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
-                    start_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
-                    send_route_command(ser, state, state_lock, start_cmd)
-                    route_state = "MOVING"
-                    route_step_start_time_s = now_s
-                    route_action = "manual_start_forward"
+                    if route_active:
+                        move_rpm_command = start_forward_chunk_after_turn(ser, state, state_lock, args)
+                        tag_corr_sent = True
+                        tag_correction_was_active = False
+                        pending_turn_tag_id = None
+                        pending_turn_command = ""
+                        pending_post_turn_forward = False
+                        route_state = "MOVING"
+                        route_step_start_time_s = now_s
+                        route_action = "manual_force_forward"
+                    else:
+                        route_active = True
+                        handled_turn_tags.clear()
+                        slowed_for_turn_tags.clear()
+                        previous_tag_id = None
+                        stable_tag_id = None
+                        stable_count = 0
+                        current_event_seq = base.snapshot_mega_state(state, state_lock).get("event_seq", 0)
+                        last_mega_event_seq = current_event_seq
+                        last_route_tag_action = None
+                        tag_correction_was_active = False
+                        pending_turn_tag_id = None
+                        pending_turn_command = ""
+                        pending_turn_start_time_s = -1.0
+                        pending_post_turn_forward = False
+                        turn_align_start_time_s = -1.0
+                        send_tag_correction(ser, state, state_lock, 0.0)
+                        move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
+                        start_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
+                        send_route_command(ser, state, state_lock, start_cmd)
+                        route_state = "MOVING"
+                        route_step_start_time_s = now_s
+                        route_action = "manual_start_forward"
                 elif requested_command == "STOP":
                     route_active = False
                     send_tag_correction(ser, state, state_lock, 0.0)
