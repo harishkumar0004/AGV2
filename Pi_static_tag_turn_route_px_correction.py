@@ -33,6 +33,7 @@ TURN_TAGS = {
     3: "RIGHT",
     5: "RIGHT",
 }
+PRE_TURN_SLOWDOWN_TAGS = {tag_id - 1: tag_id for tag_id in TURN_TAGS}
 FINAL_TAG_ID = 7
 DEFAULT_MIN_STABLE_FRAMES = 1
 DEFAULT_TAG_K_LAT_DEG_PER_CM = -1.0
@@ -74,6 +75,8 @@ ROUTE_FIELDNAMES = [
     "turn_align_step_cm",
     "turn_align_timeout_sec",
     "move_rpm_command",
+    "pre_turn_slowdown_active",
+    "next_turn_tag_id",
 ] + base.FIELDNAMES
 
 
@@ -109,7 +112,9 @@ def build_arg_parser():
     parser.add_argument("--normal-move-rpm", type=float, default=DEFAULT_NORMAL_MOVE_RPM,
                         help="Mega MOVE_RPM used for normal forward chunks.")
     parser.add_argument("--turn-approach-rpm", type=float, default=DEFAULT_TURN_APPROACH_RPM,
-                        help="Mega MOVE_RPM used while centering on a turn tag and during 2 cm approach moves.")
+                        help="Mega MOVE_RPM used after the checkpoint before a turn, while centering on a turn tag, and during 2 cm approach moves.")
+    parser.add_argument("--disable-pre-turn-slowdown", action="store_true",
+                        help="Do not slow at the checkpoint before turn tags. By default, tag 2 slows for tag 3 and tag 4 slows for tag 5.")
     parser.add_argument("--turn-center-tolerance-px", type=float, default=DEFAULT_TURN_CENTER_TOLERANCE_PX,
                         help="Turn tag is considered centered when abs(tag center x - image center x) is below this many pixels.")
     parser.add_argument("--turn-align-step-cm", type=float, default=DEFAULT_TURN_ALIGN_STEP_CM,
@@ -121,8 +126,8 @@ def build_arg_parser():
     parser.add_argument("--tag-k-lat", type=float, default=DEFAULT_TAG_K_LAT_DEG_PER_CM,
                         help="Legacy cm gain, not used in this pixel-correction variant.")
     parser.add_argument("--tag-k-px", type=float, default=DEFAULT_TAG_K_PX_DEG_PER_PX,
-                        help=("Degrees of TAG_CORR per pixel offset. Positive value means "
-                              "negative px sends negative TAG_CORR, producing left RPM > right RPM."))
+                        help=("Degrees of TAG_CORR per pixel offset. Default is negative, so "
+                              "negative px sends positive TAG_CORR, producing right RPM > left RPM."))
     parser.add_argument("--tag-k-yaw", type=float, default=DEFAULT_TAG_K_YAW,
                         help=("Degrees of heading command per degree of tag yaw error. Default is 0 "
                               "because turn tags appear near +/-90 deg after a pivot."))
@@ -265,9 +270,9 @@ def compute_tag_correction(measurement, args):
     lateral_px = measurement.get("lateral_offset_px") or 0.0
     yaw_error_deg = measurement.get("yaw_error_deg") or 0.0
 
-    # Sign convention for this AGV:
-    #   negative px -> tag is left of camera center -> command right correction
-    #   right correction -> negative TAG_CORR -> left RPM greater than right RPM
+    # Sign convention for this AGV after requested reversal:
+    #   negative px -> positive TAG_CORR -> right RPM greater than left RPM
+    #   positive px -> negative TAG_CORR -> left RPM greater than right RPM
     raw_cmd = (args.tag_k_px * lateral_px) + (args.tag_k_yaw * yaw_error_deg)
     return raw_cmd, raw_cmd
 
@@ -396,7 +401,8 @@ def add_route_fields(row, route_state, route_active, stable_tag_id, stable_count
                      handled_turn_tags, tag_corr_active, tag_corr_sent,
                      tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
                      gate_info, pending_turn_tag_id, pending_turn_command,
-                     turn_centered, move_rpm_command, args):
+                     turn_centered, move_rpm_command, pre_turn_slowdown_active,
+                     next_turn_tag_id, args):
     row.update({
         "route_state": route_state,
         "route_active": 1 if route_active else 0,
@@ -423,6 +429,8 @@ def add_route_fields(row, route_state, route_active, stable_tag_id, stable_count
         "turn_align_step_cm": base.fmt(args.turn_align_step_cm),
         "turn_align_timeout_sec": base.fmt(args.turn_align_timeout_sec),
         "move_rpm_command": move_rpm_command,
+        "pre_turn_slowdown_active": 1 if pre_turn_slowdown_active else 0,
+        "next_turn_tag_id": next_turn_tag_id if next_turn_tag_id is not None else "",
     })
     return row
 
@@ -469,6 +477,8 @@ def main():
     print(f"Post-turn forward: {args.post_turn_forward_cm:.1f} cm")
     print(f"Normal move RPM: {args.normal_move_rpm:.1f}")
     print(f"Turn approach/alignment RPM: {args.turn_approach_rpm:.1f}")
+    if not args.disable_pre_turn_slowdown:
+        print("Pre-turn slowdown: tag 2 slows before tag 3, tag 4 slows before tag 5")
     print(f"Turn centering: abs(dx) <= {args.turn_center_tolerance_px:.1f} px, step {args.turn_align_step_cm:.1f} cm")
     print(f"Gate box: {args.gate_width_px}x{args.gate_height_px} px at image center")
     if not args.disable_straight_tag_correction:
@@ -478,7 +488,7 @@ def main():
             f"+ {args.tag_k_yaw:.3f} * yaw_deg"
         )
         print("  default yaw gain is 0, so post-turn +/-90 deg tag yaw does not create a huge correction")
-        print("  negative px -> negative TAG_CORR -> left RPM greater than right RPM")
+        print("  negative px -> positive TAG_CORR -> right RPM greater than left RPM")
         print("  tag correction command is not degree-limited")
         print("  motor RPM is still limited inside the Mega sketch by INITIAL_RPM/MAX_RPM")
         print("  If correction goes opposite, change --tag-k-px sign first.")
@@ -499,6 +509,7 @@ def main():
     route_state = "IDLE"
     route_active = False
     handled_turn_tags = set()
+    slowed_for_turn_tags = set()
     previous_tag_id = None
     stable_tag_id = None
     stable_count = 0
@@ -573,6 +584,8 @@ def main():
                 tag_corr_sent = False
                 turn_centered = is_turn_tag_centered(gate_info, args)
                 move_rpm_command = ""
+                pre_turn_slowdown_active = False
+                next_turn_tag_id = None
 
                 mega_event = mega_snapshot.get("event", "")
                 mega_event_seq = mega_snapshot.get("event_seq", 0)
@@ -723,6 +736,19 @@ def main():
                         last_route_tag_action = tag_action_key
 
                     else:
+                        next_turn_tag_id = PRE_TURN_SLOWDOWN_TAGS.get(stable_tag_id)
+                        if (
+                            route_active
+                            and not args.disable_pre_turn_slowdown
+                            and next_turn_tag_id is not None
+                            and next_turn_tag_id not in handled_turn_tags
+                            and next_turn_tag_id not in slowed_for_turn_tags
+                        ):
+                            move_rpm_command = send_move_rpm(ser, state, state_lock, args.turn_approach_rpm)
+                            slowed_for_turn_tags.add(next_turn_tag_id)
+                            pre_turn_slowdown_active = True
+                            route_action = f"tag_{stable_tag_id}_slow_for_tag_{next_turn_tag_id}"
+
                         if not args.disable_straight_tag_correction:
                             tag_corr_raw_deg, tag_corr_cmd_deg = compute_tag_correction(measurement, args)
                             tag_corr_active = True
@@ -732,8 +758,9 @@ def main():
                                 last_tag_command_time = now_wall
                                 tag_corr_sent = True
                                 tag_correction_was_active = True
-                                route_action = f"tag_{stable_tag_id}_corr"
-                        elif tag_action_key != last_route_tag_action:
+                                if not route_action:
+                                    route_action = f"tag_{stable_tag_id}_corr"
+                        elif tag_action_key != last_route_tag_action and not route_action:
                             route_action = f"tag_{stable_tag_id}_checkpoint"
 
                         if tag_action_key != last_route_tag_action:
@@ -832,6 +859,7 @@ def main():
                 if requested_command == "START_ROUTE":
                     route_active = True
                     handled_turn_tags.clear()
+                    slowed_for_turn_tags.clear()
                     previous_tag_id = None
                     stable_tag_id = None
                     stable_count = 0
@@ -874,13 +902,15 @@ def main():
                         tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
                         gate_info,
                         pending_turn_tag_id, pending_turn_command,
-                        turn_centered, move_rpm_command, args
+                        turn_centered, move_rpm_command, pre_turn_slowdown_active,
+                        next_turn_tag_id, args
                     )
                     writer.writerow(row)
                     break
                 elif requested_command and requested_command.startswith(("FWD_CM:", "BACK_CM:", "TURN_R_DEG:", "TURN_L_DEG:")):
                     route_active = False
                     handled_turn_tags.clear()
+                    slowed_for_turn_tags.clear()
                     previous_tag_id = None
                     stable_tag_id = None
                     stable_count = 0
@@ -935,7 +965,8 @@ def main():
                         tag_corr_raw_deg, tag_corr_cmd_deg, measurement,
                         gate_info,
                         pending_turn_tag_id, pending_turn_command,
-                        turn_centered, move_rpm_command, args
+                        turn_centered, move_rpm_command, pre_turn_slowdown_active,
+                        next_turn_tag_id, args
                     )
                     writer.writerow(row)
 
