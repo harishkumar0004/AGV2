@@ -753,7 +753,32 @@ def main():
                 )
                 stable_tag_visible = route_state == "MOVING" and (tag_visible_in_gate or turn_tag_visible)
 
-                if stable_tag_visible:
+                if (
+                    route_active
+                    and route_state == "ALIGN_TURN_STEP"
+                    and tag_stable_visible
+                    and stable_tag_id == pending_turn_tag_id
+                    and turn_centered
+                ):
+                    send_tag_correction(ser, state, state_lock, 0.0)
+                    tag_corr_sent = True
+                    tag_correction_was_active = False
+                    handled_turn_tags.add(pending_turn_tag_id)
+
+                    if args.pre_turn_forward_cm > 0.0:
+                        pre_turn_cmd = f"FWD_CM:{args.pre_turn_forward_cm:.3f}"
+                        send_route_command(ser, state, state_lock, pre_turn_cmd)
+                        route_state = "PRE_TURN_FORWARD"
+                        route_step_start_time_s = now_s
+                        route_action = f"tag_{pending_turn_tag_id}_centered_during_align_pre_turn_forward"
+                    else:
+                        send_route_command(ser, state, state_lock, pending_turn_command)
+                        route_state = "TURNING"
+                        pending_turn_start_time_s = now_s
+                        route_step_start_time_s = now_s
+                        route_action = f"tag_{pending_turn_tag_id}_centered_during_align_{pending_turn_command.lower()}"
+
+                elif stable_tag_visible:
                     tag_action_key = (stable_tag_id, route_state)
 
                     if route_active and stable_tag_id == FINAL_TAG_ID and tag_visible_in_gate and tag_action_key != last_route_tag_action:
