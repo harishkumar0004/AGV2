@@ -53,6 +53,9 @@ DEFAULT_TURN_ALIGN_STEP_CM = 1.0
 DEFAULT_TURN_ALIGN_TIMEOUT_SEC = 8.0
 DEFAULT_POST_TURN_YAW_TOLERANCE_DEG = 2.0
 DEFAULT_POST_TURN_MAX_EXTRA_TURN_DEG = 6.0
+DEFAULT_POST_TURN_CENTER_TOLERANCE_PX = 70.0
+DEFAULT_POST_TURN_ALIGN_TIMEOUT_SEC = 20.0
+DEFAULT_POST_TURN_TAG_CORR_GAIN = 2.0
 
 ROUTE_FIELDNAMES = [
     "route_state",
@@ -121,6 +124,15 @@ def build_arg_parser():
     parser.add_argument("--post-turn-max-extra-turn-deg", type=float,
                         default=DEFAULT_POST_TURN_MAX_EXTRA_TURN_DEG,
                         help="Maximum small extra pivot used for post-turn yaw fine tuning.")
+    parser.add_argument("--post-turn-center-tolerance-px", type=float,
+                        default=DEFAULT_POST_TURN_CENTER_TOLERANCE_PX,
+                        help="Practical post-turn X tolerance before continuing to the next straight segment.")
+    parser.add_argument("--post-turn-align-timeout-sec", type=float,
+                        default=DEFAULT_POST_TURN_ALIGN_TIMEOUT_SEC,
+                        help="Maximum time allowed for post-turn center/yaw alignment before stopping.")
+    parser.add_argument("--post-turn-tag-corr-gain", type=float,
+                        default=DEFAULT_POST_TURN_TAG_CORR_GAIN,
+                        help="Extra TAG_CORR multiplier used only during post-turn alignment steps.")
     parser.add_argument("--turn-deg", type=float, default=90.0,
                         help="Pivot angle used for turn tags.")
     parser.add_argument("--normal-move-rpm", type=float, default=DEFAULT_NORMAL_MOVE_RPM,
@@ -381,6 +393,29 @@ def post_turn_extra_turn_command(yaw_error_deg, args):
     return f"TURN_R_DEG:{extra_deg:.3f}"
 
 
+def is_post_turn_centered(gate_info, args):
+    dx_px = gate_info.get("dx_px")
+    dy_px = gate_info.get("dy_px")
+    if dx_px is None or dy_px is None:
+        return False
+
+    return (
+        abs(dx_px) <= args.post_turn_center_tolerance_px
+        and abs(dy_px) <= args.turn_center_y_tolerance_px
+    )
+
+
+def choose_post_turn_align_motion(gate_info, args):
+    dy_px = gate_info.get("dy_px")
+    if dy_px is None:
+        return "FWD_CM"
+
+    if abs(dy_px) <= args.turn_center_y_tolerance_px:
+        return "FWD_CM"
+
+    return choose_turn_align_motion(gate_info, args)
+
+
 def send_move_rpm(ser, state, state_lock, rpm):
     command = f"MOVE_RPM:{rpm:.2f}"
     send_route_command(ser, state, state_lock, command)
@@ -561,7 +596,8 @@ def main():
             "Post-turn tag alignment: ENABLED "
             f"(+/-{args.turn_center_tolerance_px:.1f}px X, "
             f"+/-{args.turn_center_y_tolerance_px:.1f}px Y, "
-            f"yaw +/-{args.post_turn_yaw_tolerance_deg:.1f} deg)"
+            f"yaw +/-{args.post_turn_yaw_tolerance_deg:.1f} deg; "
+            f"practical post-turn X +/-{args.post_turn_center_tolerance_px:.1f}px)"
         )
     print(f"Normal move RPM: {args.normal_move_rpm:.1f}")
     print(f"Turn approach/alignment RPM: {args.turn_approach_rpm:.1f}")
@@ -873,7 +909,7 @@ def main():
                 elif route_active and route_state == "POST_TURN_ALIGN_TAG":
                     if (
                         turn_align_start_time_s >= 0.0
-                        and now_s - turn_align_start_time_s > args.turn_align_timeout_sec
+                        and now_s - turn_align_start_time_s > args.post_turn_align_timeout_sec
                     ):
                         send_tag_correction(ser, state, state_lock, 0.0)
                         send_route_command(ser, state, state_lock, "STOP")
@@ -896,7 +932,7 @@ def main():
                             pending_turn_start_time_s = now_s
                             route_step_start_time_s = now_s
                             route_action = f"post_turn_yaw_fine_tune_{extra_turn_cmd.lower()}"
-                        elif turn_centered:
+                        elif is_post_turn_centered(gate_info, args):
                             send_tag_correction(ser, state, state_lock, 0.0)
                             tag_corr_sent = True
                             tag_correction_was_active = False
@@ -911,13 +947,14 @@ def main():
                             route_action = "post_turn_aligned_forward_chunk"
                         else:
                             tag_corr_raw_deg, tag_corr_cmd_deg = compute_tag_correction(measurement, args)
+                            tag_corr_cmd_deg *= args.post_turn_tag_corr_gain
                             tag_corr_active = True
                             send_tag_correction(ser, state, state_lock, tag_corr_cmd_deg)
                             last_tag_command_time = now_wall
                             tag_corr_sent = True
                             tag_correction_was_active = True
                             align_step_cm = max(0.1, args.turn_align_step_cm)
-                            align_direction = choose_turn_align_motion(gate_info, args)
+                            align_direction = choose_post_turn_align_motion(gate_info, args)
                             send_route_command(
                                 ser,
                                 state,
