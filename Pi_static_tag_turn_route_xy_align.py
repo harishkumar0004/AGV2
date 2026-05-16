@@ -51,6 +51,8 @@ DEFAULT_TURN_CENTER_TOLERANCE_PX = 15.0
 DEFAULT_TURN_CENTER_Y_TOLERANCE_PX = 25.0
 DEFAULT_TURN_ALIGN_STEP_CM = 1.0
 DEFAULT_TURN_ALIGN_TIMEOUT_SEC = 8.0
+DEFAULT_POST_TURN_YAW_TOLERANCE_DEG = 2.0
+DEFAULT_POST_TURN_MAX_EXTRA_TURN_DEG = 6.0
 
 ROUTE_FIELDNAMES = [
     "route_state",
@@ -111,6 +113,14 @@ def build_arg_parser():
                         help="Move forward this many cm after detecting a turn tag, before pivoting.")
     parser.add_argument("--post-turn-forward-cm", type=float, default=2.0,
                         help="Move forward this many cm after the pivot turn finishes.")
+    parser.add_argument("--disable-post-turn-align", action="store_true",
+                        help="Skip the tag-based center/yaw check after the 90 degree turn.")
+    parser.add_argument("--post-turn-yaw-tolerance-deg", type=float,
+                        default=DEFAULT_POST_TURN_YAW_TOLERANCE_DEG,
+                        help="After a turn, accept the turn tag yaw when it is within this many degrees of +/-90.")
+    parser.add_argument("--post-turn-max-extra-turn-deg", type=float,
+                        default=DEFAULT_POST_TURN_MAX_EXTRA_TURN_DEG,
+                        help="Maximum small extra pivot used for post-turn yaw fine tuning.")
     parser.add_argument("--turn-deg", type=float, default=90.0,
                         help="Pivot angle used for turn tags.")
     parser.add_argument("--normal-move-rpm", type=float, default=DEFAULT_NORMAL_MOVE_RPM,
@@ -337,6 +347,40 @@ def choose_turn_align_motion(gate_info, args):
     return "FWD_CM"
 
 
+def post_turn_yaw_error_deg(measurement, pending_turn_command):
+    if measurement is None or not pending_turn_command:
+        return None
+
+    raw_yaw = measurement.get("raw_yaw_image_deg")
+    if raw_yaw is None:
+        raw_yaw = measurement.get("yaw_error_deg")
+    if raw_yaw is None:
+        return None
+
+    if pending_turn_command.startswith("TURN_L_DEG"):
+        target_yaw = 90.0
+    else:
+        target_yaw = -90.0
+
+    return target_yaw - raw_yaw
+
+
+def post_turn_extra_turn_command(yaw_error_deg, args):
+    if yaw_error_deg is None:
+        return None
+
+    if abs(yaw_error_deg) <= args.post_turn_yaw_tolerance_deg:
+        return None
+
+    extra_deg = min(abs(yaw_error_deg), args.post_turn_max_extra_turn_deg)
+    if extra_deg <= 0.1:
+        return None
+
+    if yaw_error_deg > 0.0:
+        return f"TURN_L_DEG:{extra_deg:.3f}"
+    return f"TURN_R_DEG:{extra_deg:.3f}"
+
+
 def send_move_rpm(ser, state, state_lock, rpm):
     command = f"MOVE_RPM:{rpm:.2f}"
     send_route_command(ser, state, state_lock, command)
@@ -510,6 +554,15 @@ def main():
     print(f"Forward chunk: {args.forward_chunk_cm:.1f} cm")
     print(f"Pre-turn forward: {args.pre_turn_forward_cm:.1f} cm")
     print(f"Post-turn forward: {args.post_turn_forward_cm:.1f} cm")
+    if args.disable_post_turn_align:
+        print("Post-turn tag alignment: DISABLED")
+    else:
+        print(
+            "Post-turn tag alignment: ENABLED "
+            f"(+/-{args.turn_center_tolerance_px:.1f}px X, "
+            f"+/-{args.turn_center_y_tolerance_px:.1f}px Y, "
+            f"yaw +/-{args.post_turn_yaw_tolerance_deg:.1f} deg)"
+        )
     print(f"Normal move RPM: {args.normal_move_rpm:.1f}")
     print(f"Turn approach/alignment RPM: {args.turn_approach_rpm:.1f}")
     if not args.disable_pre_turn_slowdown:
@@ -646,6 +699,37 @@ def main():
 
                     elif (
                         route_active
+                        and route_state == "POST_TURN_ALIGN_STEP"
+                        and mega_event == "EVT:MOVE_DONE"
+                        and event_time_s is not None
+                        and event_time_s >= route_step_start_time_s
+                    ):
+                        route_state = "POST_TURN_ALIGN_TAG"
+                        route_step_start_time_s = now_s
+                        route_action = "post_turn_align_step_done"
+
+                    elif (
+                        route_active
+                        and route_state == "POST_TURN_YAW_TURN"
+                        and mega_event == "EVT:TURN_DONE"
+                        and event_time_s is not None
+                        and event_time_s >= pending_turn_start_time_s
+                    ):
+                        route_state = "POST_TURN_ALIGN_TAG"
+                        route_step_start_time_s = now_s
+                        route_action = "post_turn_yaw_turn_done"
+
+                    elif route_state == "POST_TURN_YAW_TURN" and mega_event == "EVT:TURN_TIMEOUT":
+                        send_route_command(ser, state, state_lock, "STOP")
+                        route_state = "ERROR"
+                        route_active = False
+                        pending_turn_tag_id = None
+                        pending_turn_command = ""
+                        pending_post_turn_forward = False
+                        route_action = "post_turn_yaw_timeout_stop"
+
+                    elif (
+                        route_active
                         and route_state == "PRE_TURN_FORWARD"
                         and mega_event == "EVT:MOVE_DONE"
                         and event_time_s is not None
@@ -688,15 +772,23 @@ def main():
                         and event_time_s is not None
                         and event_time_s >= route_step_start_time_s
                     ):
-                        move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
-                        next_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
-                        send_route_command(ser, state, state_lock, next_cmd)
-                        route_state = "MOVING"
-                        route_step_start_time_s = now_s
-                        pending_turn_tag_id = None
-                        pending_turn_command = ""
-                        pending_post_turn_forward = False
-                        route_action = "post_turn_done_forward_chunk"
+                        if args.disable_post_turn_align or pending_turn_tag_id is None:
+                            move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
+                            next_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
+                            send_route_command(ser, state, state_lock, next_cmd)
+                            route_state = "MOVING"
+                            route_step_start_time_s = now_s
+                            pending_turn_tag_id = None
+                            pending_turn_command = ""
+                            pending_post_turn_forward = False
+                            route_action = "post_turn_done_forward_chunk"
+                        else:
+                            send_tag_correction(ser, state, state_lock, 0.0)
+                            tag_correction_was_active = False
+                            route_state = "POST_TURN_ALIGN_TAG"
+                            route_step_start_time_s = now_s
+                            turn_align_start_time_s = now_s
+                            route_action = "post_turn_done_align_check"
 
                     elif (
                         route_active
@@ -777,6 +869,66 @@ def main():
                         pending_turn_start_time_s = now_s
                         route_step_start_time_s = now_s
                         route_action = f"tag_{pending_turn_tag_id}_centered_during_align_{pending_turn_command.lower()}"
+
+                elif route_active and route_state == "POST_TURN_ALIGN_TAG":
+                    if (
+                        turn_align_start_time_s >= 0.0
+                        and now_s - turn_align_start_time_s > args.turn_align_timeout_sec
+                    ):
+                        send_tag_correction(ser, state, state_lock, 0.0)
+                        send_route_command(ser, state, state_lock, "STOP")
+                        route_state = "ERROR"
+                        route_active = False
+                        tag_correction_was_active = False
+                        pending_turn_tag_id = None
+                        pending_turn_command = ""
+                        route_action = "post_turn_align_timeout_stop"
+                    elif tag_stable_visible and stable_tag_id == pending_turn_tag_id:
+                        yaw_error_after_turn = post_turn_yaw_error_deg(measurement, pending_turn_command)
+                        extra_turn_cmd = post_turn_extra_turn_command(yaw_error_after_turn, args)
+
+                        if extra_turn_cmd:
+                            send_tag_correction(ser, state, state_lock, 0.0)
+                            tag_corr_sent = True
+                            tag_correction_was_active = False
+                            send_route_command(ser, state, state_lock, extra_turn_cmd)
+                            route_state = "POST_TURN_YAW_TURN"
+                            pending_turn_start_time_s = now_s
+                            route_step_start_time_s = now_s
+                            route_action = f"post_turn_yaw_fine_tune_{extra_turn_cmd.lower()}"
+                        elif turn_centered:
+                            send_tag_correction(ser, state, state_lock, 0.0)
+                            tag_corr_sent = True
+                            tag_correction_was_active = False
+                            move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
+                            next_cmd = f"FWD_CM:{args.forward_chunk_cm:.3f}"
+                            send_route_command(ser, state, state_lock, next_cmd)
+                            route_state = "MOVING"
+                            route_step_start_time_s = now_s
+                            pending_turn_tag_id = None
+                            pending_turn_command = ""
+                            pending_post_turn_forward = False
+                            route_action = "post_turn_aligned_forward_chunk"
+                        else:
+                            tag_corr_raw_deg, tag_corr_cmd_deg = compute_tag_correction(measurement, args)
+                            tag_corr_active = True
+                            send_tag_correction(ser, state, state_lock, tag_corr_cmd_deg)
+                            last_tag_command_time = now_wall
+                            tag_corr_sent = True
+                            tag_correction_was_active = True
+                            align_step_cm = max(0.1, args.turn_align_step_cm)
+                            align_direction = choose_turn_align_motion(gate_info, args)
+                            send_route_command(
+                                ser,
+                                state,
+                                state_lock,
+                                f"{align_direction}:{align_step_cm:.3f}",
+                            )
+                            route_state = "POST_TURN_ALIGN_STEP"
+                            route_step_start_time_s = now_s
+                            route_action = f"post_turn_xy_align_{align_direction.lower()}"
+                    else:
+                        route_action = "post_turn_align_wait_tag"
 
                 elif stable_tag_visible:
                     tag_action_key = (stable_tag_id, route_state)
@@ -904,7 +1056,7 @@ def main():
 
                 elif (
                     tag_correction_was_active
-                    and route_state not in ("ALIGN_TURN_TAG", "ALIGN_TURN_STEP")
+                    and route_state not in ("ALIGN_TURN_TAG", "ALIGN_TURN_STEP", "POST_TURN_ALIGN_TAG", "POST_TURN_ALIGN_STEP", "POST_TURN_YAW_TURN")
                     and now_wall - last_tag_command_time > args.tag_correction_hold_sec
                 ):
                     send_tag_correction(ser, state, state_lock, 0.0)
