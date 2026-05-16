@@ -57,8 +57,6 @@ DEFAULT_POST_TURN_CENTER_TOLERANCE_PX = 70.0
 DEFAULT_POST_TURN_ALIGN_TIMEOUT_SEC = 20.0
 DEFAULT_POST_TURN_TAG_CORR_GAIN = 2.0
 DEFAULT_POST_TURN_LOST_TAG_FALLBACK_SEC = 3.0
-DEFAULT_TURN_DURATION_FALLBACK_MARGIN_SEC = 1.2
-DEFAULT_TURN_DURATION_FALLBACK_MAX_SEC = 8.0
 
 ROUTE_FIELDNAMES = [
     "route_state",
@@ -141,14 +139,6 @@ def build_arg_parser():
                         help="If the turn tag is lost after the post-turn move, continue forward after this many seconds instead of waiting forever.")
     parser.add_argument("--turn-deg", type=float, default=90.0,
                         help="Pivot angle used for turn tags.")
-    parser.add_argument("--disable-turn-duration-fallback", action="store_true",
-                        help="Disable Pi-side fallback that stops a turn using the previous successful turn duration.")
-    parser.add_argument("--turn-duration-fallback-margin-sec", type=float,
-                        default=DEFAULT_TURN_DURATION_FALLBACK_MARGIN_SEC,
-                        help="Extra seconds added to the previous successful 90 degree turn time before fallback stop.")
-    parser.add_argument("--turn-duration-fallback-max-sec", type=float,
-                        default=DEFAULT_TURN_DURATION_FALLBACK_MAX_SEC,
-                        help="Maximum allowed turn time before Pi-side fallback stop.")
     parser.add_argument("--normal-move-rpm", type=float, default=DEFAULT_NORMAL_MOVE_RPM,
                         help="Mega MOVE_RPM used for normal forward chunks.")
     parser.add_argument("--turn-approach-rpm", type=float, default=DEFAULT_TURN_APPROACH_RPM,
@@ -430,16 +420,6 @@ def choose_post_turn_align_motion(gate_info, args):
     return choose_turn_align_motion(gate_info, args)
 
 
-def send_post_turn_forward_or_chunk(ser, state, state_lock, args):
-    if args.post_turn_forward_cm > 0.0:
-        post_cmd = f"FWD_CM:{args.post_turn_forward_cm:.3f}"
-        send_route_command(ser, state, state_lock, post_cmd)
-        return "POST_TURN_FORWARD", "turn_fallback_post_forward"
-
-    move_rpm_command = start_forward_chunk_after_turn(ser, state, state_lock, args)
-    return "MOVING", move_rpm_command
-
-
 def start_forward_chunk_after_turn(ser, state, state_lock, args):
     send_tag_correction(ser, state, state_lock, 0.0)
     move_rpm_command = send_move_rpm(ser, state, state_lock, args.normal_move_rpm)
@@ -687,7 +667,6 @@ def main():
     pending_post_turn_forward = False
     route_step_start_time_s = -1.0
     turn_align_start_time_s = -1.0
-    last_successful_turn_duration_s = None
 
     try:
         with log_path.open("w", newline="") as log_file:
@@ -817,7 +796,6 @@ def main():
                         and event_time_s is not None
                         and event_time_s >= pending_turn_start_time_s
                     ):
-                        last_successful_turn_duration_s = max(0.1, event_time_s - pending_turn_start_time_s)
                         if args.post_turn_forward_cm > 0.0:
                             post_cmd = f"FWD_CM:{args.post_turn_forward_cm:.3f}"
                             send_route_command(ser, state, state_lock, post_cmd)
@@ -901,38 +879,6 @@ def main():
                         pending_turn_command = ""
                         pending_post_turn_forward = False
                         route_action = "turn_timeout_stop"
-
-                if (
-                    route_active
-                    and route_state == "TURNING"
-                    and not args.disable_turn_duration_fallback
-                    and pending_turn_start_time_s >= 0.0
-                ):
-                    elapsed_turn_s = now_s - pending_turn_start_time_s
-                    fallback_limit_s = None
-                    if last_successful_turn_duration_s is not None:
-                        fallback_limit_s = min(
-                            args.turn_duration_fallback_max_sec,
-                            last_successful_turn_duration_s + args.turn_duration_fallback_margin_sec,
-                        )
-                    elif pending_turn_tag_id not in (None, 3):
-                        fallback_limit_s = args.turn_duration_fallback_max_sec
-
-                    if fallback_limit_s is not None and elapsed_turn_s > fallback_limit_s:
-                        send_route_command(ser, state, state_lock, "STOP")
-                        if args.post_turn_forward_cm > 0.0:
-                            post_cmd = f"FWD_CM:{args.post_turn_forward_cm:.3f}"
-                            send_route_command(ser, state, state_lock, post_cmd)
-                            route_state = "POST_TURN_FORWARD"
-                            route_action = "turn_duration_fallback_post_forward"
-                        else:
-                            move_rpm_command = start_forward_chunk_after_turn(ser, state, state_lock, args)
-                            route_state = "MOVING"
-                            pending_turn_tag_id = None
-                            pending_turn_command = ""
-                            pending_post_turn_forward = False
-                            route_action = "turn_duration_fallback_forward_chunk"
-                        route_step_start_time_s = now_s
 
                 tag_stable_visible = (
                     measurement is not None
