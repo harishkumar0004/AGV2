@@ -797,47 +797,24 @@ def main():
                             args.turn_deg,
                         )
                         move_rpm_command = send_move_rpm(ser, state, state_lock, args.turn_approach_rpm)
-                        turn_align_start_time_s = now_s
-                        tag_corr_raw_deg, tag_corr_cmd_deg = compute_tag_correction(measurement, args)
-                        tag_corr_active = True
+                        send_tag_correction(ser, state, state_lock, 0.0)
+                        tag_corr_sent = True
+                        tag_correction_was_active = False
+                        handled_turn_tags.add(pending_turn_tag_id)
+                        turn_align_start_time_s = -1.0
 
-                        if turn_centered:
-                            send_tag_correction(ser, state, state_lock, 0.0)
-                            tag_corr_sent = True
-                            tag_correction_was_active = False
-                            handled_turn_tags.add(pending_turn_tag_id)
-
-                            if args.pre_turn_forward_cm > 0.0:
-                                pre_turn_cmd = f"FWD_CM:{args.pre_turn_forward_cm:.3f}"
-                                send_route_command(ser, state, state_lock, pre_turn_cmd)
-                                route_state = "PRE_TURN_FORWARD"
-                                route_step_start_time_s = now_s
-                                route_action = f"tag_{pending_turn_tag_id}_centered_pre_turn_forward"
-                            else:
-                                send_route_command(ser, state, state_lock, pending_turn_command)
-                                route_state = "TURNING"
-                                pending_turn_start_time_s = now_s
-                                route_step_start_time_s = now_s
-                                route_action = f"tag_{pending_turn_tag_id}_{pending_turn_command.lower()}"
-                        else:
-                            send_tag_correction(ser, state, state_lock, tag_corr_cmd_deg)
-                            last_tag_command_time = now_wall
-                            tag_corr_sent = True
-                            tag_correction_was_active = True
-                            align_step_cm = max(0.1, args.turn_align_step_cm)
-                            align_direction = choose_turn_align_motion(gate_info, args)
-                            send_route_command(
-                                ser,
-                                state,
-                                state_lock,
-                                f"{align_direction}:{align_step_cm:.3f}",
-                            )
-                            route_state = "ALIGN_TURN_STEP"
+                        if args.pre_turn_forward_cm > 0.0:
+                            pre_turn_cmd = f"FWD_CM:{args.pre_turn_forward_cm:.3f}"
+                            send_route_command(ser, state, state_lock, pre_turn_cmd)
+                            route_state = "PRE_TURN_FORWARD"
                             route_step_start_time_s = now_s
-                            if gate_info["inside"]:
-                                route_action = f"tag_{pending_turn_tag_id}_xy_align_{align_direction.lower()}"
-                            else:
-                                route_action = f"tag_{pending_turn_tag_id}_outside_gate_xy_align_{align_direction.lower()}"
+                            route_action = f"tag_{pending_turn_tag_id}_detected_pre_turn_forward"
+                        else:
+                            send_route_command(ser, state, state_lock, pending_turn_command)
+                            route_state = "TURNING"
+                            pending_turn_start_time_s = now_s
+                            route_step_start_time_s = now_s
+                            route_action = f"tag_{pending_turn_tag_id}_{pending_turn_command.lower()}"
 
                         last_route_tag_action = tag_action_key
 
