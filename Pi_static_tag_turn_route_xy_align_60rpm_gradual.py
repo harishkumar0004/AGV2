@@ -37,6 +37,7 @@ TURN_TAGS = {
 }
 PRE_TURN_SLOWDOWN_TAGS = {tag_id - 1: tag_id for tag_id in TURN_TAGS}
 FINAL_TAG_ID = 7
+DEFAULT_PRE_TURN_SLOWDOWN_FRAMES = 1
 DEFAULT_CHECKPOINT_STABLE_FRAMES = 2
 DEFAULT_TURN_STABLE_FRAMES = 3
 DEFAULT_TAG_K_LAT_DEG_PER_CM = -1.0
@@ -115,10 +116,15 @@ def build_arg_parser():
     parser.add_argument("--min-stable-frames", type=int, default=None,
                         help=("Legacy override: use the same consecutive-frame requirement for "
                               "checkpoint, turn, and post-turn tag actions."))
+    parser.add_argument("--pre-turn-slowdown-frames", type=int,
+                        default=DEFAULT_PRE_TURN_SLOWDOWN_FRAMES,
+                        help=("Consecutive gated detections required before slowing for the next "
+                              "turn tag. This can be lower than correction stability because a "
+                              "false slowdown is safer than missing the approach slowdown."))
     parser.add_argument("--checkpoint-stable-frames", type=int,
                         default=DEFAULT_CHECKPOINT_STABLE_FRAMES,
-                        help=("Consecutive detections required for straight checkpoint tags such "
-                              "as tag 2/tag 4 and for pre-turn slowdown."))
+                        help=("Consecutive detections required for straight checkpoint correction "
+                              "actions such as tag 0/tag 1/tag 2/tag 4."))
     parser.add_argument("--turn-stable-frames", type=int,
                         default=DEFAULT_TURN_STABLE_FRAMES,
                         help=("Consecutive detections required for actual turn-tag actions and "
@@ -595,6 +601,7 @@ def add_route_fields(row, route_state, route_active, stable_tag_id, stable_count
 def main():
     args = build_arg_parser().parse_args()
     if args.min_stable_frames is not None:
+        args.pre_turn_slowdown_frames = args.min_stable_frames
         args.checkpoint_stable_frames = args.min_stable_frames
         args.turn_stable_frames = args.min_stable_frames
     log_path = route_log_path(args.output_dir)
@@ -647,7 +654,8 @@ def main():
         )
     print(
         "Stable tag frames required: "
-        f"checkpoint={args.checkpoint_stable_frames}, "
+        f"pre-turn slowdown={args.pre_turn_slowdown_frames}, "
+        f"checkpoint correction={args.checkpoint_stable_frames}, "
         f"turn/post-turn={args.turn_stable_frames}"
     )
     print(f"Normal move RPM: {args.normal_move_rpm:.1f}")
@@ -981,6 +989,30 @@ def main():
                     and stable_tag_id not in handled_turn_tags
                 )
                 stable_tag_visible = route_state == "MOVING" and (tag_visible_in_gate or turn_tag_visible)
+                pre_turn_slowdown_tag_id = None
+                if (
+                    route_state == "MOVING"
+                    and measurement is not None
+                    and gate_info["inside"]
+                    and stable_count >= args.pre_turn_slowdown_frames
+                ):
+                    pre_turn_slowdown_tag_id = measurement["tag_id"]
+
+                if (
+                    route_active
+                    and not args.disable_pre_turn_slowdown
+                    and pre_turn_slowdown_tag_id is not None
+                ):
+                    next_turn_tag_id = PRE_TURN_SLOWDOWN_TAGS.get(pre_turn_slowdown_tag_id)
+                    if (
+                        next_turn_tag_id is not None
+                        and next_turn_tag_id not in handled_turn_tags
+                        and next_turn_tag_id not in slowed_for_turn_tags
+                    ):
+                        move_rpm_command = send_move_rpm(ser, state, state_lock, args.turn_approach_rpm)
+                        slowed_for_turn_tags.add(next_turn_tag_id)
+                        pre_turn_slowdown_active = True
+                        route_action = f"tag_{pre_turn_slowdown_tag_id}_slow_for_tag_{next_turn_tag_id}"
 
                 if (
                     route_active
