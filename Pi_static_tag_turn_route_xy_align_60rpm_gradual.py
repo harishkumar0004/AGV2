@@ -37,7 +37,8 @@ TURN_TAGS = {
 }
 PRE_TURN_SLOWDOWN_TAGS = {tag_id - 1: tag_id for tag_id in TURN_TAGS}
 FINAL_TAG_ID = 7
-DEFAULT_MIN_STABLE_FRAMES = 3
+DEFAULT_CHECKPOINT_STABLE_FRAMES = 2
+DEFAULT_TURN_STABLE_FRAMES = 3
 DEFAULT_TAG_K_LAT_DEG_PER_CM = -1.0
 DEFAULT_TAG_K_PX_DEG_PER_PX = -0.02
 DEFAULT_TAG_K_YAW = 0.0
@@ -111,8 +112,17 @@ def build_arg_parser():
     parser.add_argument("--power-line-frequency", type=int, default=base.DEFAULT_POWER_LINE_FREQUENCY)
     parser.add_argument("--skip-v4l2-controls", action="store_true")
     parser.add_argument("--no-display", action="store_true")
-    parser.add_argument("--min-stable-frames", type=int, default=DEFAULT_MIN_STABLE_FRAMES,
-                        help="Consecutive detections required before normal, turn, and post-turn tag actions.")
+    parser.add_argument("--min-stable-frames", type=int, default=None,
+                        help=("Legacy override: use the same consecutive-frame requirement for "
+                              "checkpoint, turn, and post-turn tag actions."))
+    parser.add_argument("--checkpoint-stable-frames", type=int,
+                        default=DEFAULT_CHECKPOINT_STABLE_FRAMES,
+                        help=("Consecutive detections required for straight checkpoint tags such "
+                              "as tag 2/tag 4 and for pre-turn slowdown."))
+    parser.add_argument("--turn-stable-frames", type=int,
+                        default=DEFAULT_TURN_STABLE_FRAMES,
+                        help=("Consecutive detections required for actual turn-tag actions and "
+                              "post-turn alignment."))
     parser.add_argument("--forward-chunk-cm", type=float, default=300.0,
                         help=("Forward distance command used between tags. The Pi sends a new "
                               "chunk if this finishes before the final tag is found."))
@@ -584,6 +594,9 @@ def add_route_fields(row, route_state, route_active, stable_tag_id, stable_count
 
 def main():
     args = build_arg_parser().parse_args()
+    if args.min_stable_frames is not None:
+        args.checkpoint_stable_frames = args.min_stable_frames
+        args.turn_stable_frames = args.min_stable_frames
     log_path = route_log_path(args.output_dir)
 
     serial_port = None if args.port.lower() == "none" else args.port
@@ -632,7 +645,11 @@ def main():
             f"yaw +/-{args.post_turn_yaw_tolerance_deg:.1f} deg; "
             f"practical post-turn X +/-{args.post_turn_center_tolerance_px:.1f}px)"
         )
-    print(f"Stable tag frames required: {args.min_stable_frames}")
+    print(
+        "Stable tag frames required: "
+        f"checkpoint={args.checkpoint_stable_frames}, "
+        f"turn/post-turn={args.turn_stable_frames}"
+    )
     print(f"Normal move RPM: {args.normal_move_rpm:.1f}")
     print(f"Turn approach/alignment RPM: {args.turn_approach_rpm:.1f}")
     if not args.disable_pre_turn_slowdown:
@@ -948,14 +965,18 @@ def main():
                             route_action = "turn_duration_fallback_forward_chunk"
                         route_step_start_time_s = now_s
 
-                tag_stable_visible = (
+                checkpoint_tag_stable_visible = (
                     measurement is not None
-                    and stable_count >= args.min_stable_frames
+                    and stable_count >= args.checkpoint_stable_frames
                 )
-                tag_visible_in_gate = tag_stable_visible and gate_info["inside"]
+                turn_tag_stable_visible = (
+                    measurement is not None
+                    and stable_count >= args.turn_stable_frames
+                )
+                tag_visible_in_gate = checkpoint_tag_stable_visible and gate_info["inside"]
                 turn_tag_visible = (
                     route_state == "MOVING"
-                    and tag_stable_visible
+                    and turn_tag_stable_visible
                     and stable_tag_id in TURN_TAGS
                     and stable_tag_id not in handled_turn_tags
                 )
@@ -964,7 +985,7 @@ def main():
                 if (
                     route_active
                     and route_state == "ALIGN_TURN_STEP"
-                    and tag_stable_visible
+                    and turn_tag_stable_visible
                     and stable_tag_id == pending_turn_tag_id
                     and turn_centered
                 ):
@@ -1000,7 +1021,7 @@ def main():
                         pending_turn_command = ""
                         pending_post_turn_forward = False
                         route_action = "post_turn_align_timeout_forward_chunk"
-                    elif tag_stable_visible and stable_tag_id == pending_turn_tag_id:
+                    elif turn_tag_stable_visible and stable_tag_id == pending_turn_tag_id:
                         yaw_error_after_turn = post_turn_yaw_error_deg(measurement, pending_turn_command)
                         extra_turn_cmd = post_turn_extra_turn_command(yaw_error_after_turn, args)
 
@@ -1145,7 +1166,7 @@ def main():
                         route_active = False
                         tag_correction_was_active = False
                         route_action = "turn_align_timeout_stop"
-                    elif tag_stable_visible and stable_tag_id == pending_turn_tag_id:
+                    elif turn_tag_stable_visible and stable_tag_id == pending_turn_tag_id:
                         tag_corr_raw_deg, tag_corr_cmd_deg = compute_tag_correction(measurement, args)
                         tag_corr_active = True
 
