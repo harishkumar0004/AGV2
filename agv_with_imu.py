@@ -50,21 +50,32 @@ CORRECTION_DURATION_SEC = 0.5
 
 
 # =====================================================
-# TAG FLIP / HEADING PARAMETERS
+# TAG HEADING PARAMETERS
 # =====================================================
 
-# Tags are physically rotated 180 degrees.
-# Therefore, when robot is correctly aligned, raw tag yaw is around 180 or -180.
-TAG_YAW_OFFSET_DEG = 180.0
+# All tags are now in same orientation.
+# Correct straight alignment means raw tag yaw should be near 0 degrees.
+EXPECTED_TAG_YAW_DEG = 0.0
 
-# At tag 6, ESP32 will rotate robot by this much using IMU.
-# If turn direction is wrong, change to -90.0.
 TURN_REL_DEG = 90.0
 
-# After robot turns +90, expected raw tag yaw changes by +90 from flipped yaw.
 EXPECTED_AFTER_TURN_YAW_DEG = None
+VERIFY_YAW_OK_DEG = 4.0
 
-VERIFY_YAW_OK_DEG = 3.0
+
+# =====================================================
+# TAG 6 CENTERING BEFORE TURN
+# =====================================================
+
+TAG_CENTER_X_OK_M = 0.006          # 6 mm
+TAG_CENTER_MOVE_PPS = 1200
+TAG_CENTER_TIMEOUT_SEC = 4.0
+
+# If xM becomes worse during centering, change to -1
+CENTER_MOVE_SIGN = 1
+
+# During turn, if tag xM goes beyond this, stop turn
+TURN_TAG_CENTER_SAFE_M = 0.018     # 18 mm
 
 
 # =====================================================
@@ -108,6 +119,8 @@ correction_end_time = 0.0
 drive_left_pps = 0
 drive_right_pps = 0
 
+tag6_center_start_time = 0.0
+
 
 # =====================================================
 # SERIAL
@@ -140,8 +153,8 @@ picam2.configure(config)
 picam2.set_controls({
     "AeEnable": False,
     "AwbEnable": False,
-    "ExposureTime": 5000,
-    "AnalogueGain": 1.0
+    "ExposureTime": 10000,
+    "AnalogueGain": 2.0
 })
 
 picam2.start()
@@ -222,10 +235,7 @@ def normalize_angle(angle):
 def compute_yaw_deg(tag):
     """
     Raw visual yaw of the AprilTag.
-
-    This function does NOT correct for 180 degree tag flip.
-    If the tag is physically flipped, this may return 179.5 or -179.5
-    when the robot is actually aligned correctly.
+    Since all tags now have same orientation, expected straight yaw is 0 deg.
     """
     corners = tag.corners
 
@@ -251,18 +261,6 @@ def compute_lateral_x_m(tag):
 
 
 def yaw_error_from_tag(raw_yaw_deg, expected_tag_yaw_deg):
-    """
-    Converts raw tag yaw into useful yaw error.
-
-    Example for flipped tags:
-        raw_yaw_deg = 179.5
-        expected_tag_yaw_deg = 180.0
-        yaw_error = -0.5
-
-        raw_yaw_deg = -179.5
-        expected_tag_yaw_deg = 180.0
-        yaw_error = 0.5
-    """
     return normalize_angle(raw_yaw_deg - expected_tag_yaw_deg)
 
 
@@ -296,6 +294,15 @@ def pose_error_to_pps(yaw_error_deg, x_error_m):
     right_pps = int(np.clip(right_pps, MIN_DRIVE_PPS, MAX_DRIVE_PPS))
 
     return left_pps, right_pps, correction, yaw_correction, x_correction
+
+
+def center_move_command(x_m):
+    if x_m > 0:
+        pps = -TAG_CENTER_MOVE_PPS * CENTER_MOVE_SIGN
+    else:
+        pps = TAG_CENTER_MOVE_PPS * CENTER_MOVE_SIGN
+
+    return pps, pps
 
 
 def advance_target():
@@ -386,12 +393,12 @@ def verify_tag6_after_turn(tag):
 # =====================================================
 
 EXPECTED_AFTER_TURN_YAW_DEG = normalize_angle(
-    TAG_YAW_OFFSET_DEG + TURN_REL_DEG
+    EXPECTED_TAG_YAW_DEG + TURN_REL_DEG
 )
 
 print("Waiting for docking Tag 11...")
 print("Press 's' when Tag 11 is visible.")
-print(f"Straight expected raw tag yaw = {TAG_YAW_OFFSET_DEG:.1f} deg")
+print(f"Straight expected raw tag yaw = {EXPECTED_TAG_YAW_DEG:.1f} deg")
 print(f"After turn expected raw tag yaw = {EXPECTED_AFTER_TURN_YAW_DEG:.1f} deg")
 
 
@@ -439,6 +446,11 @@ try:
             raw_yaw_deg = compute_yaw_deg(tag)
             x_m = compute_lateral_x_m(tag)
 
+            yaw_err_display = yaw_error_from_tag(
+                raw_yaw_deg,
+                EXPECTED_TAG_YAW_DEG
+            )
+
             cv2.putText(
                 frame,
                 f"ID:{tag.tag_id}",
@@ -461,8 +473,18 @@ try:
 
             cv2.putText(
                 frame,
-                f"xM:{x_m:.3f}",
+                f"YawErr:{yaw_err_display:.1f}",
                 (center[0] + 10, center[1] + 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"xM:{x_m:.3f}",
+                (center[0] + 10, center[1] + 90),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (255, 0, 255),
@@ -485,8 +507,8 @@ try:
 
         elif route_state == "MOVE_11_TO_7":
 
-            # ESP32 is holding heading using IMU.
-            # Raspberry Pi only waits for Tag 7.
+            # ESP32 holds IMU heading.
+            # RPI waits for Tag 7.
 
             if target_found and current_target == 7:
 
@@ -498,7 +520,7 @@ try:
                 start_apriltag_correction(
                     target_tag,
                     "TAG7",
-                    TAG_YAW_OFFSET_DEG
+                    EXPECTED_TAG_YAW_DEG
                 )
 
                 route_state = "TAG7_CORRECTION"
@@ -528,8 +550,8 @@ try:
 
         elif route_state == "MOVE_7_TO_6":
 
-            # ESP32 is holding heading using IMU.
-            # Raspberry Pi only waits for Tag 6.
+            # ESP32 holds IMU heading.
+            # RPI waits for Tag 6.
 
             if target_found and current_target == 6:
 
@@ -541,7 +563,7 @@ try:
                 start_apriltag_correction(
                     target_tag,
                     "TAG6",
-                    TAG_YAW_OFFSET_DEG
+                    EXPECTED_TAG_YAW_DEG
                 )
 
                 route_state = "TAG6_CORRECTION"
@@ -553,12 +575,13 @@ try:
                 correction_active = False
 
                 stop_robot()
-                time.sleep(0.3)
+                time.sleep(0.20)
 
-                print(f"RPI: Requesting IMU turn {TURN_REL_DEG:.1f} deg at Tag 6.")
-                send_command(f"TURN_REL {TURN_REL_DEG:.1f}")
+                print("RPI: Tag 6 correction finished. Centering tag before turn.")
 
-                route_state = "WAIT_TURN_90_DONE"
+                tag6_center_start_time = time.time()
+
+                route_state = "CENTER_TAG6_BEFORE_TURN"
 
             elif correction_active:
 
@@ -567,7 +590,86 @@ try:
                     drive_right_pps
                 )
 
+        elif route_state == "CENTER_TAG6_BEFORE_TURN":
+
+            if target_found and current_target == 6:
+
+                x_m = compute_lateral_x_m(target_tag)
+
+                if abs(x_m) <= TAG_CENTER_X_OK_M:
+
+                    stop_robot()
+                    time.sleep(0.20)
+
+                    print(
+                        f"RPI: Tag 6 centered xM={x_m:.4f}. "
+                        f"Starting slow IMU turn."
+                    )
+
+                    send_command(f"TURN_REL {TURN_REL_DEG:.1f}")
+
+                    route_state = "WAIT_TURN_90_DONE"
+
+                elif time.time() - tag6_center_start_time > TAG_CENTER_TIMEOUT_SEC:
+
+                    stop_robot()
+                    time.sleep(0.20)
+
+                    print(
+                        f"RPI: Tag 6 center timeout xM={x_m:.4f}. "
+                        f"Starting turn anyway."
+                    )
+
+                    send_command(f"TURN_REL {TURN_REL_DEG:.1f}")
+
+                    route_state = "WAIT_TURN_90_DONE"
+
+                else:
+
+                    drive_left_pps, drive_right_pps = center_move_command(x_m)
+
+                    send_velocity(
+                        drive_left_pps,
+                        drive_right_pps
+                    )
+
+                    print(
+                        f"TAG6 CENTER "
+                        f"xM={x_m:.4f} "
+                        f"L={drive_left_pps} "
+                        f"R={drive_right_pps}"
+                    )
+
+            else:
+
+                stop_robot()
+                drive_left_pps = 0
+                drive_right_pps = 0
+
+                print("RPI: Tag 6 lost during centering. Stop.")
+                route_state = "DONE"
+
         elif route_state == "WAIT_TURN_90_DONE":
+
+            # Camera safety monitoring while ESP32 performs IMU turn.
+            # If tag is visible and moving far from safe region, stop turn.
+
+            if target_found and current_target == 6:
+
+                x_m = compute_lateral_x_m(target_tag)
+
+                if abs(x_m) > TURN_TAG_CENTER_SAFE_M:
+
+                    print(
+                        f"RPI: Tag 6 leaving view during turn "
+                        f"xM={x_m:.4f}. Stopping turn."
+                    )
+
+                    stop_robot()
+                    drive_left_pps = 0
+                    drive_right_pps = 0
+
+                    route_state = "DONE"
 
             lines = read_esp32_lines()
 
@@ -584,16 +686,21 @@ try:
 
                 if ok:
                     print("RPI: Tag 6 heading verified. Test complete.")
-                    stop_robot()
-                    route_state = "DONE"
                 else:
                     print("RPI: Tag 6 heading verification failed. Stop for inspection.")
-                    stop_robot()
-                    route_state = "DONE"
+
+                stop_robot()
+                drive_left_pps = 0
+                drive_right_pps = 0
+                route_state = "DONE"
 
             else:
+
+                print("RPI: Tag 6 not visible after turn. Turn completed by IMU.")
                 stop_robot()
-                print("RPI: Waiting to see Tag 6 for heading verification.")
+                drive_left_pps = 0
+                drive_right_pps = 0
+                route_state = "DONE"
 
         elif route_state == "DONE":
 
