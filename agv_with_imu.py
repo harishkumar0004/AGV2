@@ -12,17 +12,33 @@ from pupil_apriltags import Detector
 
 
 # =====================================================
+# ROUTE
+# =====================================================
+
+START_TAG = 11
+TAG_7 = 7
+TAG_6 = 6
+
+route_state = "WAIT_START"
+
+seen_tag7 = False
+
+
+# =====================================================
 # DRIVE PARAMETERS
 # =====================================================
 
-BASE_PPS = 4000
 MAX_PPS = 10000
 
-# Normal IMU movement speed is controlled by ESP32 BASE_PPS.
-# These values are only used for AprilTag correction from Raspberry Pi.
-CORR_BASE_PPS = 2200
-CORR_MIN_PPS = 1200
-CORR_MAX_PPS = 4000
+# Live AprilTag correction speed while travelling
+VISION_BASE_PPS = 4200
+VISION_MIN_PPS = 2500
+VISION_MAX_PPS = 6000
+
+# Final tag speed
+FINAL_BASE_PPS = 1200
+FINAL_MIN_PPS = 700
+FINAL_MAX_PPS = 2200
 
 
 # =====================================================
@@ -34,44 +50,30 @@ EXPECTED_TAG_YAW_DEG = 0.0
 KP_YAW_PPS_PER_DEG = 18
 KP_X_PPS_PER_M = 16000
 
+# If xM correction moves away from zero, change this to +1.0
 X_SIGN = -1.0
 
 YAW_DEADBAND_DEG = 0.30
 X_DEADBAND_M = 0.002
 
-MAX_CORRECTION_PPS = 220
+MAX_VISION_CORRECTION_PPS = 260
+MAX_FINAL_CORRECTION_PPS = 160
 
-TAG_X_OK_M = 0.008
-TAG_YAW_OK_DEG = 3.0
+# Low-pass filter for smooth steering
+CORRECTION_FILTER_ALPHA = 0.35
 
-TAG_CORRECTION_TIMEOUT_SEC = 4.0
-TAG_GOOD_FRAMES_REQUIRED = 5
-
-
-# =====================================================
-# DOCKING ALIGNMENT PARAMETERS
-# =====================================================
-
-DOCK_YAW_OK_DEG = 1.0
-DOCK_TURN_PPS = 800
-DOCK_ALIGN_TIMEOUT_SEC = 4.0
+filtered_correction = 0.0
 
 
 # =====================================================
-# ROUTE PARAMETERS
+# FINAL TAG STOP TOLERANCE
 # =====================================================
 
-START_TAG = 11
-TAG_SEQUENCE = [11, 7, 6]
+TAG6_X_OK_M = 0.010
+TAG6_YAW_OK_DEG = 3.0
+TAG6_GOOD_FRAMES_REQUIRED = 3
 
-current_index = 0
-current_target = TAG_SEQUENCE[current_index]
-
-route_state = "WAIT_START"
-
-tag_correction_start_time = 0.0
-tag_good_count = 0
-dock_align_start_time = 0.0
+tag6_good_count = 0
 
 
 # =====================================================
@@ -91,11 +93,15 @@ TAG_SIZE_M = 0.020
 
 
 # =====================================================
-# MOTION STATE
+# SERIAL STATE
 # =====================================================
 
 drive_left_pps = 0
 drive_right_pps = 0
+
+last_drive_mode = "STOP"
+last_vel_send_time = 0.0
+VEL_SEND_INTERVAL_SEC = 0.08
 
 
 # =====================================================
@@ -156,34 +162,66 @@ def send_command(cmd):
     ser.write((cmd + "\n").encode())
 
 
-def send_velocity(left_pps, right_pps):
+def send_velocity(left_pps, right_pps, force=False):
     global drive_left_pps
     global drive_right_pps
+    global last_vel_send_time
+    global last_drive_mode
+
+    now = time.time()
 
     left_pps = int(np.clip(left_pps, -MAX_PPS, MAX_PPS))
     right_pps = int(np.clip(right_pps, -MAX_PPS, MAX_PPS))
 
+    if not force:
+        if (
+            left_pps == drive_left_pps
+            and right_pps == drive_right_pps
+            and now - last_vel_send_time < VEL_SEND_INTERVAL_SEC
+        ):
+            return
+
     drive_left_pps = left_pps
     drive_right_pps = right_pps
+    last_vel_send_time = now
+    last_drive_mode = "VISION"
 
     send_command(f"VEL {left_pps} {right_pps}")
 
 
 def stop_robot():
-    send_velocity(0, 0)
+    global last_drive_mode
+    global drive_left_pps
+    global drive_right_pps
+
+    drive_left_pps = 0
+    drive_right_pps = 0
+    last_drive_mode = "STOP"
+
+    send_command("STOP")
+
+
+def lock_heading_go():
+    global last_drive_mode
+    global filtered_correction
+
+    if last_drive_mode == "IMU":
+        return
+
+    filtered_correction = 0.0
+
+    send_command("LOCK_HEADING_GO")
+    last_drive_mode = "IMU"
+
+    print("RPI: LOCK_HEADING_GO sent")
 
 
 def read_esp32_lines():
-    lines = []
-
     while ser.in_waiting > 0:
         line = ser.readline().decode(errors="ignore").strip()
 
         if line:
             print(f"ESP32: {line}")
-            lines.append(line)
-
-    return lines
 
 
 def wait_for_esp32_text(expected_text, timeout_sec=10.0):
@@ -201,13 +239,8 @@ def wait_for_esp32_text(expected_text, timeout_sec=10.0):
     return False
 
 
-def lock_heading_go():
-    send_command("LOCK_HEADING_GO")
-    print("RPI: LOCK_HEADING_GO sent")
-
-
 # =====================================================
-# MATH / APRILTAG HELPERS
+# APRILTAG MATH
 # =====================================================
 
 def normalize_angle(angle):
@@ -226,9 +259,7 @@ def compute_yaw_deg(tag):
     dx = top_mid_x - cx
     dy = cy - top_mid_y
 
-    yaw_rad = math.atan2(dx, dy)
-
-    return math.degrees(yaw_rad)
+    return math.degrees(math.atan2(dx, dy))
 
 
 def compute_lateral_x_m(tag):
@@ -238,148 +269,158 @@ def compute_lateral_x_m(tag):
     return float(tag.pose_t[0][0])
 
 
-def yaw_error_from_tag(raw_yaw_deg):
-    return normalize_angle(raw_yaw_deg - EXPECTED_TAG_YAW_DEG)
-
-
-def get_tag_pose_error(tag):
-    raw_yaw_deg = compute_yaw_deg(tag)
-    yaw_error_deg = yaw_error_from_tag(raw_yaw_deg)
+def get_tag_pose(tag):
+    raw_yaw = compute_yaw_deg(tag)
+    yaw_error = normalize_angle(raw_yaw - EXPECTED_TAG_YAW_DEG)
     x_m = compute_lateral_x_m(tag)
 
-    return raw_yaw_deg, yaw_error_deg, x_m
+    return raw_yaw, yaw_error, x_m
 
 
-def tag_pose_good(yaw_error_deg, x_m):
+def tag6_pose_good(yaw_error, x_m):
     return (
-        abs(yaw_error_deg) <= TAG_YAW_OK_DEG
-        and abs(x_m) <= TAG_X_OK_M
+        abs(yaw_error) <= TAG6_YAW_OK_DEG
+        and abs(x_m) <= TAG6_X_OK_M
     )
 
 
-def pose_error_to_pps(yaw_error_deg, x_error_m):
+def correction_velocity(tag, final=False):
+    global filtered_correction
 
-    if abs(yaw_error_deg) < YAW_DEADBAND_DEG:
-        yaw_error_deg = 0.0
+    raw_yaw, yaw_error, x_m = get_tag_pose(tag)
 
-    if abs(x_error_m) < X_DEADBAND_M:
-        x_error_m = 0.0
+    yaw_for_control = yaw_error
+    x_for_control = x_m
 
-    yaw_correction = KP_YAW_PPS_PER_DEG * yaw_error_deg
-    x_correction = KP_X_PPS_PER_M * x_error_m * X_SIGN
+    if abs(yaw_for_control) < YAW_DEADBAND_DEG:
+        yaw_for_control = 0.0
 
-    # If yaw and xM corrections fight, prioritize xM.
-    if abs(x_error_m) > X_DEADBAND_M:
-        if yaw_correction * x_correction < 0:
-            yaw_correction *= 0.25
+    if abs(x_for_control) < X_DEADBAND_M:
+        x_for_control = 0.0
 
-    correction = yaw_correction + x_correction
+    yaw_corr = KP_YAW_PPS_PER_DEG * yaw_for_control
+    x_corr = KP_X_PPS_PER_M * x_for_control * X_SIGN
 
-    correction = int(np.clip(
-        correction,
-        -MAX_CORRECTION_PPS,
-        MAX_CORRECTION_PPS
+    # If yaw and xM fight each other, reduce yaw effect.
+    if abs(x_for_control) > X_DEADBAND_M:
+        if yaw_corr * x_corr < 0:
+            yaw_corr *= 0.25
+
+    raw_correction = yaw_corr + x_corr
+
+    if final:
+        max_corr = MAX_FINAL_CORRECTION_PPS
+        base_pps = FINAL_BASE_PPS
+        min_pps = FINAL_MIN_PPS
+        max_pps = FINAL_MAX_PPS
+    else:
+        max_corr = MAX_VISION_CORRECTION_PPS
+        base_pps = VISION_BASE_PPS
+        min_pps = VISION_MIN_PPS
+        max_pps = VISION_MAX_PPS
+
+    raw_correction = float(np.clip(
+        raw_correction,
+        -max_corr,
+        max_corr
     ))
 
-    left_pps = CORR_BASE_PPS - correction
-    right_pps = CORR_BASE_PPS + correction
-
-    left_pps = int(np.clip(left_pps, CORR_MIN_PPS, CORR_MAX_PPS))
-    right_pps = int(np.clip(right_pps, CORR_MIN_PPS, CORR_MAX_PPS))
-
-    return left_pps, right_pps, correction, yaw_correction, x_correction
-
-
-def dock_align_command(yaw_error_deg):
-    if abs(yaw_error_deg) <= DOCK_YAW_OK_DEG:
-        return 0, 0
-
-    # If dock alignment turns wrong way, swap these two returns.
-    if yaw_error_deg > 0:
-        return DOCK_TURN_PPS, -DOCK_TURN_PPS
-    else:
-        return -DOCK_TURN_PPS, DOCK_TURN_PPS
-
-
-def advance_target():
-    global current_index
-    global current_target
-
-    current_index += 1
-
-    if current_index < len(TAG_SEQUENCE):
-        current_target = TAG_SEQUENCE[current_index]
-    else:
-        current_target = TAG_SEQUENCE[-1]
-
-    print(f"RPI: Target advanced to Tag {current_target}")
-
-
-def start_tag_correction(label):
-    global tag_correction_start_time
-    global tag_good_count
-
-    tag_correction_start_time = time.time()
-    tag_good_count = 0
-
-    print(f"RPI: Starting continuous correction for {label}")
-
-
-def run_tag_correction(tag, label):
-    global tag_good_count
-
-    raw_yaw_deg, yaw_error_deg, x_m = get_tag_pose_error(tag)
-
-    if tag_pose_good(yaw_error_deg, x_m):
-        tag_good_count += 1
-        stop_robot()
-
-        print(
-            f"{label} GOOD "
-            f"count={tag_good_count}/{TAG_GOOD_FRAMES_REQUIRED} "
-            f"rawYaw={raw_yaw_deg:.2f} "
-            f"yawErr={yaw_error_deg:.2f} "
-            f"xM={x_m:.4f}"
-        )
-
-        if tag_good_count >= TAG_GOOD_FRAMES_REQUIRED:
-            return True
-
-        return False
-
-    tag_good_count = 0
-
-    left_pps, right_pps, correction, yaw_corr, x_corr = pose_error_to_pps(
-        yaw_error_deg,
-        x_m
+    filtered_correction = (
+        (1.0 - CORRECTION_FILTER_ALPHA) * filtered_correction
+        + CORRECTION_FILTER_ALPHA * raw_correction
     )
 
-    send_velocity(left_pps, right_pps)
+    correction = int(filtered_correction)
 
-    print(
-        f"{label} CORR "
-        f"rawYaw={raw_yaw_deg:.2f} "
-        f"yawErr={yaw_error_deg:.2f} "
-        f"xM={x_m:.4f} "
-        f"yawCorr={yaw_corr:.1f} "
-        f"xCorr={x_corr:.1f} "
-        f"corr={correction} "
-        f"L={left_pps} "
-        f"R={right_pps}"
+    left = base_pps - correction
+    right = base_pps + correction
+
+    left = int(np.clip(left, min_pps, max_pps))
+    right = int(np.clip(right, min_pps, max_pps))
+
+    return (
+        left,
+        right,
+        correction,
+        raw_yaw,
+        yaw_error,
+        x_m,
+        yaw_corr,
+        x_corr
     )
 
-    return False
+
+def reset_correction_filter():
+    global filtered_correction
+    filtered_correction = 0.0
 
 
 # =====================================================
-# STARTUP MESSAGE
+# TAG SELECTION
+# =====================================================
+
+def find_tag(detections, tag_id):
+    for tag in detections:
+        if tag.tag_id == tag_id:
+            return tag
+
+    return None
+
+
+def choose_vision_tag(detections):
+    global route_state
+    global seen_tag7
+
+    tag11 = find_tag(detections, START_TAG)
+    tag7 = find_tag(detections, TAG_7)
+    tag6 = find_tag(detections, TAG_6)
+
+    if route_state == "MOVE_TO_7":
+
+        if tag7 is not None:
+            seen_tag7 = True
+            route_state = "MOVE_TO_6"
+            print("RPI: Tag 7 detected. Now target is Tag 6.")
+            return tag7, "TAG7", False
+
+        if tag11 is not None:
+            return tag11, "TAG11", False
+
+        return None, "", False
+
+    if route_state == "MOVE_TO_6":
+
+        if tag6 is not None:
+            route_state = "FINAL_TAG6"
+            print("RPI: Tag 6 detected. Final approach.")
+            return tag6, "TAG6", True
+
+        if tag7 is not None:
+            return tag7, "TAG7", False
+
+        return None, "", False
+
+    if route_state == "FINAL_TAG6":
+
+        if tag6 is not None:
+            return tag6, "TAG6", True
+
+        return None, "", True
+
+    return None, "", False
+
+
+# =====================================================
+# STARTUP
 # =====================================================
 
 print("Waiting for docking Tag 11...")
-print("Press 's' when Tag 11 is visible.")
-print(f"Expected raw tag yaw = {EXPECTED_TAG_YAW_DEG:.1f} deg")
-print("This version uses continuous AprilTag correction, no correction tries.")
-print("This test stops after Tag 6 is corrected. No 90 degree turn.")
+print("Press 's' when Tag 11 is visible and robot is manually aligned.")
+print("Flow:")
+print("  s -> IMU RECAL -> LOCK_HEADING_GO")
+print("  visible tag -> live AprilTag yaw + xM correction")
+print("  no tag -> ESP32 IMU heading hold")
+print("  Tag 6 -> slow final correction and stop")
 
 
 # =====================================================
@@ -403,10 +444,15 @@ try:
             tag_size=TAG_SIZE_M
         )
 
-        target_found = False
-        target_tag = None
+        # =================================================
+        # DRAW TAGS
+        # =================================================
+
+        visible_ids = []
 
         for tag in detections:
+
+            visible_ids.append(tag.tag_id)
 
             corners = tag.corners.astype(int)
 
@@ -418,9 +464,7 @@ try:
             center = tuple(tag.center.astype(int))
             cv2.circle(frame, center, 5, (0, 0, 255), -1)
 
-            raw_yaw_deg = compute_yaw_deg(tag)
-            yaw_error_deg = yaw_error_from_tag(raw_yaw_deg)
-            x_m = compute_lateral_x_m(tag)
+            raw_yaw, yaw_error, x_m = get_tag_pose(tag)
 
             cv2.putText(
                 frame,
@@ -434,18 +478,8 @@ try:
 
             cv2.putText(
                 frame,
-                f"RawYaw:{raw_yaw_deg:.1f}",
+                f"YawErr:{yaw_error:.1f}",
                 (center[0] + 10, center[1] + 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2
-            )
-
-            cv2.putText(
-                frame,
-                f"YawErr:{yaw_error_deg:.1f}",
-                (center[0] + 10, center[1] + 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (0, 255, 0),
@@ -455,16 +489,12 @@ try:
             cv2.putText(
                 frame,
                 f"xM:{x_m:.3f}",
-                (center[0] + 10, center[1] + 90),
+                (center[0] + 10, center[1] + 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 (255, 0, 255),
                 2
             )
-
-            if tag.tag_id == current_target:
-                target_found = True
-                target_tag = tag
 
         # =================================================
         # STATE MACHINE
@@ -472,158 +502,110 @@ try:
 
         if route_state == "WAIT_START":
 
-            stop_robot()
+            pass
 
-        elif route_state == "DOCK_ALIGN_TAG11":
+        elif route_state in ("MOVE_TO_7", "MOVE_TO_6", "FINAL_TAG6"):
 
-            if target_found and current_target == START_TAG:
+            vision_tag, label, final = choose_vision_tag(detections)
 
-                raw_yaw_deg, yaw_error_deg, x_m = get_tag_pose_error(target_tag)
+            if vision_tag is not None:
 
-                if abs(yaw_error_deg) <= DOCK_YAW_OK_DEG:
+                (
+                    left,
+                    right,
+                    correction,
+                    raw_yaw,
+                    yaw_error,
+                    x_m,
+                    yaw_corr,
+                    x_corr
+                ) = correction_velocity(
+                    vision_tag,
+                    final=final
+                )
 
-                    stop_robot()
-                    time.sleep(0.20)
+                if final:
 
-                    print(
-                        f"RPI: Dock aligned "
-                        f"rawYaw={raw_yaw_deg:.2f} "
-                        f"yawErr={yaw_error_deg:.2f} "
-                        f"xM={x_m:.4f}"
-                    )
+                    if tag6_pose_good(yaw_error, x_m):
 
-                    advance_target()
-                    lock_heading_go()
+                        tag6_good_count += 1
 
-                    print("RPI: Moving from Tag 11 to Tag 7 using IMU heading.")
-                    route_state = "MOVE_11_TO_7"
+                        send_velocity(
+                            0,
+                            0,
+                            force=True
+                        )
 
-                elif time.time() - dock_align_start_time > DOCK_ALIGN_TIMEOUT_SEC:
+                        print(
+                            f"TAG6 GOOD "
+                            f"{tag6_good_count}/{TAG6_GOOD_FRAMES_REQUIRED} "
+                            f"rawYaw={raw_yaw:.2f} "
+                            f"yawErr={yaw_error:.2f} "
+                            f"xM={x_m:.4f}"
+                        )
 
-                    stop_robot()
-                    time.sleep(0.20)
+                        if tag6_good_count >= TAG6_GOOD_FRAMES_REQUIRED:
 
-                    print(
-                        f"RPI: Dock align timeout. "
-                        f"rawYaw={raw_yaw_deg:.2f} "
-                        f"yawErr={yaw_error_deg:.2f}. "
-                        f"Starting anyway."
-                    )
+                            print("RPI: Tag 6 aligned. Route complete.")
+                            stop_robot()
+                            route_state = "DONE"
 
-                    advance_target()
-                    lock_heading_go()
+                    else:
 
-                    print("RPI: Moving from Tag 11 to Tag 7 using IMU heading.")
-                    route_state = "MOVE_11_TO_7"
+                        tag6_good_count = 0
+
+                        send_velocity(
+                            left,
+                            right
+                        )
+
+                        print(
+                            f"{label} FINAL_CORR "
+                            f"rawYaw={raw_yaw:.2f} "
+                            f"yawErr={yaw_error:.2f} "
+                            f"xM={x_m:.4f} "
+                            f"yawCorr={yaw_corr:.1f} "
+                            f"xCorr={x_corr:.1f} "
+                            f"corr={correction} "
+                            f"L={left} "
+                            f"R={right}"
+                        )
 
                 else:
 
-                    left_pps, right_pps = dock_align_command(yaw_error_deg)
+                    tag6_good_count = 0
 
-                    send_velocity(left_pps, right_pps)
+                    send_velocity(
+                        left,
+                        right
+                    )
 
                     print(
-                        f"DOCK ALIGN "
-                        f"rawYaw={raw_yaw_deg:.2f} "
-                        f"yawErr={yaw_error_deg:.2f} "
+                        f"{label} LIVE_CORR "
+                        f"rawYaw={raw_yaw:.2f} "
+                        f"yawErr={yaw_error:.2f} "
                         f"xM={x_m:.4f} "
-                        f"L={left_pps} "
-                        f"R={right_pps}"
+                        f"yawCorr={yaw_corr:.1f} "
+                        f"xCorr={x_corr:.1f} "
+                        f"corr={correction} "
+                        f"L={left} "
+                        f"R={right}"
                     )
 
             else:
 
-                stop_robot()
-                print("RPI: Tag 11 lost during dock alignment. Stop.")
-                route_state = "DONE"
+                tag6_good_count = 0
 
-        elif route_state == "MOVE_11_TO_7":
-
-            if target_found and current_target == 7:
-
-                print("RPI: Tag 7 reached. Starting continuous AprilTag correction.")
-
-                stop_robot()
-                time.sleep(0.15)
-
-                start_tag_correction("TAG7")
-
-                route_state = "TAG7_CORRECTION"
-
-        elif route_state == "TAG7_CORRECTION":
-
-            if not target_found or current_target != 7:
-
-                stop_robot()
-                print("RPI: Tag 7 lost during correction. Stop.")
-                route_state = "DONE"
-
-            elif time.time() - tag_correction_start_time > TAG_CORRECTION_TIMEOUT_SEC:
-
-                stop_robot()
-                print("RPI: Tag 7 correction timeout. Stop.")
-                route_state = "DONE"
-
-            else:
-
-                done = run_tag_correction(target_tag, "TAG7")
-
-                if done:
-
+                if route_state == "FINAL_TAG6":
+                    print("RPI: Tag 6 lost during final approach. Stop.")
                     stop_robot()
-                    time.sleep(0.20)
-
-                    print("RPI: Tag 7 corrected. Locking heading and going to Tag 6.")
-
-                    lock_heading_go()
-                    advance_target()
-
-                    print("RPI: Moving from Tag 7 to Tag 6 using IMU heading.")
-                    route_state = "MOVE_7_TO_6"
-
-        elif route_state == "MOVE_7_TO_6":
-
-            if target_found and current_target == 6:
-
-                print("RPI: Tag 6 reached. Starting continuous AprilTag correction.")
-
-                stop_robot()
-                time.sleep(0.15)
-
-                start_tag_correction("TAG6")
-
-                route_state = "TAG6_CORRECTION"
-
-        elif route_state == "TAG6_CORRECTION":
-
-            if not target_found or current_target != 6:
-
-                stop_robot()
-                print("RPI: Tag 6 lost during correction. Stop.")
-                route_state = "DONE"
-
-            elif time.time() - tag_correction_start_time > TAG_CORRECTION_TIMEOUT_SEC:
-
-                stop_robot()
-                print("RPI: Tag 6 correction timeout. Stop.")
-                route_state = "DONE"
-
-            else:
-
-                done = run_tag_correction(target_tag, "TAG6")
-
-                if done:
-
-                    stop_robot()
-
-                    print("RPI: Tag 6 corrected. Route test complete.")
-                    print("RPI: Ready for next step: slow 90 degree turn test.")
-
                     route_state = "DONE"
+                else:
+                    lock_heading_go()
 
         elif route_state == "DONE":
 
-            stop_robot()
+            pass
 
         # =================================================
         # DISPLAY
@@ -641,27 +623,27 @@ try:
 
         cv2.putText(
             frame,
-            f"Target: {current_target}",
+            f"Drive: {last_drive_mode} L:{drive_left_pps} R:{drive_right_pps}",
             (40, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            0.7,
             (255, 255, 255),
             2
         )
 
         cv2.putText(
             frame,
-            f"Drive L:{drive_left_pps} R:{drive_right_pps}",
+            f"Visible: {visible_ids}",
             (40, 130),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            0.7,
             (255, 255, 255),
             2
         )
 
         cv2.putText(
             frame,
-            f"Good frames:{tag_good_count}",
+            f"Tag6 good: {tag6_good_count}",
             (40, 170),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -670,7 +652,7 @@ try:
         )
 
         cv2.imshow(
-            "AGV Route 11-7-6 Continuous Correction",
+            "AGV Live AprilTag + IMU Route 11-7-6",
             frame
         )
 
@@ -682,7 +664,9 @@ try:
 
             if route_state == "WAIT_START":
 
-                if target_found and current_target == START_TAG:
+                tag11 = find_tag(detections, START_TAG)
+
+                if tag11 is not None:
 
                     print("RPI: Docking Tag 11 visible.")
                     print("RPI: Requesting ESP32 IMU recalibration.")
@@ -703,10 +687,13 @@ try:
                     if ok:
 
                         print("RPI: IMU calibrated.")
-                        print("RPI: Aligning robot with docking Tag 11 yaw.")
+                        print("RPI: Locking heading and starting movement.")
 
-                        dock_align_start_time = time.time()
-                        route_state = "DOCK_ALIGN_TAG11"
+                        reset_correction_filter()
+
+                        route_state = "MOVE_TO_7"
+
+                        lock_heading_go()
 
                     else:
 
@@ -717,20 +704,20 @@ try:
                     print("RPI: Start ignored. Tag 11 not visible.")
 
         elif key == ord('q'):
+
             break
 
-        time.sleep(0.05)
+        time.sleep(0.03)
 
 except KeyboardInterrupt:
     pass
 
 finally:
+
     stop_robot()
 
     picam2.stop()
-
     cv2.destroyAllWindows()
-
     ser.close()
 
     print("Robot stopped")
