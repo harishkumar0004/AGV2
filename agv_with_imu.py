@@ -140,8 +140,8 @@ picam2.configure(config)
 picam2.set_controls({
     "AeEnable": False,
     "AwbEnable": False,
-    "ExposureTime": 10000,
-    "AnalogueGain": 2.0
+    "ExposureTime": 5000,
+    "AnalogueGain": 1.0
 })
 
 picam2.start()
