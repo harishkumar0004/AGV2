@@ -28,20 +28,15 @@ route_state = "WAIT_START"
 
 MAX_PPS = 10000
 
-# Live AprilTag correction speed while travelling
-VISION_BASE_PPS = 3500
-VISION_MIN_PPS = 2000
-VISION_MAX_PPS = 5000
+# Live AprilTag correction while travelling
+VISION_BASE_PPS = 4200
+VISION_MIN_PPS = 2500
+VISION_MAX_PPS = 6000
 
-# Final tag 6 alignment speed
-FINAL_BASE_PPS = 600
-FINAL_MIN_PPS = 400
-FINAL_MAX_PPS = 1000
+# Tag 6 correction speed
+TAG6_FB_PPS = 850
 
-# Front/back centering speed at tag 6
-CENTER_FB_PPS = 300
-
-# If front/back moves wrong way, change this to -1
+# If front/back centering moves wrong way, change this to -1
 FB_SIGN = 1
 
 
@@ -51,24 +46,23 @@ FB_SIGN = 1
 
 EXPECTED_TAG_YAW_DEG = 0.0
 
-# Before tag 6, use yaw + xM
+# Normal travelling correction: yaw + xM
 KP_YAW_PPS_PER_DEG = 18
 KP_X_PPS_PER_M = 16000
 
-# At tag 6, use yaw only
+# Tag 6 correction: yaw only + image center Y
 KP_TAG6_YAW_PPS_PER_DEG = 20
 
-# If xM correction moves away from zero before tag 6, change this to +1.0
+# If xM correction moves away from zero before Tag 6, change this to +1.0
 X_SIGN = -1.0
 
 YAW_DEADBAND_DEG = 0.30
-X_DEADBAND_M = 0.0005
+X_DEADBAND_M = 0.002
 
-MAX_VISION_CORRECTION_PPS = 200
+MAX_VISION_CORRECTION_PPS = 260
 MAX_TAG6_YAW_CORRECTION_PPS = 180
 
-# Smooth steering
-CORRECTION_FILTER_ALPHA = 0.3
+CORRECTION_FILTER_ALPHA = 0.35
 filtered_correction = 0.0
 
 
@@ -77,12 +71,9 @@ filtered_correction = 0.0
 # =====================================================
 
 TAG6_YAW_OK_DEG = 3.0
-
-# Only use image center Y for front/back centering.
-# Do not use xM.
 TAG6_CENTER_Y_OK_PX = 25
-
 TAG6_GOOD_FRAMES_REQUIRED = 3
+
 tag6_good_count = 0
 
 TURN_DEG = 90.0
@@ -306,7 +297,7 @@ def tag6_good(yaw_error, y_error_px):
 
 
 # =====================================================
-# CORRECTION BEFORE TAG 6: YAW + XM
+# TRAVEL CORRECTION: YAW + XM
 # =====================================================
 
 def travelling_correction_velocity(tag):
@@ -364,7 +355,7 @@ def travelling_correction_velocity(tag):
 
 
 # =====================================================
-# TAG 6: YAW ONLY + IMAGE CENTER Y
+# TAG 6 CORRECTION: YAW ONLY + IMAGE CENTER Y
 # =====================================================
 
 def tag6_heading_center_velocity(tag):
@@ -376,6 +367,9 @@ def tag6_heading_center_velocity(tag):
     if abs(yaw_for_control) < YAW_DEADBAND_DEG:
         yaw_for_control = 0.0
 
+    # Your observed convention:
+    # yaw positive = robot rotated left.
+    # Therefore use negative sign to rotate back right.
     yaw_corr = -KP_TAG6_YAW_PPS_PER_DEG * yaw_for_control
 
     yaw_corr = int(np.clip(
@@ -384,28 +378,25 @@ def tag6_heading_center_velocity(tag):
         MAX_TAG6_YAW_CORRECTION_PPS
     ))
 
-    # Front/back movement to center tag vertically in image.
-    # No xM correction is used here.
+    # Front/back only from image Y center.
+    # No xM correction at Tag 6.
     if abs(y_err) <= TAG6_CENTER_Y_OK_PX:
         fb = 0
     else:
         if y_err > 0:
-            fb = CENTER_FB_PPS * FB_SIGN
+            fb = TAG6_FB_PPS * FB_SIGN
         else:
-            fb = -CENTER_FB_PPS * FB_SIGN
+            fb = -TAG6_FB_PPS * FB_SIGN
 
-    # Heading correction is differential.
-    # Front/back centering is common speed.
     left = fb - yaw_corr
     right = fb + yaw_corr
 
-    # If front/back is centered, still allow pure yaw correction.
     if fb == 0:
         left = -yaw_corr
         right = yaw_corr
 
-    left = int(np.clip(left, -FINAL_MAX_PPS, FINAL_MAX_PPS))
-    right = int(np.clip(right, -FINAL_MAX_PPS, FINAL_MAX_PPS))
+    left = int(np.clip(left, -MAX_PPS, MAX_PPS))
+    right = int(np.clip(right, -MAX_PPS, MAX_PPS))
 
     return (
         left,
@@ -424,7 +415,7 @@ def reset_correction_filter():
 
 
 # =====================================================
-# TAG SELECTION
+# TAG HELPERS
 # =====================================================
 
 def find_tag(detections, tag_id):
@@ -445,10 +436,20 @@ def choose_travel_tag(detections):
     if route_state == "MOVE_TO_7":
 
         if tag7 is not None:
-            route_state = "MOVE_TO_6"
+
+            stop_robot()
+
+            route_state = "WAIT_TAG6_CORRECT_COMMAND"
             reset_correction_filter()
-            print("RPI: Tag 7 detected. Now moving toward Tag 6.")
-            return tag7, "TAG7"
+
+            print("RPI: Tag 7 detected.")
+            print("RPI: Continue with IMU heading toward Tag 6.")
+
+            lock_heading_go()
+
+            route_state = "MOVE_TO_6"
+
+            return None, ""
 
         if tag11 is not None:
             return tag11, "TAG11"
@@ -458,9 +459,16 @@ def choose_travel_tag(detections):
     if route_state == "MOVE_TO_6":
 
         if tag6 is not None:
-            route_state = "TAG6_ALIGN"
+
+            stop_robot()
+
+            route_state = "WAIT_TAG6_CORRECT_COMMAND"
             reset_correction_filter()
-            print("RPI: Tag 6 detected. Align heading and image center before turn.")
+
+            print("RPI: Tag 6 detected. Robot stopped.")
+            print("RPI: Press 'c' to correct heading + image center.")
+            print("RPI: After correction, press 't' to turn 90 degrees.")
+
             return None, ""
 
         if tag7 is not None:
@@ -477,10 +485,19 @@ def choose_travel_tag(detections):
 
 print("Waiting for docking Tag 11...")
 print("Press 's' when Tag 11 is visible and robot is manually aligned.")
+print("")
+print("Keys:")
+print("  s = start route")
+print("  c = correct Tag 6 heading + image center")
+print("  t = turn 90 degrees after correction")
+print("  q = quit")
+print("")
 print("Route:")
 print("  11->7 uses live AprilTag + IMU")
 print("  7->6 uses live AprilTag + IMU")
-print("  At Tag 6: heading only + image center Y, then TURN_REL 90")
+print("  Tag 6 detected: stop and wait for c")
+print("  c: correct yaw + image center Y only")
+print("  t: TURN_REL 90 using IMU")
 
 
 # =====================================================
@@ -606,15 +623,21 @@ try:
 
                 lock_heading_go()
 
-        elif route_state == "TAG6_ALIGN":
+        elif route_state == "WAIT_TAG6_CORRECT_COMMAND":
+
+            stop_robot()
+
+        elif route_state == "TAG6_CORRECTING":
 
             tag6 = find_tag(detections, TAG_6)
 
             if tag6 is None:
 
-                print("RPI: Tag 6 lost during final alignment. Stop.")
                 stop_robot()
-                route_state = "DONE"
+                route_state = "WAIT_TAG6_CORRECT_COMMAND"
+
+                print("RPI: Tag 6 lost during correction. Stopped.")
+                print("RPI: Reposition manually if needed, then press 'c' again.")
 
             else:
 
@@ -645,12 +668,12 @@ try:
 
                     if tag6_good_count >= TAG6_GOOD_FRAMES_REQUIRED:
 
-                        print("RPI: Tag 6 heading and image center OK.")
-                        print(f"RPI: Sending TURN_REL {TURN_DEG:.1f}")
+                        stop_robot()
 
-                        send_command(f"TURN_REL {TURN_DEG:.1f}")
+                        route_state = "WAIT_TURN_COMMAND"
 
-                        route_state = "TAG6_TURN"
+                        print("RPI: Tag 6 correction complete.")
+                        print("RPI: Press 't' to turn 90 degrees.")
 
                 else:
 
@@ -669,6 +692,10 @@ try:
                         f"R={right}"
                     )
 
+        elif route_state == "WAIT_TURN_COMMAND":
+
+            stop_robot()
+
         elif route_state == "TAG6_TURN":
 
             lines = read_esp32_lines()
@@ -680,7 +707,7 @@ try:
 
         elif route_state == "DONE":
 
-            pass
+            stop_robot()
 
         # =================================================
         # DISPLAY
@@ -743,7 +770,7 @@ try:
         )
 
         cv2.imshow(
-            "AGV Tag6 Heading Center Turn",
+            "AGV Tag6 Manual Correct Then Turn",
             frame
         )
 
@@ -751,6 +778,10 @@ try:
             read_esp32_lines()
 
         key = cv2.waitKey(1) & 0xFF
+
+        # =================================================
+        # KEY COMMANDS
+        # =================================================
 
         if key == ord('s'):
 
@@ -794,6 +825,41 @@ try:
                 else:
 
                     print("RPI: Start ignored. Tag 11 not visible.")
+
+        elif key == ord('c'):
+
+            if route_state == "WAIT_TAG6_CORRECT_COMMAND":
+
+                tag6 = find_tag(detections, TAG_6)
+
+                if tag6 is None:
+
+                    print("RPI: Cannot correct. Tag 6 is not visible.")
+
+                else:
+
+                    tag6_good_count = 0
+
+                    print("RPI: Starting Tag 6 correction.")
+                    print("RPI: Using yaw + image center Y only. No xM correction.")
+
+                    route_state = "TAG6_CORRECTING"
+
+        elif key == ord('t'):
+
+            if route_state == "WAIT_TURN_COMMAND":
+
+                print(f"RPI: Sending TURN_REL {TURN_DEG:.1f}")
+
+                ser.reset_input_buffer()
+
+                send_command(f"TURN_REL {TURN_DEG:.1f}")
+
+                route_state = "TAG6_TURN"
+
+            else:
+
+                print("RPI: Turn ignored. Correct Tag 6 first, then press 't'.")
 
         elif key == ord('q'):
 
