@@ -21,8 +21,6 @@ TAG_6 = 6
 
 route_state = "WAIT_START"
 
-seen_tag7 = False
-
 
 # =====================================================
 # DRIVE PARAMETERS
@@ -35,10 +33,16 @@ VISION_BASE_PPS = 4200
 VISION_MIN_PPS = 2500
 VISION_MAX_PPS = 6000
 
-# Final tag speed
-FINAL_BASE_PPS = 1200
-FINAL_MIN_PPS = 700
-FINAL_MAX_PPS = 2200
+# Final tag 6 alignment speed
+FINAL_BASE_PPS = 1000
+FINAL_MIN_PPS = 600
+FINAL_MAX_PPS = 1800
+
+# Front/back centering speed at tag 6
+CENTER_FB_PPS = 850
+
+# If front/back moves wrong way, change this to -1
+FB_SIGN = 1
 
 
 # =====================================================
@@ -47,33 +51,41 @@ FINAL_MAX_PPS = 2200
 
 EXPECTED_TAG_YAW_DEG = 0.0
 
+# Before tag 6, use yaw + xM
 KP_YAW_PPS_PER_DEG = 18
 KP_X_PPS_PER_M = 16000
 
-# If xM correction moves away from zero, change this to +1.0
+# At tag 6, use yaw only
+KP_TAG6_YAW_PPS_PER_DEG = 20
+
+# If xM correction moves away from zero before tag 6, change this to +1.0
 X_SIGN = -1.0
 
 YAW_DEADBAND_DEG = 0.30
 X_DEADBAND_M = 0.002
 
 MAX_VISION_CORRECTION_PPS = 260
-MAX_FINAL_CORRECTION_PPS = 160
+MAX_TAG6_YAW_CORRECTION_PPS = 180
 
-# Low-pass filter for smooth steering
+# Smooth steering
 CORRECTION_FILTER_ALPHA = 0.35
-
 filtered_correction = 0.0
 
 
 # =====================================================
-# FINAL TAG STOP TOLERANCE
+# TAG 6 FINAL CONDITIONS
 # =====================================================
 
-TAG6_X_OK_M = 0.010
 TAG6_YAW_OK_DEG = 3.0
-TAG6_GOOD_FRAMES_REQUIRED = 3
 
+# Only use image center Y for front/back centering.
+# Do not use xM.
+TAG6_CENTER_Y_OK_PX = 25
+
+TAG6_GOOD_FRAMES_REQUIRED = 3
 tag6_good_count = 0
+
+TURN_DEG = 90.0
 
 
 # =====================================================
@@ -217,11 +229,16 @@ def lock_heading_go():
 
 
 def read_esp32_lines():
+    lines = []
+
     while ser.in_waiting > 0:
         line = ser.readline().decode(errors="ignore").strip()
 
         if line:
             print(f"ESP32: {line}")
+            lines.append(line)
+
+    return lines
 
 
 def wait_for_esp32_text(expected_text, timeout_sec=10.0):
@@ -277,14 +294,22 @@ def get_tag_pose(tag):
     return raw_yaw, yaw_error, x_m
 
 
-def tag6_pose_good(yaw_error, x_m):
+def tag_y_error_px(tag):
+    return float(tag.center[1] - (FRAME_HEIGHT / 2.0))
+
+
+def tag6_good(yaw_error, y_error_px):
     return (
         abs(yaw_error) <= TAG6_YAW_OK_DEG
-        and abs(x_m) <= TAG6_X_OK_M
+        and abs(y_error_px) <= TAG6_CENTER_Y_OK_PX
     )
 
 
-def correction_velocity(tag, final=False):
+# =====================================================
+# CORRECTION BEFORE TAG 6: YAW + XM
+# =====================================================
+
+def travelling_correction_velocity(tag):
     global filtered_correction
 
     raw_yaw, yaw_error, x_m = get_tag_pose(tag)
@@ -301,28 +326,16 @@ def correction_velocity(tag, final=False):
     yaw_corr = KP_YAW_PPS_PER_DEG * yaw_for_control
     x_corr = KP_X_PPS_PER_M * x_for_control * X_SIGN
 
-    # If yaw and xM fight each other, reduce yaw effect.
     if abs(x_for_control) > X_DEADBAND_M:
         if yaw_corr * x_corr < 0:
             yaw_corr *= 0.25
 
     raw_correction = yaw_corr + x_corr
 
-    if final:
-        max_corr = MAX_FINAL_CORRECTION_PPS
-        base_pps = FINAL_BASE_PPS
-        min_pps = FINAL_MIN_PPS
-        max_pps = FINAL_MAX_PPS
-    else:
-        max_corr = MAX_VISION_CORRECTION_PPS
-        base_pps = VISION_BASE_PPS
-        min_pps = VISION_MIN_PPS
-        max_pps = VISION_MAX_PPS
-
     raw_correction = float(np.clip(
         raw_correction,
-        -max_corr,
-        max_corr
+        -MAX_VISION_CORRECTION_PPS,
+        MAX_VISION_CORRECTION_PPS
     ))
 
     filtered_correction = (
@@ -332,11 +345,11 @@ def correction_velocity(tag, final=False):
 
     correction = int(filtered_correction)
 
-    left = base_pps - correction
-    right = base_pps + correction
+    left = VISION_BASE_PPS - correction
+    right = VISION_BASE_PPS + correction
 
-    left = int(np.clip(left, min_pps, max_pps))
-    right = int(np.clip(right, min_pps, max_pps))
+    left = int(np.clip(left, VISION_MIN_PPS, VISION_MAX_PPS))
+    right = int(np.clip(right, VISION_MIN_PPS, VISION_MAX_PPS))
 
     return (
         left,
@@ -347,6 +360,61 @@ def correction_velocity(tag, final=False):
         x_m,
         yaw_corr,
         x_corr
+    )
+
+
+# =====================================================
+# TAG 6: YAW ONLY + IMAGE CENTER Y
+# =====================================================
+
+def tag6_heading_center_velocity(tag):
+    raw_yaw, yaw_error, x_m = get_tag_pose(tag)
+    y_err = tag_y_error_px(tag)
+
+    yaw_for_control = yaw_error
+
+    if abs(yaw_for_control) < YAW_DEADBAND_DEG:
+        yaw_for_control = 0.0
+
+    yaw_corr = -KP_TAG6_YAW_PPS_PER_DEG * yaw_for_control
+
+    yaw_corr = int(np.clip(
+        yaw_corr,
+        -MAX_TAG6_YAW_CORRECTION_PPS,
+        MAX_TAG6_YAW_CORRECTION_PPS
+    ))
+
+    # Front/back movement to center tag vertically in image.
+    # No xM correction is used here.
+    if abs(y_err) <= TAG6_CENTER_Y_OK_PX:
+        fb = 0
+    else:
+        if y_err > 0:
+            fb = CENTER_FB_PPS * FB_SIGN
+        else:
+            fb = -CENTER_FB_PPS * FB_SIGN
+
+    # Heading correction is differential.
+    # Front/back centering is common speed.
+    left = fb - yaw_corr
+    right = fb + yaw_corr
+
+    # If front/back is centered, still allow pure yaw correction.
+    if fb == 0:
+        left = -yaw_corr
+        right = yaw_corr
+
+    left = int(np.clip(left, -FINAL_MAX_PPS, FINAL_MAX_PPS))
+    right = int(np.clip(right, -FINAL_MAX_PPS, FINAL_MAX_PPS))
+
+    return (
+        left,
+        right,
+        yaw_corr,
+        raw_yaw,
+        yaw_error,
+        x_m,
+        y_err
     )
 
 
@@ -367,9 +435,8 @@ def find_tag(detections, tag_id):
     return None
 
 
-def choose_vision_tag(detections):
+def choose_travel_tag(detections):
     global route_state
-    global seen_tag7
 
     tag11 = find_tag(detections, START_TAG)
     tag7 = find_tag(detections, TAG_7)
@@ -378,36 +445,30 @@ def choose_vision_tag(detections):
     if route_state == "MOVE_TO_7":
 
         if tag7 is not None:
-            seen_tag7 = True
             route_state = "MOVE_TO_6"
-            print("RPI: Tag 7 detected. Now target is Tag 6.")
-            return tag7, "TAG7", False
+            reset_correction_filter()
+            print("RPI: Tag 7 detected. Now moving toward Tag 6.")
+            return tag7, "TAG7"
 
         if tag11 is not None:
-            return tag11, "TAG11", False
+            return tag11, "TAG11"
 
-        return None, "", False
+        return None, ""
 
     if route_state == "MOVE_TO_6":
 
         if tag6 is not None:
-            route_state = "FINAL_TAG6"
-            print("RPI: Tag 6 detected. Final approach.")
-            return tag6, "TAG6", True
+            route_state = "TAG6_ALIGN"
+            reset_correction_filter()
+            print("RPI: Tag 6 detected. Align heading and image center before turn.")
+            return None, ""
 
         if tag7 is not None:
-            return tag7, "TAG7", False
+            return tag7, "TAG7"
 
-        return None, "", False
+        return None, ""
 
-    if route_state == "FINAL_TAG6":
-
-        if tag6 is not None:
-            return tag6, "TAG6", True
-
-        return None, "", True
-
-    return None, "", False
+    return None, ""
 
 
 # =====================================================
@@ -416,11 +477,10 @@ def choose_vision_tag(detections):
 
 print("Waiting for docking Tag 11...")
 print("Press 's' when Tag 11 is visible and robot is manually aligned.")
-print("Flow:")
-print("  s -> IMU RECAL -> LOCK_HEADING_GO")
-print("  visible tag -> live AprilTag yaw + xM correction")
-print("  no tag -> ESP32 IMU heading hold")
-print("  Tag 6 -> slow final correction and stop")
+print("Route:")
+print("  11->7 uses live AprilTag + IMU")
+print("  7->6 uses live AprilTag + IMU")
+print("  At Tag 6: heading only + image center Y, then TURN_REL 90")
 
 
 # =====================================================
@@ -444,10 +504,6 @@ try:
             tag_size=TAG_SIZE_M
         )
 
-        # =================================================
-        # DRAW TAGS
-        # =================================================
-
         visible_ids = []
 
         for tag in detections:
@@ -465,6 +521,7 @@ try:
             cv2.circle(frame, center, 5, (0, 0, 255), -1)
 
             raw_yaw, yaw_error, x_m = get_tag_pose(tag)
+            y_err = tag_y_error_px(tag)
 
             cv2.putText(
                 frame,
@@ -496,6 +553,16 @@ try:
                 2
             )
 
+            cv2.putText(
+                frame,
+                f"yErr:{y_err:.0f}px",
+                (center[0] + 10, center[1] + 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 180, 255),
+                2
+            )
+
         # =================================================
         # STATE MACHINE
         # =================================================
@@ -504,11 +571,11 @@ try:
 
             pass
 
-        elif route_state in ("MOVE_TO_7", "MOVE_TO_6", "FINAL_TAG6"):
+        elif route_state in ("MOVE_TO_7", "MOVE_TO_6"):
 
-            vision_tag, label, final = choose_vision_tag(detections)
+            tag, label = choose_travel_tag(detections)
 
-            if vision_tag is not None:
+            if tag is not None:
 
                 (
                     left,
@@ -519,89 +586,97 @@ try:
                     x_m,
                     yaw_corr,
                     x_corr
-                ) = correction_velocity(
-                    vision_tag,
-                    final=final
+                ) = travelling_correction_velocity(tag)
+
+                send_velocity(left, right)
+
+                print(
+                    f"{label} LIVE_CORR "
+                    f"rawYaw={raw_yaw:.2f} "
+                    f"yawErr={yaw_error:.2f} "
+                    f"xM={x_m:.4f} "
+                    f"yawCorr={yaw_corr:.1f} "
+                    f"xCorr={x_corr:.1f} "
+                    f"corr={correction} "
+                    f"L={left} "
+                    f"R={right}"
                 )
 
-                if final:
+            else:
 
-                    if tag6_pose_good(yaw_error, x_m):
+                lock_heading_go()
 
-                        tag6_good_count += 1
+        elif route_state == "TAG6_ALIGN":
 
-                        send_velocity(
-                            0,
-                            0,
-                            force=True
-                        )
+            tag6 = find_tag(detections, TAG_6)
 
-                        print(
-                            f"TAG6 GOOD "
-                            f"{tag6_good_count}/{TAG6_GOOD_FRAMES_REQUIRED} "
-                            f"rawYaw={raw_yaw:.2f} "
-                            f"yawErr={yaw_error:.2f} "
-                            f"xM={x_m:.4f}"
-                        )
+            if tag6 is None:
 
-                        if tag6_good_count >= TAG6_GOOD_FRAMES_REQUIRED:
+                print("RPI: Tag 6 lost during final alignment. Stop.")
+                stop_robot()
+                route_state = "DONE"
 
-                            print("RPI: Tag 6 aligned. Route complete.")
-                            stop_robot()
-                            route_state = "DONE"
+            else:
 
-                    else:
+                (
+                    left,
+                    right,
+                    yaw_corr,
+                    raw_yaw,
+                    yaw_error,
+                    x_m,
+                    y_err
+                ) = tag6_heading_center_velocity(tag6)
 
-                        tag6_good_count = 0
+                if tag6_good(yaw_error, y_err):
 
-                        send_velocity(
-                            left,
-                            right
-                        )
+                    tag6_good_count += 1
 
-                        print(
-                            f"{label} FINAL_CORR "
-                            f"rawYaw={raw_yaw:.2f} "
-                            f"yawErr={yaw_error:.2f} "
-                            f"xM={x_m:.4f} "
-                            f"yawCorr={yaw_corr:.1f} "
-                            f"xCorr={x_corr:.1f} "
-                            f"corr={correction} "
-                            f"L={left} "
-                            f"R={right}"
-                        )
+                    stop_robot()
+
+                    print(
+                        f"TAG6 GOOD "
+                        f"{tag6_good_count}/{TAG6_GOOD_FRAMES_REQUIRED} "
+                        f"rawYaw={raw_yaw:.2f} "
+                        f"yawErr={yaw_error:.2f} "
+                        f"xM={x_m:.4f} "
+                        f"yErr={y_err:.1f}"
+                    )
+
+                    if tag6_good_count >= TAG6_GOOD_FRAMES_REQUIRED:
+
+                        print("RPI: Tag 6 heading and image center OK.")
+                        print(f"RPI: Sending TURN_REL {TURN_DEG:.1f}")
+
+                        send_command(f"TURN_REL {TURN_DEG:.1f}")
+
+                        route_state = "TAG6_TURN"
 
                 else:
 
                     tag6_good_count = 0
 
-                    send_velocity(
-                        left,
-                        right
-                    )
+                    send_velocity(left, right)
 
                     print(
-                        f"{label} LIVE_CORR "
+                        f"TAG6 ALIGN "
                         f"rawYaw={raw_yaw:.2f} "
                         f"yawErr={yaw_error:.2f} "
                         f"xM={x_m:.4f} "
-                        f"yawCorr={yaw_corr:.1f} "
-                        f"xCorr={x_corr:.1f} "
-                        f"corr={correction} "
+                        f"yErr={y_err:.1f} "
+                        f"yawCorr={yaw_corr} "
                         f"L={left} "
                         f"R={right}"
                     )
 
-            else:
+        elif route_state == "TAG6_TURN":
 
-                tag6_good_count = 0
+            lines = read_esp32_lines()
 
-                if route_state == "FINAL_TAG6":
-                    print("RPI: Tag 6 lost during final approach. Stop.")
-                    stop_robot()
+            for line in lines:
+                if "OK TURN_DONE" in line:
+                    print("RPI: 90 degree turn complete.")
                     route_state = "DONE"
-                else:
-                    lock_heading_go()
 
         elif route_state == "DONE":
 
@@ -610,6 +685,22 @@ try:
         # =================================================
         # DISPLAY
         # =================================================
+
+        cv2.line(
+            frame,
+            (int(CX) - 30, int(CY)),
+            (int(CX) + 30, int(CY)),
+            (255, 255, 255),
+            2
+        )
+
+        cv2.line(
+            frame,
+            (int(CX), int(CY) - 30),
+            (int(CX), int(CY) + 30),
+            (255, 255, 255),
+            2
+        )
 
         cv2.putText(
             frame,
@@ -652,11 +743,12 @@ try:
         )
 
         cv2.imshow(
-            "AGV Live AprilTag + IMU Route 11-7-6",
+            "AGV Tag6 Heading Center Turn",
             frame
         )
 
-        read_esp32_lines()
+        if route_state != "TAG6_TURN":
+            read_esp32_lines()
 
         key = cv2.waitKey(1) & 0xFF
 
