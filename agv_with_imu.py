@@ -37,45 +37,33 @@ MAX_DRIVE_PPS = 8000
 # APRILTAG CORRECTION PARAMETERS
 # =====================================================
 
+# Reduced from 400 to 250 to avoid aggressive steering at Tag 7
+MAX_CORRECTION_PPS = 250
+
 KP_YAW_PPS_PER_DEG = 25
 KP_X_PPS_PER_M = 30000
 
+# If xM correction goes wrong direction, change this to +1.0
 X_SIGN = -1.0
 
 YAW_DEADBAND_DEG = 0.20
 X_DEADBAND_M = 0.002
 
-MAX_CORRECTION_PPS = 400
 CORRECTION_DURATION_SEC = 0.5
 
 
 # =====================================================
-# TAG HEADING PARAMETERS
+# TAG ACCEPTANCE / RETRY PARAMETERS
 # =====================================================
 
 # All tags are now in same orientation.
 # Correct straight alignment means raw tag yaw should be near 0 degrees.
 EXPECTED_TAG_YAW_DEG = 0.0
 
-TURN_REL_DEG = 90.0
+TAG_RECHECK_X_OK_M = 0.008       # 8 mm
+TAG_RECHECK_YAW_OK_DEG = 3.0     # 3 degrees
 
-EXPECTED_AFTER_TURN_YAW_DEG = None
-VERIFY_YAW_OK_DEG = 4.0
-
-
-# =====================================================
-# TAG 6 CENTERING BEFORE TURN
-# =====================================================
-
-TAG_CENTER_X_OK_M = 0.006          # 6 mm
-TAG_CENTER_MOVE_PPS = 1200
-TAG_CENTER_TIMEOUT_SEC = 4.0
-
-# If xM becomes worse during centering, change to -1
-CENTER_MOVE_SIGN = 1
-
-# During turn, if tag xM goes beyond this, stop turn
-TURN_TAG_CENTER_SAFE_M = 0.018     # 18 mm
+TAG_MAX_CORRECTION_ATTEMPTS = 2
 
 
 # =====================================================
@@ -89,7 +77,9 @@ current_index = 0
 current_target = TAG_SEQUENCE[current_index]
 
 route_state = "WAIT_START"
-mission_started = False
+
+tag7_attempts = 0
+tag6_attempts = 0
 
 
 # =====================================================
@@ -119,11 +109,9 @@ correction_end_time = 0.0
 drive_left_pps = 0
 drive_right_pps = 0
 
-tag6_center_start_time = 0.0
-
 
 # =====================================================
-# SERIAL
+# SERIAL SETUP
 # =====================================================
 
 ser = serial.Serial(
@@ -153,8 +141,8 @@ picam2.configure(config)
 picam2.set_controls({
     "AeEnable": False,
     "AwbEnable": False,
-    "ExposureTime": 5000,
-    "AnalogueGain": 1.0
+    "ExposureTime": 10000,
+    "AnalogueGain": 2.0
 })
 
 picam2.start()
@@ -234,8 +222,9 @@ def normalize_angle(angle):
 
 def compute_yaw_deg(tag):
     """
-    Raw visual yaw of the AprilTag.
-    Since all tags now have same orientation, expected straight yaw is 0 deg.
+    Raw visual yaw of AprilTag.
+    Since all tags have same orientation now,
+    expected straight yaw is 0 degrees.
     """
     corners = tag.corners
 
@@ -275,6 +264,8 @@ def pose_error_to_pps(yaw_error_deg, x_error_m):
     yaw_correction = KP_YAW_PPS_PER_DEG * yaw_error_deg
     x_correction = KP_X_PPS_PER_M * x_error_m * X_SIGN
 
+    # If yaw and x correction fight each other,
+    # reduce yaw contribution and prioritize xM alignment.
     if abs(x_error_m) > X_DEADBAND_M:
         if yaw_correction * x_correction < 0:
             yaw_correction *= 0.20
@@ -296,13 +287,35 @@ def pose_error_to_pps(yaw_error_deg, x_error_m):
     return left_pps, right_pps, correction, yaw_correction, x_correction
 
 
-def center_move_command(x_m):
-    if x_m > 0:
-        pps = -TAG_CENTER_MOVE_PPS * CENTER_MOVE_SIGN
-    else:
-        pps = TAG_CENTER_MOVE_PPS * CENTER_MOVE_SIGN
+def get_tag_pose_error(tag):
+    raw_yaw_deg = compute_yaw_deg(tag)
+    x_m = compute_lateral_x_m(tag)
 
-    return pps, pps
+    yaw_error = yaw_error_from_tag(
+        raw_yaw_deg,
+        EXPECTED_TAG_YAW_DEG
+    )
+
+    return raw_yaw_deg, yaw_error, x_m
+
+
+def is_tag_pose_good(tag, label):
+    raw_yaw_deg, yaw_error, x_m = get_tag_pose_error(tag)
+
+    pose_ok = (
+        abs(x_m) <= TAG_RECHECK_X_OK_M
+        and abs(yaw_error) <= TAG_RECHECK_YAW_OK_DEG
+    )
+
+    print(
+        f"{label} RECHECK "
+        f"rawYaw={raw_yaw_deg:.2f} "
+        f"yawErr={yaw_error:.2f} "
+        f"xM={x_m:.4f} "
+        f"ok={pose_ok}"
+    )
+
+    return pose_ok
 
 
 def advance_target():
@@ -319,19 +332,13 @@ def advance_target():
     print(f"RPI: Target advanced to Tag {current_target}")
 
 
-def start_apriltag_correction(tag, label, expected_tag_yaw_deg):
+def start_apriltag_correction(tag, label):
     global correction_active
     global correction_end_time
     global drive_left_pps
     global drive_right_pps
 
-    raw_yaw_deg = compute_yaw_deg(tag)
-    x_m = compute_lateral_x_m(tag)
-
-    yaw_error = yaw_error_from_tag(
-        raw_yaw_deg,
-        expected_tag_yaw_deg
-    )
+    raw_yaw_deg, yaw_error, x_m = get_tag_pose_error(tag)
 
     x_error_m = x_m
 
@@ -357,7 +364,7 @@ def start_apriltag_correction(tag, label, expected_tag_yaw_deg):
     print(
         f"{label} CORR "
         f"rawYaw={raw_yaw_deg:.2f} "
-        f"expectedYaw={expected_tag_yaw_deg:.2f} "
+        f"expectedYaw={EXPECTED_TAG_YAW_DEG:.2f} "
         f"yawErr={yaw_error:.2f} "
         f"xM={x_m:.4f} "
         f"xErr={x_error_m:.4f} "
@@ -370,36 +377,15 @@ def start_apriltag_correction(tag, label, expected_tag_yaw_deg):
     )
 
 
-def verify_tag6_after_turn(tag):
-    raw_yaw_deg = compute_yaw_deg(tag)
-
-    yaw_error = yaw_error_from_tag(
-        raw_yaw_deg,
-        EXPECTED_AFTER_TURN_YAW_DEG
-    )
-
-    print(
-        f"TAG6 VERIFY "
-        f"rawYaw={raw_yaw_deg:.2f} "
-        f"expectedYaw={EXPECTED_AFTER_TURN_YAW_DEG:.2f} "
-        f"yawErr={yaw_error:.2f}"
-    )
-
-    return abs(yaw_error) <= VERIFY_YAW_OK_DEG
-
-
 # =====================================================
-# INITIALIZE EXPECTED AFTER TURN YAW
+# STARTUP MESSAGE
 # =====================================================
-
-EXPECTED_AFTER_TURN_YAW_DEG = normalize_angle(
-    EXPECTED_TAG_YAW_DEG + TURN_REL_DEG
-)
 
 print("Waiting for docking Tag 11...")
 print("Press 's' when Tag 11 is visible.")
-print(f"Straight expected raw tag yaw = {EXPECTED_TAG_YAW_DEG:.1f} deg")
-print(f"After turn expected raw tag yaw = {EXPECTED_AFTER_TURN_YAW_DEG:.1f} deg")
+print(f"Expected straight raw tag yaw = {EXPECTED_TAG_YAW_DEG:.1f} deg")
+print("This test stops after Tag 6 is reliably corrected.")
+print("No 90 degree turn is executed in this code.")
 
 
 # =====================================================
@@ -427,7 +413,7 @@ try:
         target_tag = None
 
         # ------------------------------------------------
-        # Draw tags and find current target
+        # Draw all tags and find current target
         # ------------------------------------------------
 
         for tag in detections:
@@ -440,7 +426,6 @@ try:
                 cv2.line(frame, p1, p2, (0, 255, 0), 2)
 
             center = tuple(tag.center.astype(int))
-
             cv2.circle(frame, center, 5, (0, 0, 255), -1)
 
             raw_yaw_deg = compute_yaw_deg(tag)
@@ -507,8 +492,8 @@ try:
 
         elif route_state == "MOVE_11_TO_7":
 
-            # ESP32 holds IMU heading.
-            # RPI waits for Tag 7.
+            # ESP32 holds heading using IMU.
+            # Raspberry Pi waits for Tag 7.
 
             if target_found and current_target == 7:
 
@@ -517,10 +502,11 @@ try:
                 stop_robot()
                 time.sleep(0.15)
 
+                tag7_attempts = 1
+
                 start_apriltag_correction(
                     target_tag,
-                    "TAG7",
-                    EXPECTED_TAG_YAW_DEG
+                    "TAG7_ATTEMPT_1"
                 )
 
                 route_state = "TAG7_CORRECTION"
@@ -532,14 +518,9 @@ try:
                 correction_active = False
 
                 stop_robot()
-                time.sleep(0.15)
+                time.sleep(0.20)
 
-                lock_heading_go()
-
-                advance_target()
-
-                print("RPI: Moving from Tag 7 to Tag 6 using IMU heading.")
-                route_state = "MOVE_7_TO_6"
+                route_state = "TAG7_RECHECK"
 
             elif correction_active:
 
@@ -548,22 +529,72 @@ try:
                     drive_right_pps
                 )
 
+        elif route_state == "TAG7_RECHECK":
+
+            if target_found and current_target == 7:
+
+                if is_tag_pose_good(target_tag, "TAG7"):
+
+                    print("RPI: Tag 7 pose good. Locking corrected heading.")
+
+                    lock_heading_go()
+
+                    advance_target()
+
+                    print("RPI: Moving from Tag 7 to Tag 6 using IMU heading.")
+                    route_state = "MOVE_7_TO_6"
+
+                else:
+
+                    if tag7_attempts < TAG_MAX_CORRECTION_ATTEMPTS:
+
+                        tag7_attempts += 1
+
+                        print(
+                            f"RPI: Tag 7 pose not good. "
+                            f"Retry correction attempt {tag7_attempts}."
+                        )
+
+                        start_apriltag_correction(
+                            target_tag,
+                            f"TAG7_ATTEMPT_{tag7_attempts}"
+                        )
+
+                        route_state = "TAG7_CORRECTION"
+
+                    else:
+
+                        print("RPI: Tag 7 correction failed after retries. Stop.")
+                        stop_robot()
+                        drive_left_pps = 0
+                        drive_right_pps = 0
+                        route_state = "DONE"
+
+            else:
+
+                print("RPI: Tag 7 lost during recheck. Stop.")
+                stop_robot()
+                drive_left_pps = 0
+                drive_right_pps = 0
+                route_state = "DONE"
+
         elif route_state == "MOVE_7_TO_6":
 
-            # ESP32 holds IMU heading.
-            # RPI waits for Tag 6.
+            # ESP32 holds heading using IMU.
+            # Raspberry Pi waits for Tag 6.
 
             if target_found and current_target == 6:
 
-                print("RPI: Tag 6 reached. Starting AprilTag correction before turn.")
+                print("RPI: Tag 6 reached. Starting AprilTag correction.")
 
                 stop_robot()
                 time.sleep(0.15)
 
+                tag6_attempts = 1
+
                 start_apriltag_correction(
                     target_tag,
-                    "TAG6",
-                    EXPECTED_TAG_YAW_DEG
+                    "TAG6_ATTEMPT_1"
                 )
 
                 route_state = "TAG6_CORRECTION"
@@ -577,11 +608,7 @@ try:
                 stop_robot()
                 time.sleep(0.20)
 
-                print("RPI: Tag 6 correction finished. Centering tag before turn.")
-
-                tag6_center_start_time = time.time()
-
-                route_state = "CENTER_TAG6_BEFORE_TURN"
+                route_state = "TAG6_RECHECK"
 
             elif correction_active:
 
@@ -590,113 +617,49 @@ try:
                     drive_right_pps
                 )
 
-        elif route_state == "CENTER_TAG6_BEFORE_TURN":
+        elif route_state == "TAG6_RECHECK":
 
             if target_found and current_target == 6:
 
-                x_m = compute_lateral_x_m(target_tag)
+                if is_tag_pose_good(target_tag, "TAG6"):
 
-                if abs(x_m) <= TAG_CENTER_X_OK_M:
-
-                    stop_robot()
-                    time.sleep(0.20)
-
-                    print(
-                        f"RPI: Tag 6 centered xM={x_m:.4f}. "
-                        f"Starting slow IMU turn."
-                    )
-
-                    send_command(f"TURN_REL {TURN_REL_DEG:.1f}")
-
-                    route_state = "WAIT_TURN_90_DONE"
-
-                elif time.time() - tag6_center_start_time > TAG_CENTER_TIMEOUT_SEC:
-
-                    stop_robot()
-                    time.sleep(0.20)
-
-                    print(
-                        f"RPI: Tag 6 center timeout xM={x_m:.4f}. "
-                        f"Starting turn anyway."
-                    )
-
-                    send_command(f"TURN_REL {TURN_REL_DEG:.1f}")
-
-                    route_state = "WAIT_TURN_90_DONE"
-
-                else:
-
-                    drive_left_pps, drive_right_pps = center_move_command(x_m)
-
-                    send_velocity(
-                        drive_left_pps,
-                        drive_right_pps
-                    )
-
-                    print(
-                        f"TAG6 CENTER "
-                        f"xM={x_m:.4f} "
-                        f"L={drive_left_pps} "
-                        f"R={drive_right_pps}"
-                    )
-
-            else:
-
-                stop_robot()
-                drive_left_pps = 0
-                drive_right_pps = 0
-
-                print("RPI: Tag 6 lost during centering. Stop.")
-                route_state = "DONE"
-
-        elif route_state == "WAIT_TURN_90_DONE":
-
-            # Camera safety monitoring while ESP32 performs IMU turn.
-            # If tag is visible and moving far from safe region, stop turn.
-
-            if target_found and current_target == 6:
-
-                x_m = compute_lateral_x_m(target_tag)
-
-                if abs(x_m) > TURN_TAG_CENTER_SAFE_M:
-
-                    print(
-                        f"RPI: Tag 6 leaving view during turn "
-                        f"xM={x_m:.4f}. Stopping turn."
-                    )
+                    print("RPI: Tag 6 pose good. Route test complete.")
+                    print("RPI: Robot stopped at Tag 6. Ready for future turn test.")
 
                     stop_robot()
                     drive_left_pps = 0
                     drive_right_pps = 0
-
                     route_state = "DONE"
 
-            lines = read_esp32_lines()
-
-            for line in lines:
-                if "OK TURN_DONE" in line:
-                    print("RPI: ESP32 reports 90 degree turn done.")
-                    route_state = "VERIFY_TAG6_HEADING"
-
-        elif route_state == "VERIFY_TAG6_HEADING":
-
-            if target_found and current_target == 6:
-
-                ok = verify_tag6_after_turn(target_tag)
-
-                if ok:
-                    print("RPI: Tag 6 heading verified. Test complete.")
                 else:
-                    print("RPI: Tag 6 heading verification failed. Stop for inspection.")
 
-                stop_robot()
-                drive_left_pps = 0
-                drive_right_pps = 0
-                route_state = "DONE"
+                    if tag6_attempts < TAG_MAX_CORRECTION_ATTEMPTS:
+
+                        tag6_attempts += 1
+
+                        print(
+                            f"RPI: Tag 6 pose not good. "
+                            f"Retry correction attempt {tag6_attempts}."
+                        )
+
+                        start_apriltag_correction(
+                            target_tag,
+                            f"TAG6_ATTEMPT_{tag6_attempts}"
+                        )
+
+                        route_state = "TAG6_CORRECTION"
+
+                    else:
+
+                        print("RPI: Tag 6 correction failed after retries. Stop.")
+                        stop_robot()
+                        drive_left_pps = 0
+                        drive_right_pps = 0
+                        route_state = "DONE"
 
             else:
 
-                print("RPI: Tag 6 not visible after turn. Turn completed by IMU.")
+                print("RPI: Tag 6 lost during recheck. Stop.")
                 stop_robot()
                 drive_left_pps = 0
                 drive_right_pps = 0
@@ -742,13 +705,22 @@ try:
             2
         )
 
+        cv2.putText(
+            frame,
+            f"Tag7 tries:{tag7_attempts} Tag6 tries:{tag6_attempts}",
+            (40, 170),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2
+        )
+
         cv2.imshow(
-            "AGV Route Test 11-7-6",
+            "AGV Route Test 11-7-6 Reliable Tag6",
             frame
         )
 
-        if route_state != "WAIT_TURN_90_DONE":
-            read_esp32_lines()
+        read_esp32_lines()
 
         key = cv2.waitKey(1) & 0xFF
 
