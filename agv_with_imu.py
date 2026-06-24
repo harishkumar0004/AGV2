@@ -26,11 +26,11 @@ PULSES_PER_METER = PULSES_PER_REV / WHEEL_CIRCUMFERENCE
 # DRIVE PARAMETERS
 # =====================================================
 
-BASE_PPS = 5500
-MAX_PPS = 12000
+BASE_PPS = 4000
+MAX_PPS = 10000
 
-MIN_DRIVE_PPS = 3000
-MAX_DRIVE_PPS = 8000
+MIN_DRIVE_PPS = 2000
+MAX_DRIVE_PPS = 6000
 
 
 # =====================================================
@@ -49,7 +49,7 @@ X_SIGN = -1.0
 YAW_DEADBAND_DEG = 0.20
 X_DEADBAND_M = 0.002
 
-CORRECTION_DURATION_SEC = 0.5
+CORRECTION_DURATION_SEC = 0.8
 
 
 # =====================================================
