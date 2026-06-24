@@ -80,6 +80,7 @@ current_target = TAG_SEQUENCE[current_index]
 route_state = "WAIT_START"
 mission_started = False
 
+
 # =====================================================
 # CAMERA PARAMETERS
 # =====================================================
@@ -139,8 +140,8 @@ picam2.configure(config)
 picam2.set_controls({
     "AeEnable": False,
     "AwbEnable": False,
-    "ExposureTime": 5000,
-    "AnalogueGain": 1.0
+    "ExposureTime": 10000,
+    "AnalogueGain": 2.0
 })
 
 picam2.start()
@@ -156,8 +157,6 @@ detector = Detector(
     quad_decimate=2.0,
     refine_edges=1
 )
-
-
 
 
 # =====================================================
@@ -290,8 +289,8 @@ def pose_error_to_pps(yaw_error_deg, x_error_m):
         MAX_CORRECTION_PPS
     ))
 
-    left_pps = BASE_PPS + correction
-    right_pps = BASE_PPS - correction
+    left_pps = BASE_PPS - correction
+    right_pps = BASE_PPS + correction
 
     left_pps = int(np.clip(left_pps, MIN_DRIVE_PPS, MAX_DRIVE_PPS))
     right_pps = int(np.clip(right_pps, MIN_DRIVE_PPS, MAX_DRIVE_PPS))
@@ -420,10 +419,10 @@ try:
         target_found = False
         target_tag = None
 
-
         # ------------------------------------------------
         # Draw tags and find current target
         # ------------------------------------------------
+
         for tag in detections:
 
             corners = tag.corners.astype(int)
