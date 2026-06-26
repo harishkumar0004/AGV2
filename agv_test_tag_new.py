@@ -1494,6 +1494,7 @@ class AGVQtApp(QMainWindow):
 
 
 
+
     # -------------------------
     # Serial
     # -------------------------
@@ -2619,6 +2620,8 @@ class AGVQtApp(QMainWindow):
 
             return None, None, ""
 
+
+
         # ------------------------------------------------------------
         # SEARCH_TARGET
         # ------------------------------------------------------------
@@ -2782,13 +2785,43 @@ class AGVQtApp(QMainWindow):
                     )
         elif self.route_state == "MOVE":
 
-            helper_visible = bool(visible_ids(detections).intersection(HELPER_IDS))
+            helper_ids_now = visible_ids(detections).intersection(HELPER_IDS)
+            helper_visible = bool(helper_ids_now)
+
             if self.last_drive_mode == "VISION" and helper_visible:
+                previous_blocked = set(getattr(self, "previous_helper_block_ids", set()))
+                usable_rejected_helpers = helper_ids_now.difference(previous_blocked)
+
+                # Do not keep driving on old visual correction when the only
+                # helpers still visible are previous-cluster helpers.
+                #
+                # Failure fixed:
+                #   12->11 started with old/previous helpers 505/506 visible.
+                #   The code kept the strong 12 correction alive, so the robot
+                #   curved away before Tag 11 could be reached.
+                #
+                # If at least one helper is visible and not previous-blocked,
+                # we still avoid killing vision immediately. That keeps the
+                # original exit-side protection:
+                #   EAST 503 is not used for correction, but it also does not
+                #   instantly clear a useful visual command.
+                if not usable_rejected_helpers:
+                    self.skip_next_segment_lock = False
+                    self.filtered_correction = 0.0
+                    self.send_esp32("LOCK_HEADING_GO")
+                    self.last_drive_mode = "IMU"
+                    if time.time() - getattr(self, "_last_previous_block_only_lock_log", 0.0) > 0.80:
+                        self._last_previous_block_only_lock_log = time.time()
+                        self.append_log(
+                            "Only previous-blocked helpers visible; switching to IMU heading hold."
+                        )
+                    return
+
                 now = time.time()
                 if now - getattr(self, "_last_keep_visual_on_reject_log", 0.0) > 1.0:
                     self._last_keep_visual_on_reject_log = now
                     self.append_log(
-                        "Rejected helper visible; keeping previous visual VEL instead of LOCK_HEADING_GO."
+                        "Rejected unblocked helper visible; keeping previous visual VEL instead of LOCK_HEADING_GO."
                     )
                 return
 
@@ -3026,7 +3059,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: keep_visual_on_rejected_helper active")
+        self.append_log("BUILD: previous_blocked_helpers_lock active")
 
         self.active_path = list(self.path)
         self.path_index = 1
