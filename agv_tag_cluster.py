@@ -81,11 +81,11 @@ CELL_DISTANCE_M = 0.50
 
 # Fixed ESP32 tuning defaults.
 # These are kept as normal Python values so they cannot be deleted by Qt layout cleanup.
-DEFAULT_BASE_PPS = 6500
+DEFAULT_BASE_PPS = 4500
 DEFAULT_IMU_MAX_CORR = 350
 DEFAULT_IMU_KP = 70.0
-DEFAULT_ACCEL_PPS_PER_SEC = 7000
-DEFAULT_DECEL_PPS_PER_SEC = 9000
+DEFAULT_ACCEL_PPS_PER_SEC = 4000
+DEFAULT_DECEL_PPS_PER_SEC = 5500
 
 NORTH = 0
 EAST = 1
@@ -1292,7 +1292,6 @@ class AGVQtApp(QMainWindow):
             expected_tag=self.expected_next_tag,
         )
 
-
     # -------------------------
     # Camera
     # -------------------------
@@ -1355,6 +1354,7 @@ class AGVQtApp(QMainWindow):
                 self.dock_tag_confirmed = True
                 self.waiting_for_manual_alignment = True
                 self.update_ui_state()
+
 
     # -------------------------
     # Serial
@@ -2634,3 +2634,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
