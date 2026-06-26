@@ -50,12 +50,12 @@ TURN_DEG_BY_LANDMARK = {
 MAX_PPS = 10000
 
 # Normal live correction while moving
-VISION_BASE_PPS = 4200
-VISION_MIN_PPS = 2500
-VISION_MAX_PPS = 6000
+VISION_BASE_PPS = 3500
+VISION_MIN_PPS = 2000
+VISION_MAX_PPS = 5000
 
 # Turning landmark correction speed
-TURN_TAG_FB_PPS = 850
+TURN_TAG_FB_PPS = 550
 
 # If front/back centering moves wrong way, change to -1
 FB_SIGN = 1
@@ -107,12 +107,12 @@ KP_TURN_TAG_YAW_PPS_PER_DEG = 20
 X_SIGN = -1.0
 
 YAW_DEADBAND_DEG = 0.30
-X_DEADBAND_M = 0.002
+X_DEADBAND_M = 0.0005
 
-MAX_VISION_CORRECTION_PPS = 260
-MAX_TURN_TAG_YAW_CORRECTION_PPS = 180
+MAX_VISION_CORRECTION_PPS = 200
+MAX_TURN_TAG_YAW_CORRECTION_PPS = 150
 
-CORRECTION_FILTER_ALPHA = 0.35
+CORRECTION_FILTER_ALPHA = 0.30
 filtered_correction = 0.0
 
 
@@ -154,7 +154,7 @@ drive_right_pps = 0
 
 last_drive_mode = "STOP"
 last_vel_send_time = 0.0
-VEL_SEND_INTERVAL_SEC = 0.08
+VEL_SEND_INTERVAL_SEC = 0.07
 
 
 # =====================================================
