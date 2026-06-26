@@ -82,8 +82,8 @@ CELL_DISTANCE_M = 0.50
 # Fixed ESP32 tuning defaults.
 # These are kept as normal Python values so they cannot be deleted by Qt layout cleanup.
 DEFAULT_BASE_PPS = 6500
-DEFAULT_IMU_MAX_CORR = 450
-DEFAULT_IMU_KP = 85.0
+DEFAULT_IMU_MAX_CORR = 350
+DEFAULT_IMU_KP = 70.0
 DEFAULT_ACCEL_PPS_PER_SEC = 7000
 DEFAULT_DECEL_PPS_PER_SEC = 9000
 
@@ -271,10 +271,10 @@ def turn_action_between_headings(in_heading, out_heading):
 
 MAX_PPS = 12000
 
-VISION_BASE_PPS = 6000
-VISION_BASE_PPS_SLOW = 4200
-VISION_MIN_PPS = 2500
-VISION_MAX_PPS = 7800
+VISION_BASE_PPS = 4500
+VISION_BASE_PPS_SLOW = 3200
+VISION_MIN_PPS = 1800
+VISION_MAX_PPS = 6500
 
 LOCAL_NUDGE_PPS = 500
 TURN_TAG_FB_PPS = 550
@@ -429,11 +429,11 @@ X_LARGE_ERROR_M = 0.012
 YAW_MEDIUM_ERROR_DEG = 2.0
 YAW_LARGE_ERROR_DEG = 5.0
 
-MAX_VISION_CORRECTION_PPS = 350
-MAX_VISION_CORRECTION_STRONG_PPS = 900
+MAX_VISION_CORRECTION_PPS = 300
+MAX_VISION_CORRECTION_STRONG_PPS = 600
 
-CORRECTION_FILTER_ALPHA = 0.45
-CORRECTION_FILTER_ALPHA_STRONG = 0.75
+CORRECTION_FILTER_ALPHA = 0.35
+CORRECTION_FILTER_ALPHA_STRONG = 0.55
 
 KP_TURN_TAG_YAW_PPS_PER_DEG = 20
 MAX_TURN_TAG_YAW_CORRECTION_PPS = 150
@@ -1043,6 +1043,7 @@ class AGVQtApp(QMainWindow):
         self.expected_exit_helper_id = None
         self.segment_next_action = "UNKNOWN"
         self.corner_single_arrival_candidates = set()
+        self.skip_next_segment_lock = False
 
         self.filtered_correction = 0.0
 
@@ -1291,6 +1292,7 @@ class AGVQtApp(QMainWindow):
             expected_tag=self.expected_next_tag,
         )
 
+
     # -------------------------
     # Camera
     # -------------------------
@@ -1353,7 +1355,6 @@ class AGVQtApp(QMainWindow):
                 self.dock_tag_confirmed = True
                 self.waiting_for_manual_alignment = True
                 self.update_ui_state()
-
 
     # -------------------------
     # Serial
@@ -1509,6 +1510,11 @@ class AGVQtApp(QMainWindow):
         self.send_esp32("STOP")
 
     def lock_heading_go(self):
+        if getattr(self, "skip_next_segment_lock", False):
+            self.skip_next_segment_lock = False
+            self.last_drive_mode = "IMU"
+            self.append_log("Skipped LOCK_HEADING_GO after straight pass-through; keeping same IMU heading.")
+            return
         if self.last_drive_mode == "IMU":
             return
         self.filtered_correction = 0.0
@@ -1537,7 +1543,7 @@ class AGVQtApp(QMainWindow):
             kp_x = (KP_X_PPS_PER_M + KP_X_STRONG_PPS_PER_M) * 0.5
             max_corr = int((MAX_VISION_CORRECTION_PPS + MAX_VISION_CORRECTION_STRONG_PPS) * 0.5)
             base_pps = int((VISION_BASE_PPS + VISION_BASE_PPS_SLOW) * 0.5)
-            alpha = 0.60
+            alpha = 0.45
         else:
             kp_yaw = KP_YAW_PPS_PER_DEG
             kp_x = KP_X_PPS_PER_M
@@ -1755,6 +1761,7 @@ class AGVQtApp(QMainWindow):
             # The next control tick will continue with vision correction if a tag
             # is visible, otherwise ESP32 IMU heading hold remains active.
             self.current_heading = desired_heading
+            self.skip_next_segment_lock = True
             self.start_segment(self.current_tag, next_tag)
 
             if must_stop:
@@ -2093,11 +2100,12 @@ class AGVQtApp(QMainWindow):
                             f"reason={reason}. Correction only."
                         )
 
-                    tag = find_tag(detections, helper_id)
-                    if tag is not None:
-                        if self.helper_is_exit_side(helper_id):
-                            return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
-                        return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
+                    # Do not steer from rejected helper evidence.
+                    # In the 15->11 / 11->4 tests, rejected previous/exit helpers
+                    # created strong visual corrections in the wrong direction.
+                    # Safer behavior: keep IMU heading until a valid target-side
+                    # helper/central tag is seen.
+                    return None, None, ""
 
                 ready, center_y_error_px = self.local_helper_arrival_ready(
                     detections,
@@ -2146,11 +2154,9 @@ class AGVQtApp(QMainWindow):
                         f"reason={single_reason}; not reached."
                     )
 
-                tag = find_tag(detections, single_helper)
-                if tag is not None:
-                    if self.expected_exit_helper_id is not None and int(single_helper) == int(self.expected_exit_helper_id):
-                        return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
-                    return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
+                # Do not steer from ambiguous single helper evidence.
+                # Wait for a valid pair, valid corner->single sequence, or central tag.
+                return None, None, ""
 
             # Standalone fallback: helpers that are not valid target arrival remain
             # old-cluster correction until a clean loss happens.
