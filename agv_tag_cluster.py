@@ -49,10 +49,14 @@ TURN_DEG_BY_LANDMARK = {
 
 MAX_PPS = 10000
 
-# Normal live correction while moving
+# Normal travelling speed
 VISION_BASE_PPS = 3500
-VISION_MIN_PPS = 2000
-VISION_MAX_PPS = 5000
+
+# Slower speed when correction error is large
+VISION_BASE_PPS_SLOW = 2600
+
+VISION_MIN_PPS = 1600
+VISION_MAX_PPS = 5200
 
 # Turning landmark correction speed
 TURN_TAG_FB_PPS = 550
@@ -93,15 +97,16 @@ HELPER_GRID_OFFSET = {
 
 
 # =====================================================
-# CORRECTION PARAMETERS
+# GLOBAL ADAPTIVE CORRECTION PARAMETERS
 # =====================================================
 
-# Travelling correction: yaw + estimated landmark center x
+# Normal correction gains
 KP_YAW_PPS_PER_DEG = 18
 KP_X_PPS_PER_M = 16000
 
-# Turning landmark correction: yaw only + image center Y
-KP_TURN_TAG_YAW_PPS_PER_DEG = 20
+# Strong correction gains when error is large
+KP_YAW_STRONG_PPS_PER_DEG = 28
+KP_X_STRONG_PPS_PER_M = 32000
 
 # If xM correction moves away from zero during travel, change to +1.0
 X_SIGN = -1.0
@@ -109,16 +114,32 @@ X_SIGN = -1.0
 YAW_DEADBAND_DEG = 0.30
 X_DEADBAND_M = 0.0005
 
-MAX_VISION_CORRECTION_PPS = 200
-MAX_TURN_TAG_YAW_CORRECTION_PPS = 150
+# Error thresholds for automatic correction strength
+X_MEDIUM_ERROR_M = 0.008       # 8 mm
+X_LARGE_ERROR_M = 0.018        # 18 mm
 
+YAW_MEDIUM_ERROR_DEG = 3.0
+YAW_LARGE_ERROR_DEG = 7.0
+
+# Correction limits
+MAX_VISION_CORRECTION_PPS = 220
+MAX_VISION_CORRECTION_STRONG_PPS = 450
+
+# Smoothing
 CORRECTION_FILTER_ALPHA = 0.30
+CORRECTION_FILTER_ALPHA_STRONG = 0.50
+
 filtered_correction = 0.0
 
 
 # =====================================================
-# TURN LANDMARK FINAL CONDITIONS
+# TURN LANDMARK CORRECTION PARAMETERS
 # =====================================================
+
+# Turning landmark correction: yaw only + image center Y
+KP_TURN_TAG_YAW_PPS_PER_DEG = 20
+
+MAX_TURN_TAG_YAW_CORRECTION_PPS = 150
 
 TURN_TAG_YAW_OK_DEG = 3.0
 TURN_TAG_CENTER_Y_OK_PX = 25
@@ -447,12 +468,25 @@ def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
 
 
 # =====================================================
-# CORRECTION FUNCTIONS
+# ADAPTIVE TRAVELLING CORRECTION
 # =====================================================
 
 def reset_correction_filter():
     global filtered_correction
     filtered_correction = 0.0
+
+
+def adaptive_error_level(yaw_error, center_x_m):
+    abs_x = abs(center_x_m)
+    abs_yaw = abs(yaw_error)
+
+    if abs_x >= X_LARGE_ERROR_M or abs_yaw >= YAW_LARGE_ERROR_DEG:
+        return "LARGE"
+
+    if abs_x >= X_MEDIUM_ERROR_M or abs_yaw >= YAW_MEDIUM_ERROR_DEG:
+        return "MEDIUM"
+
+    return "SMALL"
 
 
 def travelling_correction_velocity_from_landmark(
@@ -461,6 +495,38 @@ def travelling_correction_velocity_from_landmark(
     center_x_m
 ):
     global filtered_correction
+
+    error_level = adaptive_error_level(
+        yaw_error,
+        center_x_m
+    )
+
+    if error_level == "LARGE":
+        kp_yaw = KP_YAW_STRONG_PPS_PER_DEG
+        kp_x = KP_X_STRONG_PPS_PER_M
+        max_corr = MAX_VISION_CORRECTION_STRONG_PPS
+        base_pps = VISION_BASE_PPS_SLOW
+        alpha = CORRECTION_FILTER_ALPHA_STRONG
+
+    elif error_level == "MEDIUM":
+        kp_yaw = (KP_YAW_PPS_PER_DEG + KP_YAW_STRONG_PPS_PER_DEG) * 0.5
+        kp_x = (KP_X_PPS_PER_M + KP_X_STRONG_PPS_PER_M) * 0.5
+        max_corr = int(
+            (MAX_VISION_CORRECTION_PPS + MAX_VISION_CORRECTION_STRONG_PPS)
+            * 0.5
+        )
+        base_pps = int(
+            (VISION_BASE_PPS + VISION_BASE_PPS_SLOW)
+            * 0.5
+        )
+        alpha = 0.40
+
+    else:
+        kp_yaw = KP_YAW_PPS_PER_DEG
+        kp_x = KP_X_PPS_PER_M
+        max_corr = MAX_VISION_CORRECTION_PPS
+        base_pps = VISION_BASE_PPS
+        alpha = CORRECTION_FILTER_ALPHA
 
     yaw_for_control = yaw_error
     x_for_control = center_x_m
@@ -471,9 +537,11 @@ def travelling_correction_velocity_from_landmark(
     if abs(x_for_control) < X_DEADBAND_M:
         x_for_control = 0.0
 
-    yaw_corr = KP_YAW_PPS_PER_DEG * yaw_for_control
-    x_corr = KP_X_PPS_PER_M * x_for_control * X_SIGN
+    yaw_corr = kp_yaw * yaw_for_control
+    x_corr = kp_x * x_for_control * X_SIGN
 
+    # If yaw and x correction fight, reduce yaw effect.
+    # Lateral x correction is more important for reaching the next landmark.
     if abs(x_for_control) > X_DEADBAND_M:
         if yaw_corr * x_corr < 0:
             yaw_corr *= 0.25
@@ -482,25 +550,29 @@ def travelling_correction_velocity_from_landmark(
 
     raw_correction = float(np.clip(
         raw_correction,
-        -MAX_VISION_CORRECTION_PPS,
-        MAX_VISION_CORRECTION_PPS
+        -max_corr,
+        max_corr
     ))
 
     filtered_correction = (
-        (1.0 - CORRECTION_FILTER_ALPHA) * filtered_correction
-        + CORRECTION_FILTER_ALPHA * raw_correction
+        (1.0 - alpha) * filtered_correction
+        + alpha * raw_correction
     )
 
     correction = int(filtered_correction)
 
-    left = VISION_BASE_PPS - correction
-    right = VISION_BASE_PPS + correction
+    left = base_pps - correction
+    right = base_pps + correction
 
     left = int(np.clip(left, VISION_MIN_PPS, VISION_MAX_PPS))
     right = int(np.clip(right, VISION_MIN_PPS, VISION_MAX_PPS))
 
-    return left, right, correction, yaw_corr, x_corr
+    return left, right, correction, yaw_corr, x_corr, error_level
 
+
+# =====================================================
+# TURN LANDMARK CORRECTION
+# =====================================================
 
 def turn_tag_heading_center_velocity_from_landmark(
     raw_yaw,
@@ -749,6 +821,11 @@ print("  helper tags 501-508 estimate the central landmark")
 print("  central tag is preferred if visible")
 print("  otherwise helper closest to image center is used")
 print("")
+print("Adaptive correction:")
+print("  small error  -> normal speed, normal correction")
+print("  medium error -> medium correction")
+print("  large error  -> slower speed, stronger correction")
+print("")
 print("Keys:")
 print("  s = start route")
 print("  c = correct current turn landmark")
@@ -815,7 +892,8 @@ try:
                         right,
                         correction,
                         yaw_corr,
-                        x_corr
+                        x_corr,
+                        error_level
                     ) = travelling_correction_velocity_from_landmark(
                         raw_yaw,
                         yaw_error,
@@ -834,6 +912,7 @@ try:
                         f"centerYerr={center_y_error_px:.1f}px "
                         f"yawCorr={yaw_corr:.1f} "
                         f"xCorr={x_corr:.1f} "
+                        f"level={error_level} "
                         f"corr={correction} "
                         f"L={left} "
                         f"R={right}"
@@ -1086,7 +1165,7 @@ try:
         )
 
         cv2.imshow(
-            "AGV Route 11-7-6-5-9 Cluster",
+            "AGV Route 11-7-6-5-9 Cluster Adaptive",
             frame
         )
 
