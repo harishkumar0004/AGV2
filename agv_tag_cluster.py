@@ -484,7 +484,7 @@ TARGET_HELPER_SEEN_FRAMES_REQUIRED = 1
 # No time-based arrival and no single-helper arrival.
 # A side-pair helper is accepted only when the estimated landmark center
 # is reasonably close to the camera center line.
-LOCAL_PAIR_CENTER_Y_OK_PX = 9999
+LOCAL_PAIR_CENTER_Y_OK_PX = 90
 LOCAL_SINGLE_CENTER_Y_OK_PX = 90
 # Minimum time after segment start before helpers are allowed to confirm target arrival.
 # Prevents immediately accepting old-cluster helpers at segment start.
@@ -1963,7 +1963,11 @@ class AGVQtApp(QMainWindow):
             ) = pose
 
         if evidence_type == "PAIR":
-            return True, center_y_error_px
+            if center_y_error_px is None:
+                return False, None
+            ready = abs(center_y_error_px) <= LOCAL_PAIR_CENTER_Y_OK_PX
+            return ready, center_y_error_px
+            
 
         if center_y_error_px is None:
             return False, None
