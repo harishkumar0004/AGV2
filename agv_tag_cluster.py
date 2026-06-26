@@ -1235,6 +1235,7 @@ class AGVQtApp(QMainWindow):
             expected_tag=self.expected_next_tag,
         )
 
+
     # -------------------------
     # Camera
     # -------------------------
@@ -1611,12 +1612,53 @@ class AGVQtApp(QMainWindow):
         self.append_log(f"Starting segment {from_tag} → {to_tag}")
         self.update_ui_state()
 
+    def arrival_requires_stop_or_turn(self, landmark_id):
+        """
+        Return True if this reached landmark must physically stop.
+
+        Stop is required for:
+          - docking/calibration completion
+          - final destination
+          - left/right/U-turn before the next segment
+
+        Stop is NOT required for a straight pass-through waypoint.
+        """
+        landmark_id = int(landmark_id)
+
+        if self.calibrating_move_to_tag1:
+            return True
+
+        if not self.mission_running:
+            return True
+
+        if not (self.path_index < len(self.active_path) and landmark_id == self.active_path[self.path_index]):
+            return True
+
+        next_index = self.path_index + 1
+
+        if next_index >= len(self.active_path):
+            return True
+
+        next_tag = self.active_path[next_index]
+        desired_heading = heading_between_tags(landmark_id, next_tag)
+        turn_deg = turn_delta_deg(self.current_heading, desired_heading)
+
+        return abs(turn_deg) > 1.0
+
     def handle_landmark_arrival(self, landmark_id):
-        self.stop_robot()
+        landmark_id = int(landmark_id)
+
+        must_stop = self.arrival_requires_stop_or_turn(landmark_id)
+
+        if must_stop:
+            self.stop_robot()
+
         self.reset_correction_filter()
 
-        landmark_id = int(landmark_id)
-        self.append_log(f"Reached landmark Tag {landmark_id}")
+        if must_stop:
+            self.append_log(f"Reached landmark Tag {landmark_id}")
+        else:
+            self.append_log(f"Pass-through landmark Tag {landmark_id}; continuing without STOP")
 
         if self.calibrating_move_to_tag1 and landmark_id == GRID_START_TAG:
             self.finish_calibration_at_tag1()
@@ -1643,6 +1685,7 @@ class AGVQtApp(QMainWindow):
         self.update_ui_state()
 
         if abs(turn_deg) > 1.0:
+            # Turn waypoint: stop already sent above, then rotate.
             self.route_state = "TURNING"
             self.turning_waiting = True
             self.pending_after_turn_segment = True
@@ -1651,27 +1694,42 @@ class AGVQtApp(QMainWindow):
             self.send_esp32(f"TURN_REL {turn_deg:.1f}")
             self.current_heading = desired_heading
         else:
+            # Straight pass-through: do not stop and do not re-lock heading here.
+            # The next control tick will continue with vision correction if a tag
+            # is visible, otherwise ESP32 IMU heading hold remains active.
             self.current_heading = desired_heading
             self.start_segment(self.current_tag, next_tag)
-            self.lock_heading_go()
+
+            if must_stop:
+                # This path is mostly for non-mission/manual cases. For normal
+                # straight pass-through, must_stop is False and no pause is created.
+                self.lock_heading_go()
 
     def start_local_arrival(self, landmark_id, helper_id):
         """
-        Local helper arrival is a pure stop/update event.
+        Local helper arrival updates the mission state.
 
-        No time-based nudge.
-        No frame-based helper wait.
+        It does NOT blindly send STOP anymore.
+        STOP is sent only if this landmark is a turn point, final target, or
+        calibration target. Straight pass-through waypoints continue smoothly.
         """
         self.remember_local_arrival_helper(helper_id)
-        self.stop_robot()
         self.local_arrival_landmark = int(landmark_id)
         self.local_arrival_helper_id = int(helper_id)
         self.local_arrival_good_count = 0
         self.local_arrival_start_time = time.time()
-        self.append_log(
-            f"Local helper accepted as reached: target={landmark_id} helper={helper_id}. "
-            "STOP now; no nudge/frame wait."
-        )
+
+        if self.arrival_requires_stop_or_turn(landmark_id):
+            self.append_log(
+                f"Local helper accepted as reached: target={landmark_id} helper={helper_id}. "
+                "STOP/turn handling required."
+            )
+        else:
+            self.append_log(
+                f"Local helper accepted as pass-through: target={landmark_id} helper={helper_id}. "
+                "No STOP."
+            )
+
         self.handle_landmark_arrival(landmark_id)
 
     def local_helper_arrival_ready(self, detections, helper_id, evidence_type):
