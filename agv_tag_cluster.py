@@ -249,6 +249,10 @@ LOCAL_NUDGE_CENTER_Y_OK_PX = 30
 LOCAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
 LOCAL_NUDGE_TIMEOUT_SEC = 5.0
 
+# Accept local helper tags as arrival evidence; central tag is not required.
+LOCAL_HELPER_SEEN_FRAMES_REQUIRED = 1
+
+
 KP_YAW_PPS_PER_DEG = 18
 KP_X_PPS_PER_M = 16000
 
@@ -426,6 +430,39 @@ def detect_side_pair(detections, target_landmark):
     for center_helper, corners in groups:
         if center_helper in ids and len(ids.intersection(corners)) > 0:
             return center_helper
+
+    return None
+
+
+
+def detect_local_arrival_helper(detections, target_landmark):
+    """
+    Restored cluster behavior for local landmark arrival.
+
+    The robot should not require the central landmark tag to stop/update.
+    If the target central tag is not visible, accept helper evidence:
+      1) side-center + adjacent corner pair, preferred
+      2) a single cross helper 501/503/505/507
+      3) any helper if nothing else is available
+
+    This lets the robot stop/nudge/update when it sees local cluster tags.
+    """
+    if find_tag(detections, target_landmark) is not None:
+        return None
+
+    pair_helper = detect_side_pair(detections, target_landmark)
+    if pair_helper is not None:
+        return pair_helper
+
+    ids = visible_ids(detections)
+
+    for helper_id in [501, 503, 505, 507]:
+        if helper_id in ids:
+            return helper_id
+
+    for helper_id in [502, 504, 506, 508]:
+        if helper_id in ids:
+            return helper_id
 
     return None
 
@@ -661,7 +698,7 @@ class TagGridWidget(QWidget):
         self.goal_tag = None
         self.path = []
         self.expected_tag = None
-        self.setMinimumSize(460, 255)
+        self.setMinimumSize(420, 210)
 
     def set_state(self, current_tag=None, goal_tag=None, path=None, expected_tag=None):
         self.current_tag = current_tag
@@ -763,7 +800,7 @@ class AGVQtApp(QMainWindow):
         screen = QApplication.primaryScreen()
         if screen is not None:
             geo = screen.availableGeometry()
-            self.resize(int(geo.width() * 0.96), int(geo.height() * 0.92))
+            self.resize(int(geo.width() * 0.98), int(geo.height() * 0.96))
         else:
             self.resize(1024, 700)
 
@@ -838,8 +875,8 @@ class AGVQtApp(QMainWindow):
 
         left = QVBoxLayout()
         right = QVBoxLayout()
-        main.addLayout(left, 3)
-        main.addLayout(right, 2)
+        main.addLayout(left, 4)
+        main.addLayout(right, 1)
 
         grid_group = QGroupBox("5 x 3 Tag Grid")
         grid_layout = QVBoxLayout(grid_group)
@@ -852,7 +889,7 @@ class AGVQtApp(QMainWindow):
         camera_layout = QVBoxLayout(camera_group)
         self.camera_label = QLabel("Camera not started")
         self.camera_label.setAlignment(Qt.AlignCenter)
-        self.camera_label.setMinimumSize(460, 255)
+        self.camera_label.setMinimumSize(520, 390)
         self.camera_label.setStyleSheet("background:#111;color:white;border:1px solid #555;")
         self.camera_status = QLabel("Camera status: idle")
         self.camera_status.setStyleSheet("font-weight:bold;")
@@ -901,9 +938,6 @@ class AGVQtApp(QMainWindow):
         self.connect_btn = QPushButton("Connect ESP32")
         self.connect_btn.clicked.connect(self.connect_esp32)
 
-        self.status_btn = QPushButton("ESP32 Status")
-        self.status_btn.clicked.connect(lambda: self.send_esp32("STATUS"))
-
         self.start_btn = QPushButton("Start Mission")
         self.start_btn.clicked.connect(self.start_mission)
 
@@ -924,9 +958,8 @@ class AGVQtApp(QMainWindow):
         mission.addWidget(self.route_state_edit, 5, 1, 1, 2)
         mission.addWidget(self.simulation_checkbox, 6, 0)
         mission.addWidget(self.connect_btn, 7, 0)
-        mission.addWidget(self.status_btn, 7, 1)
-        mission.addWidget(self.start_btn, 8, 0)
-        mission.addWidget(self.stop_btn, 8, 1)
+        mission.addWidget(self.start_btn, 7, 1)
+        mission.addWidget(self.stop_btn, 8, 0, 1, 2)
         right.addWidget(mission_group)
 
         tuning_group = QGroupBox("PPS / ESP32 Tuning")
@@ -967,7 +1000,9 @@ class AGVQtApp(QMainWindow):
         tuning.addWidget(QLabel("DECEL"), 4, 0)
         tuning.addWidget(self.decel_spin, 4, 1)
         tuning.addWidget(self.apply_tuning_btn, 5, 0, 1, 2)
-        right.addWidget(tuning_group)
+        # Tuning widgets are kept for defaults, but the panel is hidden to save RPi4 screen space.
+        # Use apply_esp32_tuning() to send these defaults before calibration/mission.
+        tuning_group.setVisible(False)
 
         dest_group = QGroupBox("Destination / A-Star Path")
         dest = QVBoxLayout(dest_group)
@@ -980,7 +1015,7 @@ class AGVQtApp(QMainWindow):
 
         self.path_text = QTextEdit()
         self.path_text.setReadOnly(True)
-        self.path_text.setMinimumHeight(70)
+        self.path_text.setMinimumHeight(45)
 
         dest.addWidget(QLabel("Select destination:"))
         dest.addWidget(self.destination_combo)
@@ -992,7 +1027,7 @@ class AGVQtApp(QMainWindow):
         log_layout = QVBoxLayout(log_group)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(110)
+        self.log.setMinimumHeight(220)
         log_layout.addWidget(self.log)
         right.addWidget(log_group, 1)
 
@@ -1391,8 +1426,12 @@ class AGVQtApp(QMainWindow):
             return None, None, ""
 
         if self.segment_phase == "SEARCH_TARGET":
-            helper_id = detect_side_pair(detections, self.travel_to_landmark)
+            helper_id = detect_local_arrival_helper(detections, self.travel_to_landmark)
             if helper_id is not None:
+                self.append_log(
+                    f"Local helper Tag {helper_id} seen for target {self.travel_to_landmark}. "
+                    "Central tag is not required."
+                )
                 self.start_local_arrival(self.travel_to_landmark, helper_id)
                 return None, None, ""
 
@@ -1478,7 +1517,7 @@ class AGVQtApp(QMainWindow):
                 self.send_velocity(left, right)
 
                 # Log at lower rate only.
-                if time.time() - getattr(self, "_last_corr_log", 0.0) > 0.35:
+                if time.time() - getattr(self, "_last_corr_log", 0.0) > 0.70:
                     self._last_corr_log = time.time()
                     self.append_log(
                         f"{label} CORR seg={self.travel_from_landmark}->{self.travel_to_landmark} "
@@ -1512,6 +1551,12 @@ class AGVQtApp(QMainWindow):
         if abs(visible_y_error_px) <= LOCAL_NUDGE_CENTER_Y_OK_PX:
             self.local_arrival_good_count += 1
             self.stop_robot()
+
+            self.append_log(
+                f"LOCAL_ARRIVAL_GOOD target={self.local_arrival_landmark} "
+                f"helper={seen_tag_id} yErr={visible_y_error_px:.1f}px "
+                f"good={self.local_arrival_good_count}/{LOCAL_NUDGE_GOOD_FRAMES_REQUIRED}"
+            )
 
             if self.local_arrival_good_count >= LOCAL_NUDGE_GOOD_FRAMES_REQUIRED:
                 self.handle_landmark_arrival(self.local_arrival_landmark)
