@@ -529,17 +529,8 @@ KP_X_PPS_PER_M = 24000
 KP_YAW_STRONG_PPS_PER_DEG = 42
 KP_X_STRONG_PPS_PER_M = 85000
 
-X_SIGN = -1.0
-
 # Direction-specific X correction sign.
-#
-# Do not change the entry table for this.
-# The table decides which helper is valid.
-# This only decides which wheel direction is used for lateral X correction.
-#
-# Current finding:
-#   EAST travel correction is physically opposite, so flip EAST only.
-# Keep NORTH/SOUTH/WEST same as the previous stable build.
+# This is the only X-sign source used by travel correction.
 X_SIGN_BY_HEADING = {
     NORTH: -1.0,
     EAST: 1.0,
@@ -1502,7 +1493,6 @@ class AGVQtApp(QMainWindow):
                 self.update_ui_state()
 
 
-
     # -------------------------
     # Serial
     # -------------------------
@@ -1719,7 +1709,7 @@ class AGVQtApp(QMainWindow):
             x_for_control = 0.0
 
         yaw_corr = kp_yaw * yaw_for_control
-        direction_x_sign = X_SIGN_BY_HEADING.get(getattr(self, "segment_heading", None), X_SIGN)
+        direction_x_sign = X_SIGN_BY_HEADING.get(getattr(self, "segment_heading", None), -1.0)
         x_corr = kp_x * x_for_control * direction_x_sign
 
         if abs(x_for_control) > X_DEADBAND_M:
@@ -2756,7 +2746,7 @@ class AGVQtApp(QMainWindow):
                         f"{label} CORR seg={self.travel_from_landmark}->{self.travel_to_landmark} "
                         f"phase={self.segment_phase} seen={seen_tag_id} grid=({helper_x_grid},{helper_y_grid}) "
                         f"yawErr={yaw_error:.2f} centerXM={center_x_m:.4f} level={error_level} "
-                        f"xSign={X_SIGN_BY_HEADING.get(getattr(self, 'segment_heading', None), X_SIGN):.1f} "
+                        f"xSign={X_SIGN_BY_HEADING.get(getattr(self, 'segment_heading', None), -1.0):.1f} "
                         f"corr={correction} L={left} R={right}"
                     )
         elif self.route_state == "MOVE":
@@ -2994,7 +2984,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: east_mirrors_west_entry_center active")
+        self.append_log("BUILD: east_mirrors_west_single_xsign_map active")
 
         self.active_path = list(self.path)
         self.path_index = 1
