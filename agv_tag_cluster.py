@@ -883,6 +883,14 @@ class AGVQtApp(QMainWindow):
         self.local_arrival_good_count = 0
         self.local_arrival_start_time = 0.0
 
+        # Helpers visible at the instant a new segment starts are treated as
+        # previous-landmark local tags. They must disappear once before the same
+        # helper ID can be accepted as the next target. This prevents:
+        #   1 -> 2 reached by helper 503
+        #   immediately starting 2 -> 3
+        #   same visible 503 falsely becoming Tag 3.
+        self.previous_helper_block_ids = set()
+
         self.filtered_correction = 0.0
 
         self.turning_waiting = False
@@ -1193,6 +1201,7 @@ class AGVQtApp(QMainWindow):
                 self.waiting_for_manual_alignment = True
                 self.update_ui_state()
 
+
     # -------------------------
     # Serial
     # -------------------------
@@ -1452,6 +1461,19 @@ class AGVQtApp(QMainWindow):
         self.cluster_lost_count = 0
         self.target_helper_seen_count = 0
         self.target_central_seen_count = 0
+
+        # Previous-local vs arrived-local protection:
+        # Any helper IDs visible at the exact start of the new segment belong to
+        # the previous landmark. Do not accept those IDs as arrival for the next
+        # landmark until they disappear once.
+        self.previous_helper_block_ids = visible_ids(self.latest_detections).intersection(HELPER_IDS)
+
+        if self.previous_helper_block_ids:
+            self.append_log(
+                "Blocking previous local helpers at segment start: "
+                + ", ".join(str(x) for x in sorted(self.previous_helper_block_ids))
+            )
+
         self.reset_correction_filter()
         self.route_state = "MOVE"
         self.expected_next_tag = int(to_tag)
@@ -1560,6 +1582,34 @@ class AGVQtApp(QMainWindow):
         ready = abs(center_y_error_px) <= LOCAL_SINGLE_CENTER_Y_OK_PX
         return ready, center_y_error_px
 
+    def update_previous_helper_blocks(self, detections):
+        """
+        Remove a helper ID from previous_helper_block_ids only after that ID
+        disappears from the camera view.
+
+        This is not time-based and not frame-count based. It is a visibility
+        transition rule: previous local tag -> disappeared -> can be considered
+        new/arrived local tag later.
+        """
+        if not self.previous_helper_block_ids:
+            return
+
+        ids = visible_ids(detections)
+        still_visible = self.previous_helper_block_ids.intersection(ids)
+        cleared = self.previous_helper_block_ids.difference(still_visible)
+
+        if cleared:
+            self.append_log(
+                "Previous helper cleared after disappearing: "
+                + ", ".join(str(x) for x in sorted(cleared))
+            )
+
+        self.previous_helper_block_ids = still_visible
+
+    def helper_is_previous_blocked(self, helper_id):
+        return int(helper_id) in self.previous_helper_block_ids
+
+
     def choose_move_correction(self, detections):
         """
         Improved previous-local vs arrived-local logic.
@@ -1590,6 +1640,8 @@ class AGVQtApp(QMainWindow):
           - pair centerY gate
           - single-helper early arrival
         """
+        self.update_previous_helper_blocks(detections)
+
         central_target = find_tag(detections, self.travel_to_landmark)
 
         if central_target is not None:
@@ -1643,6 +1695,18 @@ class AGVQtApp(QMainWindow):
             )
 
             if helper_id is not None and evidence_type == "PAIR":
+                if self.helper_is_previous_blocked(helper_id):
+                    if time.time() - getattr(self, "_last_prev_block_log", 0.0) > 0.80:
+                        self._last_prev_block_log = time.time()
+                        self.append_log(
+                            f"PREVIOUS HELPER BLOCKED: helper={helper_id} still belongs to Tag {self.travel_from_landmark}; "
+                            f"not accepting as target {self.travel_to_landmark} yet."
+                        )
+
+                    tag = find_tag(detections, helper_id)
+                    if tag is not None:
+                        return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
+
                 ready, center_y_error_px = self.local_helper_arrival_ready(
                     detections,
                     helper_id,
@@ -1663,10 +1727,16 @@ class AGVQtApp(QMainWindow):
             if single_helper is not None:
                 if time.time() - getattr(self, "_last_single_log", 0.0) > 0.90:
                     self._last_single_log = time.time()
-                    self.append_log(
-                        f"SINGLE HELPER CORRECTION ONLY: target={self.travel_to_landmark} "
-                        f"helper={single_helper} phase=START_CLUSTER; not reached."
-                    )
+                    if self.helper_is_previous_blocked(single_helper):
+                        self.append_log(
+                            f"SINGLE HELPER STILL PREVIOUS: helper={single_helper} belongs to Tag {self.travel_from_landmark}; "
+                            f"correction only, not target {self.travel_to_landmark}."
+                        )
+                    else:
+                        self.append_log(
+                            f"SINGLE HELPER CORRECTION ONLY: target={self.travel_to_landmark} "
+                            f"helper={single_helper} phase=START_CLUSTER; not reached."
+                        )
 
                 tag = find_tag(detections, single_helper)
                 if tag is not None:
@@ -1704,6 +1774,18 @@ class AGVQtApp(QMainWindow):
             )
 
             if helper_id is not None:
+                if self.helper_is_previous_blocked(helper_id):
+                    if time.time() - getattr(self, "_last_prev_block_log", 0.0) > 0.80:
+                        self._last_prev_block_log = time.time()
+                        self.append_log(
+                            f"SEARCH helper {helper_id} is still previous-local from Tag {self.travel_from_landmark}; "
+                            f"not accepting as target {self.travel_to_landmark} until it disappears once."
+                        )
+
+                    tag = find_tag(detections, helper_id)
+                    if tag is not None:
+                        return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
+
                 ready, center_y_error_px = self.local_helper_arrival_ready(
                     detections,
                     helper_id,
@@ -1895,6 +1977,7 @@ class AGVQtApp(QMainWindow):
         self.current_heading = SOUTH
         self.mission_running = False
         self.route_state = "IDLE"
+        self.previous_helper_block_ids = set()
 
         self.append_log("Calibration reset")
         self.update_ui_state()
@@ -2054,6 +2137,7 @@ class AGVQtApp(QMainWindow):
         self.mission_running = False
         self.expected_next_tag = None
         self.route_state = "IDLE"
+        self.previous_helper_block_ids = set()
         self.stop_robot()
         self.append_log("Mission stopped")
         self.update_ui_state()
