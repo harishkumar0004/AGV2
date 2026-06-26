@@ -497,6 +497,14 @@ LOCAL_NUDGE_TIMEOUT_SEC = 5.0
 # Accept local helper tags as arrival evidence; central tag is not required.
 LOCAL_HELPER_SEEN_FRAMES_REQUIRED = 1
 
+# Exact-table helper arrival rule.
+# Do not accept arbitrary helpers.
+# Accept only:
+#   1) direct CENTRAL helper from ENTRY_SEQUENCE_BY_HEADING, or
+#   2) expected helper created by the previous entry helper.
+# Example EAST: 508 -> 501, so 501 can confirm Tag 12 after 508.
+ACCEPT_EXPECTED_HELPER_AS_REACHED = True
+
 
 # Stronger correction tuning.
 # Previous logs showed repeated LARGE corrections saturating at about ±500 pps
@@ -2275,6 +2283,20 @@ class AGVQtApp(QMainWindow):
 
         return False
 
+    def helper_can_confirm_reached_now(self, helper_id):
+        helper_id = int(helper_id)
+
+        if not ACCEPT_EXPECTED_HELPER_AS_REACHED:
+            return False
+
+        # Direct center helper in the user's table.
+        if self.helper_expects_central_now(helper_id):
+            return True
+
+        # Expected helper produced by an entry helper in the user's table.
+        # Example EAST: 508 produced candidate 501.
+        return helper_id in set(getattr(self, "corner_single_arrival_candidates", set()))
+
     def remember_local_arrival_helper(self, helper_id):
         self.last_arrival_helper_id = int(helper_id)
         self.last_arrival_heading = self.segment_heading
@@ -2407,6 +2429,17 @@ class AGVQtApp(QMainWindow):
                     )
                     return None, None, ""
 
+                if ready and self.helper_can_confirm_reached_now(helper_id):
+                    self.append_log(
+                        f"EXPECTED HELPER REACHED: target={self.travel_to_landmark} "
+                        f"helper={helper_id} group={helper_group_name(helper_id)} "
+                        f"seq={self.helper_sequence_note(helper_id)} "
+                        f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px. "
+                        "Applying landmark reached/pass-through."
+                    )
+                    self.start_local_arrival(self.travel_to_landmark, helper_id)
+                    return None, None, ""
+
                 self.append_log(
                     f"HELPER PAIR CORRECTION ONLY: target={self.travel_to_landmark} "
                     f"helper={helper_id} group={helper_group_name(helper_id)} "
@@ -2432,6 +2465,17 @@ class AGVQtApp(QMainWindow):
                         single_helper,
                         "SINGLE"
                     )
+
+                    if ready and self.helper_can_confirm_reached_now(single_helper):
+                        self.append_log(
+                            f"EXPECTED SINGLE HELPER REACHED: target={self.travel_to_landmark} "
+                            f"helper={single_helper} reason={single_reason} "
+                            f"seq={self.helper_sequence_note(single_helper)} "
+                            f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px. "
+                            "Applying landmark reached/pass-through."
+                        )
+                        self.start_local_arrival(self.travel_to_landmark, single_helper)
+                        return None, None, ""
 
                     self.append_log(
                         f"SINGLE HELPER CORRECTION ONLY AFTER CORNER: target={self.travel_to_landmark} "
@@ -2551,6 +2595,17 @@ class AGVQtApp(QMainWindow):
                             f"seq={self.helper_sequence_note(helper_id)} "
                             f"candidates={sorted(self.corner_single_arrival_candidates)}. IMU hold."
                         )
+                        return None, None, ""
+
+                    if self.helper_can_confirm_reached_now(helper_id):
+                        self.append_log(
+                            f"SEARCH EXPECTED HELPER REACHED: target={self.travel_to_landmark} "
+                            f"helper={helper_id} evidence={evidence_type} "
+                            f"seq={self.helper_sequence_note(helper_id)} "
+                            f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px. "
+                            "Applying landmark reached/pass-through."
+                        )
+                        self.start_local_arrival(self.travel_to_landmark, helper_id)
                         return None, None, ""
 
                     tag = find_tag(detections, helper_id)
@@ -2883,7 +2938,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: exact_table_north_xsign_flip active")
+        self.append_log("BUILD: exact_table_expected_helper_reached active")
 
         self.active_path = list(self.path)
         self.path_index = 1
