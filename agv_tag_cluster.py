@@ -71,12 +71,12 @@ LOCAL_NUDGE_TIMEOUT_SEC = 5.0
 # DRIVE PARAMETERS
 # =====================================================
 
-MAX_PPS = 10000
+MAX_PPS = 12000
 
 VISION_BASE_PPS = 6500 #3500
-VISION_BASE_PPS_SLOW = 3500 #2600
-VISION_MIN_PPS = 2500 #1600
-VISION_MAX_PPS = 6500 #5200
+VISION_BASE_PPS_SLOW = 5000 #2600
+VISION_MIN_PPS = 3000 #1600
+VISION_MAX_PPS = 7500 #5200
 
 # If manual correction or local nudge moves wrong direction, flip this to -1
 FB_SIGN = 1
