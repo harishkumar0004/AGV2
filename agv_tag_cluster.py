@@ -257,9 +257,7 @@ TARGET_CENTRAL_SEEN_FRAMES_REQUIRED = 2
 TARGET_HELPER_SEEN_FRAMES_REQUIRED = 1
 # Minimum time after segment start before helpers are allowed to confirm target arrival.
 # Prevents immediately accepting old-cluster helpers at segment start.
-TARGET_HELPER_MIN_TRAVEL_SEC = 0.55
 # Previous central tag should be absent briefly before accepting helper-only target arrival.
-OLD_CENTRAL_LOST_FOR_HELPER_FRAMES = 2
 
 LOCAL_NUDGE_CENTER_Y_OK_PX = 30
 LOCAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
@@ -453,19 +451,23 @@ def detect_side_pair(detections, target_landmark):
 
 def detect_local_arrival_helper(detections, target_landmark):
     """
-    Working cluster arrival logic restored for Qt.
+    Qt version of the standalone local-arrival check.
 
-    Called only after the old cluster has disappeared and helpers are allowed
-    to belong to the target landmark.
+    IMPORTANT:
+    This function must be called ONLY after the old cluster has completely
+    disappeared and segment_phase == SEARCH_TARGET.
 
-    Priority:
-      1) target central tag -> handled elsewhere, not here
-      2) side-center + adjacent corner pair
-      3) single important cross helper: 501, 503, 505, 507
-      4) any corner helper as weaker evidence
+    Reason:
+    Helper IDs 501-508 are reused around every landmark. If we use them while
+    still in START_CLUSTER, the robot can mistake Tag 0's helper 505 as Tag 1.
+    That is exactly the false stop seen during docking -> Tag 1.
 
-    This fixes the major issue where the robot passes Tag 1/turning tags when
-    central tag is not visible but local helper tags are visible.
+    Logic:
+      1) central target is handled before this function.
+      2) side-center + adjacent corner pair is accepted.
+      3) because 501, 503, 505, 507 are important, a single cross helper is
+         accepted after full old-cluster loss.
+      4) corner-only helpers are not accepted alone.
     """
     ids = visible_ids(detections)
 
@@ -483,13 +485,9 @@ def detect_local_arrival_helper(detections, target_landmark):
         if center_helper in ids and len(ids.intersection(corners)) > 0:
             return center_helper
 
-    # User-validated important local tags.
+    # User-marked important cross helpers.
+    # Accepted only in SEARCH_TARGET after full old cluster loss.
     for helper_id in [501, 503, 505, 507]:
-        if helper_id in ids:
-            return helper_id
-
-    # Last fallback: corner helper.
-    for helper_id in [502, 504, 506, 508]:
         if helper_id in ids:
             return helper_id
 
@@ -1077,7 +1075,7 @@ class AGVQtApp(QMainWindow):
         self.heading_edit.setText(HEADING_LABELS.get(self.current_heading, "---"))
         self.expected_next_edit.setText(str(self.expected_next_tag) if self.expected_next_tag is not None else "---")
         self.path_edit.setText(" → ".join(str(x) for x in self.path) if self.path else "---")
-        self.route_state_edit.setText(f"{self.route_state} / {self.segment_phase} / lost={self.cluster_lost_count} oldC={self.old_central_lost_count} h={self.target_helper_seen_count}")
+        self.route_state_edit.setText(f"{self.route_state} / {self.segment_phase} / lost={self.cluster_lost_count} h={self.target_helper_seen_count}")
 
         if self.calibration_done:
             self.calib_state.setText("DONE - GRID START TAG 1")
@@ -1118,7 +1116,7 @@ class AGVQtApp(QMainWindow):
         # Add state overlay.
         cv2.putText(
             frame_bgr,
-            f"State:{self.route_state} Seg:{self.travel_from_landmark}->{self.travel_to_landmark} phase:{self.segment_phase} lost:{self.cluster_lost_count} oldC:{self.old_central_lost_count}",
+            f"State:{self.route_state} Seg:{self.travel_from_landmark}->{self.travel_to_landmark} phase:{self.segment_phase} lost:{self.cluster_lost_count}",
             (25, 35),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1268,7 +1266,6 @@ class AGVQtApp(QMainWindow):
 
         return found
 
-
     def apply_esp32_tuning(self):
         """
         Send fixed ESP32 tuning values.
@@ -1416,10 +1413,8 @@ class AGVQtApp(QMainWindow):
         self.travel_to_landmark = int(to_tag)
         self.segment_phase = "START_CLUSTER"
         self.cluster_lost_count = 0
-        self.old_central_lost_count = 0
         self.target_helper_seen_count = 0
         self.target_central_seen_count = 0
-        self.segment_start_time = time.time()
         self.reset_correction_filter()
         self.route_state = "MOVE"
         self.expected_next_tag = int(to_tag)
@@ -1479,83 +1474,17 @@ class AGVQtApp(QMainWindow):
         self.route_state = "LOCAL_ARRIVAL"
         self.append_log(f"Local arrival at Tag {landmark_id}, helper {helper_id} accepted. Central tag not required.")
 
-    def target_requires_stop(self):
-        """
-        In the Qt A* mission, every selected node in active_path is a waypoint.
-        The robot must respect local target cluster tags at each waypoint, not
-        only the central tag. This is especially important for turning nodes.
-        """
-        return True
-
-    def target_local_helper_candidate(self, detections):
-        """
-        Strong local helper detection.
-
-        This is based on the last working standalone cluster code, but adapted
-        for dynamic A* paths. The key difference is that we do not wait forever
-        for all helpers to disappear, because helper IDs 501-508 are reused in
-        every cluster. If the old central tag is gone and we have travelled for
-        a short time, local helpers are accepted as target evidence.
-
-        Priority:
-          1) side-center + adjacent corner pair
-          2) important cross helpers: 501, 503, 505, 507
-          3) corner helpers: 502, 504, 506, 508
-        """
-        if find_tag(detections, self.travel_to_landmark) is not None:
-            return None
-
-        pair_helper = detect_side_pair(detections, self.travel_to_landmark)
-        if pair_helper is not None:
-            return pair_helper
-
-        ids = visible_ids(detections)
-
-        for helper_id in [501, 503, 505, 507]:
-            if helper_id in ids:
-                return helper_id
-
-        for helper_id in [502, 504, 506, 508]:
-            if helper_id in ids:
-                return helper_id
-
-        return None
-
-    def helper_arrival_allowed_now(self, detections):
-        """
-        Decide whether helper-only target arrival is allowed now.
-
-        The old standalone script waited for complete old cluster loss. In Qt/A*
-        this can fail because helpers are reused and may never give a clean gap.
-        This condition uses the old central tag loss + minimum travel time.
-        """
-        old_central_visible = find_tag(detections, self.travel_from_landmark) is not None
-
-        if old_central_visible:
-            self.old_central_lost_count = 0
-        else:
-            self.old_central_lost_count += 1
-
-        travelled_long_enough = (time.time() - self.segment_start_time) >= TARGET_HELPER_MIN_TRAVEL_SEC
-        old_central_gone = self.old_central_lost_count >= OLD_CENTRAL_LOST_FOR_HELPER_FRAMES
-
-        return travelled_long_enough and old_central_gone
-
-
     def choose_move_correction(self, detections):
         """
-        Restored cluster behavior with robust local-helper target arrival.
+        Standalone cluster program logic, adapted to Qt/A*.
 
-        The earlier Qt mismatch was here:
-          START_CLUSTER kept treating every helper as the OLD landmark.
-          Since helper IDs are reused, the robot sometimes never entered
-          SEARCH_TARGET and ignored target local tags.
+        This intentionally does NOT use local helper tags while in START_CLUSTER.
+        In START_CLUSTER, helpers 501-508 are considered part of the OLD landmark.
+        Only after the old cluster has fully disappeared for
+        CLUSTER_LOST_FRAMES_REQUIRED frames do helpers belong to the target.
 
-        Now:
-          central target still wins;
-          after old central is gone briefly and minimum travel time has passed,
-          helper tags 501/503/505/507, side-pairs, or corners can trigger
-          LOCAL_ARRIVAL for the target even if central target is not visible.
+        This prevents false arrival during docking Tag 0 -> Tag 1 when Tag 0's
+        helper 505 is visible.
         """
         central_target = find_tag(detections, self.travel_to_landmark)
 
@@ -1571,34 +1500,10 @@ class AGVQtApp(QMainWindow):
 
         self.target_central_seen_count = 0
 
-        # Robust local-helper arrival path.
-        helper_id = self.target_local_helper_candidate(detections)
-
-        if helper_id is not None and self.helper_arrival_allowed_now(detections):
-            self.target_helper_seen_count += 1
-
-            self.append_log(
-                f"TARGET LOCAL HELPER SEEN: target={self.travel_to_landmark} "
-                f"helper={helper_id} count={self.target_helper_seen_count}/{TARGET_HELPER_SEEN_FRAMES_REQUIRED} "
-                f"oldCentralLost={self.old_central_lost_count}"
-            )
-
-            if self.target_helper_seen_count >= TARGET_HELPER_SEEN_FRAMES_REQUIRED:
-                self.append_log(
-                    f"LOCAL HELPER ACCEPTED: target={self.travel_to_landmark} "
-                    f"helper={helper_id}. Central tag not required."
-                )
-
-                self.start_local_arrival(
-                    self.travel_to_landmark,
-                    helper_id
-                )
-
-                return None, None, ""
-        else:
-            self.target_helper_seen_count = 0
-
         if self.segment_phase == "START_CLUSTER":
+            # EXACT standalone behavior:
+            # If current/old central OR any helper is visible, it still belongs
+            # to the old landmark. Keep correcting using old landmark.
             if any_cluster_visible_now(detections, self.travel_from_landmark):
                 self.cluster_lost_count = 0
 
@@ -1621,25 +1526,30 @@ class AGVQtApp(QMainWindow):
             return None, None, ""
 
         if self.segment_phase == "SEARCH_TARGET":
-            # Same as standalone cluster code: once searching target, helpers
-            # are directly eligible for local arrival.
+            # Now, and only now, local helpers are respected as target arrival.
             helper_id = detect_local_arrival_helper(
                 detections,
                 self.travel_to_landmark
             )
 
             if helper_id is not None:
+                self.target_helper_seen_count += 1
+
                 self.append_log(
-                    f"SEARCH_TARGET LOCAL HELPER: target={self.travel_to_landmark} "
-                    f"helper={helper_id}. Central tag not required."
+                    f"SEARCH_TARGET helper target={self.travel_to_landmark} "
+                    f"helper={helper_id} count={self.target_helper_seen_count}/{TARGET_HELPER_SEEN_FRAMES_REQUIRED}. "
+                    "Central tag not required."
                 )
 
-                self.start_local_arrival(
-                    self.travel_to_landmark,
-                    helper_id
-                )
+                if self.target_helper_seen_count >= TARGET_HELPER_SEEN_FRAMES_REQUIRED:
+                    self.start_local_arrival(
+                        self.travel_to_landmark,
+                        helper_id
+                    )
+                    return None, None, ""
 
-                return None, None, ""
+            else:
+                self.target_helper_seen_count = 0
 
             tag = choose_best_cluster_tag(
                 detections,
@@ -1862,7 +1772,7 @@ class AGVQtApp(QMainWindow):
         self.current_tag = DOCK_TAG
         self.current_heading = SOUTH
 
-        self.append_log("Moving from docking Tag 0 to grid Tag 1 using old camera cluster logic.")
+        self.append_log("Moving from docking Tag 0 to grid Tag 1 using standalone cluster logic: Tag 0 helpers remain OLD until full cluster loss.")
         self.start_segment(DOCK_TAG, GRID_START_TAG)
         self.lock_heading_go()
 
