@@ -82,8 +82,8 @@ CELL_DISTANCE_M = 0.50
 # Fixed ESP32 tuning defaults.
 # These are kept as normal Python values so they cannot be deleted by Qt layout cleanup.
 DEFAULT_BASE_PPS = 6500
-DEFAULT_IMU_MAX_CORR = 350
-DEFAULT_IMU_KP = 70.0
+DEFAULT_IMU_MAX_CORR = 450
+DEFAULT_IMU_KP = 85.0
 DEFAULT_ACCEL_PPS_PER_SEC = 7000
 DEFAULT_DECEL_PPS_PER_SEC = 9000
 
@@ -271,10 +271,10 @@ def turn_action_between_headings(in_heading, out_heading):
 
 MAX_PPS = 12000
 
-VISION_BASE_PPS = 6500
-VISION_BASE_PPS_SLOW = 5000
-VISION_MIN_PPS = 3000
-VISION_MAX_PPS = 7500
+VISION_BASE_PPS = 6000
+VISION_BASE_PPS_SLOW = 4200
+VISION_MIN_PPS = 2500
+VISION_MAX_PPS = 7800
 
 LOCAL_NUDGE_PPS = 500
 TURN_TAG_FB_PPS = 550
@@ -400,28 +400,32 @@ LOCAL_NUDGE_TIMEOUT_SEC = 5.0
 LOCAL_HELPER_SEEN_FRAMES_REQUIRED = 1
 
 
-KP_YAW_PPS_PER_DEG = 18
-KP_X_PPS_PER_M = 16000
+# Stronger correction tuning.
+# Previous logs showed repeated LARGE corrections saturating at about ±500 pps
+# while the robot still drifted. This version increases vision authority and
+# applies it faster, especially when x/yaw errors are large.
+KP_YAW_PPS_PER_DEG = 24
+KP_X_PPS_PER_M = 24000
 
-KP_YAW_STRONG_PPS_PER_DEG = 28
-KP_X_STRONG_PPS_PER_M = 45000
+KP_YAW_STRONG_PPS_PER_DEG = 42
+KP_X_STRONG_PPS_PER_M = 75000
 
 X_SIGN = -1.0
 
 YAW_DEADBAND_DEG = 0.30
 X_DEADBAND_M = 0.0005
 
-X_MEDIUM_ERROR_M = 0.008
-X_LARGE_ERROR_M = 0.018
+X_MEDIUM_ERROR_M = 0.005
+X_LARGE_ERROR_M = 0.012
 
-YAW_MEDIUM_ERROR_DEG = 3.0
-YAW_LARGE_ERROR_DEG = 7.0
+YAW_MEDIUM_ERROR_DEG = 2.0
+YAW_LARGE_ERROR_DEG = 5.0
 
-MAX_VISION_CORRECTION_PPS = 220
-MAX_VISION_CORRECTION_STRONG_PPS = 500
+MAX_VISION_CORRECTION_PPS = 350
+MAX_VISION_CORRECTION_STRONG_PPS = 900
 
-CORRECTION_FILTER_ALPHA = 0.30
-CORRECTION_FILTER_ALPHA_STRONG = 0.50
+CORRECTION_FILTER_ALPHA = 0.45
+CORRECTION_FILTER_ALPHA_STRONG = 0.75
 
 KP_TURN_TAG_YAW_PPS_PER_DEG = 20
 MAX_TURN_TAG_YAW_CORRECTION_PPS = 150
@@ -1280,6 +1284,7 @@ class AGVQtApp(QMainWindow):
         )
 
 
+
     # -------------------------
     # Camera
     # -------------------------
@@ -1525,7 +1530,7 @@ class AGVQtApp(QMainWindow):
             kp_x = (KP_X_PPS_PER_M + KP_X_STRONG_PPS_PER_M) * 0.5
             max_corr = int((MAX_VISION_CORRECTION_PPS + MAX_VISION_CORRECTION_STRONG_PPS) * 0.5)
             base_pps = int((VISION_BASE_PPS + VISION_BASE_PPS_SLOW) * 0.5)
-            alpha = 0.40
+            alpha = 0.60
         else:
             kp_yaw = KP_YAW_PPS_PER_DEG
             kp_x = KP_X_PPS_PER_M
