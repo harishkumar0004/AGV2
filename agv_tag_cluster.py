@@ -106,7 +106,7 @@ KP_X_PPS_PER_M = 16000
 
 # Strong correction gains when error is large
 KP_YAW_STRONG_PPS_PER_DEG = 28
-KP_X_STRONG_PPS_PER_M = 32000
+KP_X_STRONG_PPS_PER_M = 40000
 
 # If xM correction moves away from zero during travel, change to +1.0
 X_SIGN = -1.0
@@ -123,7 +123,7 @@ YAW_LARGE_ERROR_DEG = 7.0
 
 # Correction limits
 MAX_VISION_CORRECTION_PPS = 220
-MAX_VISION_CORRECTION_STRONG_PPS = 450
+MAX_VISION_CORRECTION_STRONG_PPS = 550
 
 # Smoothing
 CORRECTION_FILTER_ALPHA = 0.30
