@@ -12,7 +12,7 @@ from pupil_apriltags import Detector
 
 
 # =====================================================
-# ROUTE LANDMARKS
+# ROUTE
 # =====================================================
 
 START_TAG = 11
@@ -21,54 +21,52 @@ TAG_6 = 6
 TAG_5 = 5
 TAG_9 = 9
 
-route_state = "WAIT_START"
-
-turn_landmark_id = None
-next_move_state_after_turn = None
-
-
-# =====================================================
-# TRAVEL SEGMENT TRACKING
-# =====================================================
-
-travel_from_landmark = None
-travel_to_landmark = None
-
-left_start_cluster = False
-start_cluster_lost_count = 0
-target_cluster_seen_count = 0
-
-travel_segment_start_time = 0.0
-
-START_CLUSTER_LOST_FRAMES_REQUIRED = 4
-TARGET_CLUSTER_SEEN_FRAMES_REQUIRED = 2
-MIN_TRAVEL_TIME_BEFORE_TARGET_SEC = 1.0
-
-
-# =====================================================
-# TARGET ARRIVAL NUDGE
-# =====================================================
-
-arrival_nudge_landmark = None
-arrival_nudge_next_action = None
-arrival_nudge_helper_id = None
-arrival_nudge_good_count = 0
-arrival_nudge_start_time = 0.0
-
-ARRIVAL_NUDGE_PPS = 500
-ARRIVAL_NUDGE_CENTER_Y_OK_PX = 30
-ARRIVAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
-ARRIVAL_NUDGE_TIMEOUT_SEC = 5.0
-
-
-# =====================================================
-# TURN SETTINGS
-# =====================================================
+ROUTE = [START_TAG, TAG_7, TAG_6, TAG_5, TAG_9]
 
 TURN_DEG_BY_LANDMARK = {
     TAG_6: 90.0,
     TAG_5: -90.0,
 }
+
+TURN_LANDMARKS = {TAG_6, TAG_5}
+FINAL_LANDMARK = TAG_9
+PASS_THROUGH_LANDMARKS = {TAG_7}
+
+route_state = "WAIT_START"
+
+route_index = 0
+travel_from_landmark = None
+travel_to_landmark = None
+
+turn_landmark_id = None
+
+
+# =====================================================
+# TRAVEL PHASE
+# =====================================================
+
+segment_phase = "START_CLUSTER"
+cluster_lost_count = 0
+
+CLUSTER_LOST_FRAMES_REQUIRED = 5
+TARGET_CENTRAL_SEEN_FRAMES_REQUIRED = 2
+
+target_central_seen_count = 0
+
+
+# =====================================================
+# LOCAL ARRIVAL NUDGE
+# =====================================================
+
+local_arrival_landmark = None
+local_arrival_helper_id = None
+local_arrival_good_count = 0
+local_arrival_start_time = 0.0
+
+LOCAL_NUDGE_PPS = 500
+LOCAL_NUDGE_CENTER_Y_OK_PX = 30
+LOCAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
+LOCAL_NUDGE_TIMEOUT_SEC = 5.0
 
 
 # =====================================================
@@ -79,13 +77,10 @@ MAX_PPS = 10000
 
 VISION_BASE_PPS = 3500
 VISION_BASE_PPS_SLOW = 2600
-
 VISION_MIN_PPS = 1600
 VISION_MAX_PPS = 5200
 
-TURN_TAG_FB_PPS = 550
-
-# If pressing c or arrival nudge moves front/back wrong way, change this to -1
+# If manual correction or local nudge moves wrong direction, flip this to -1
 FB_SIGN = 1
 
 
@@ -94,20 +89,16 @@ FB_SIGN = 1
 # =====================================================
 
 TAG_SIZE_M = 0.010
-
-# tag size = 10 mm, gap = 5 mm, center-to-center = 15 mm
 CLUSTER_SPACING_M = 0.015
 
 EXPECTED_TAG_YAW_DEG = 0.0
 
-# Helper tag grid:
+# Helper grid:
 #
 #   508   501   502
 #   507   CEN   503
 #   506   505   504
 #
-# x_grid: right positive
-# y_grid: image-down positive
 HELPER_GRID_OFFSET = {
     501: (0, -1),
     502: (1, -1),
@@ -119,19 +110,13 @@ HELPER_GRID_OFFSET = {
     508: (-1, -1),
 }
 
+HELPER_IDS = set(HELPER_GRID_OFFSET.keys())
 CROSS_HELPERS = {501, 503, 505, 507}
 CORNER_HELPERS = {502, 504, 506, 508}
 
-CORRECTION_HELPER_PRIORITY = [501, 503, 505, 507]
-
-# For final Tag 9, prefer stopping at better side-center helpers.
-# In your observed Tag 9 approach, 503 is better than 505.
-FINAL_STOP_HELPER_PRIORITY = [503, 501, 507, 505]
-FINAL_HELPER_CENTER_OK_PX = 35
-
 
 # =====================================================
-# GLOBAL ADAPTIVE CORRECTION PARAMETERS
+# TRAVEL CORRECTION PARAMETERS
 # =====================================================
 
 KP_YAW_PPS_PER_DEG = 18
@@ -140,7 +125,6 @@ KP_X_PPS_PER_M = 16000
 KP_YAW_STRONG_PPS_PER_DEG = 28
 KP_X_STRONG_PPS_PER_M = 45000
 
-# If xM correction moves away from zero during travel, change to +1.0
 X_SIGN = -1.0
 
 YAW_DEADBAND_DEG = 0.30
@@ -162,20 +146,18 @@ filtered_correction = 0.0
 
 
 # =====================================================
-# TURN LANDMARK CORRECTION PARAMETERS
+# TURN TAG CORRECTION PARAMETERS
 # =====================================================
 
 KP_TURN_TAG_YAW_PPS_PER_DEG = 20
 MAX_TURN_TAG_YAW_CORRECTION_PPS = 150
 
+TURN_TAG_FB_PPS = 550
 TURN_TAG_YAW_OK_DEG = 3.0
 TURN_TAG_CENTER_Y_OK_PX = 25
 TURN_TAG_GOOD_FRAMES_REQUIRED = 3
 
 turn_tag_good_count = 0
-
-POST_TURN_VERIFY_TIMEOUT_SEC = 6.0
-post_turn_start_time = 0.0
 
 
 # =====================================================
@@ -291,9 +273,9 @@ def send_velocity(left_pps, right_pps, force=False):
 
 
 def stop_robot():
-    global last_drive_mode
     global drive_left_pps
     global drive_right_pps
+    global last_drive_mode
 
     drive_left_pps = 0
     drive_right_pps = 0
@@ -346,7 +328,7 @@ def wait_for_esp32_text(expected_text, timeout_sec=10.0):
 
 
 # =====================================================
-# BASIC APRILTAG MATH
+# BASIC TAG MATH
 # =====================================================
 
 def normalize_angle(angle):
@@ -377,7 +359,6 @@ def compute_lateral_x_m(tag):
 
 def estimate_tag_side_px(tag):
     corners = tag.corners
-
     side_lengths = []
 
     for i in range(4):
@@ -392,80 +373,87 @@ def estimate_tag_side_px(tag):
     return float(sum(side_lengths) / len(side_lengths))
 
 
-def get_helper_grid_offset(tag_id, central_tag_id):
-    if tag_id == central_tag_id:
-        return 0, 0
+# =====================================================
+# TAG SELECTION
+# =====================================================
 
-    if tag_id in HELPER_GRID_OFFSET:
-        return HELPER_GRID_OFFSET[tag_id]
+def visible_ids(detections):
+    ids = set()
+
+    for tag in detections:
+        ids.add(tag.tag_id)
+
+    return ids
+
+
+def find_tag(detections, tag_id):
+    for tag in detections:
+        if tag.tag_id == tag_id:
+            return tag
 
     return None
 
 
-# =====================================================
-# CLUSTER LANDMARK POSE
-# =====================================================
+def any_helper_visible(detections):
+    ids = visible_ids(detections)
+    return len(ids.intersection(HELPER_IDS)) > 0
 
-def is_cluster_tag(tag_id, central_tag_id):
-    if tag_id == central_tag_id:
+
+def any_cluster_visible_now(detections, central_tag_id):
+    if find_tag(detections, central_tag_id) is not None:
         return True
 
-    return tag_id in HELPER_GRID_OFFSET
+    return any_helper_visible(detections)
+
+
+def is_cluster_tag(tag_id, central_tag_id):
+    return tag_id == central_tag_id or tag_id in HELPER_IDS
 
 
 def choose_best_cluster_tag(detections, central_tag_id):
     """
-    Used for travelling.
-    Prefer central landmark tag if visible.
-    Otherwise choose helper closest to image center.
+    Important:
+    This function assumes the route state already tells us which landmark
+    the helper tags belong to.
     """
 
-    candidate_tags = []
+    central = find_tag(detections, central_tag_id)
 
-    for tag in detections:
-        if is_cluster_tag(tag.tag_id, central_tag_id):
-            candidate_tags.append(tag)
-
-    if not candidate_tags:
-        return None
-
-    for tag in candidate_tags:
-        if tag.tag_id == central_tag_id:
-            return tag
+    if central is not None:
+        return central
 
     best_tag = None
     best_dist = 999999999.0
 
-    for tag in candidate_tags:
-        dx = tag.center[0] - CX
-        dy = tag.center[1] - CY
-        dist = dx * dx + dy * dy
+    for tag in detections:
+        if tag.tag_id in HELPER_IDS:
+            dx = tag.center[0] - CX
+            dy = tag.center[1] - CY
+            dist = dx * dx + dy * dy
 
-        if dist < best_dist:
-            best_dist = dist
-            best_tag = tag
+            if dist < best_dist:
+                best_dist = dist
+                best_tag = tag
 
     return best_tag
 
 
-def choose_best_correction_tag(detections, central_tag_id):
+def choose_correction_tag(detections, central_tag_id):
     """
     Used after pressing c.
-    Priority:
-    1. central landmark tag
-    2. cross helpers 501, 503, 505, 507
-    3. any helper closest to image center
+    Prefer central tag, then cross helpers, then any helper.
     """
 
-    for tag in detections:
-        if tag.tag_id == central_tag_id:
-            return tag
+    central = find_tag(detections, central_tag_id)
+
+    if central is not None:
+        return central
 
     best_tag = None
     best_dist = 999999999.0
 
     for tag in detections:
-        if tag.tag_id in CORRECTION_HELPER_PRIORITY:
+        if tag.tag_id in CROSS_HELPERS:
             dx = tag.center[0] - CX
             dy = tag.center[1] - CY
             dist = dx * dx + dy * dy
@@ -480,151 +468,57 @@ def choose_best_correction_tag(detections, central_tag_id):
     return choose_best_cluster_tag(detections, central_tag_id)
 
 
-def central_tag_visible(detections, central_tag_id):
-    for tag in detections:
-        if tag.tag_id == central_tag_id:
-            return True
-
-    return False
-
-
-def any_cluster_visible(detections, central_tag_id):
-    return choose_best_cluster_tag(detections, central_tag_id) is not None
-
-
-def visible_tag_ids(detections):
-    ids = set()
-
-    for tag in detections:
-        ids.add(tag.tag_id)
-
-    return ids
-
-
-def find_tag_by_id(detections, tag_id):
-    for tag in detections:
-        if tag.tag_id == tag_id:
-            return tag
-
-    return None
-
-
-def helper_group_stop_allowed_for_target(target_landmark):
+def detect_side_pair(detections, target_landmark):
     """
-    Tag 7 is pass-through, so helper groups must never cause stop/nudge.
+    Called only after the old cluster has completely disappeared.
 
-    Tag 6 and Tag 5 are action/turn landmarks.
-    Tag 9 is final destination.
+    Single 501/503/505/507 is not enough.
+    Side-center + adjacent corner is enough.
 
-    Single 501/503/505/507 must not cause stopping.
-    Side-center + adjacent corner can cause nudge.
+    502 + 503 or 503 + 504 -> 503
+    506 + 507 or 507 + 508 -> 507
+    508 + 501 or 501 + 502 -> 501
+    506 + 505 or 505 + 504 -> 505
     """
 
     if target_landmark == TAG_7:
-        return False
+        return None
 
-    if target_landmark in (TAG_6, TAG_5, TAG_9):
-        return True
-
-    return False
-
-
-def detect_target_helper_arrival_pattern(detections, target_landmark):
-    """
-    Detects side/corner group of target cluster.
-
-    Single 501, 503, 505, or 507 is NOT enough.
-
-    But a side-center helper plus one adjacent corner helper IS enough:
-      502 + 503 or 503 + 504 -> right side, nudge to 503
-      506 + 507 or 507 + 508 -> left side, nudge to 507
-      508 + 501 or 501 + 502 -> top side, nudge to 501
-      506 + 505 or 505 + 504 -> bottom side, nudge to 505
-
-    This prevents missing Tag 6/5 when all three side tags are not detected
-    in exactly the same frame.
-    """
-
-    ids = visible_tag_ids(detections)
+    ids = visible_ids(detections)
 
     if target_landmark in ids:
         return None
 
-    if not helper_group_stop_allowed_for_target(target_landmark):
-        return None
-
-    side_groups = [
-        ("RIGHT",  {502, 503, 504}, 503, {502, 504}),
-        ("LEFT",   {506, 507, 508}, 507, {506, 508}),
-        ("TOP",    {508, 501, 502}, 501, {508, 502}),
-        ("BOTTOM", {506, 505, 504}, 505, {506, 504}),
+    groups = [
+        (503, {502, 504}),
+        (507, {506, 508}),
+        (501, {508, 502}),
+        (505, {506, 504}),
     ]
 
-    best_group_name = None
-    best_helper = None
-    best_count = 0
-
-    for group_name, group_ids, center_helper, corner_ids in side_groups:
-
-        visible_in_group = ids.intersection(group_ids)
-        visible_count = len(visible_in_group)
-
-        has_side_center = center_helper in ids
-        has_adjacent_corner = len(ids.intersection(corner_ids)) > 0
-
-        # Single center helper alone is not enough.
-        # Center helper + one adjacent corner is enough.
-        if has_side_center and has_adjacent_corner and visible_count >= 2:
-            if visible_count > best_count:
-                best_count = visible_count
-                best_group_name = group_name
-                best_helper = center_helper
-
-    if best_helper is not None:
-        print(
-            f"TARGET_HELPER_PATTERN "
-            f"target={target_landmark} "
-            f"group={best_group_name} "
-            f"count={best_count} "
-            f"preferredHelper={best_helper}"
-        )
-
-        return best_helper
+    for center_helper, corners in groups:
+        if center_helper in ids and len(ids.intersection(corners)) > 0:
+            return center_helper
 
     return None
 
 
-def choose_final_stop_helper(detections, final_landmark):
-    """
-    For final Tag 9:
-    - central 9 is always best
-    - then prefer selected side-center helpers
-    - never stop at corner helpers
-    """
+# =====================================================
+# LANDMARK POSE FROM CLUSTER
+# =====================================================
 
-    for tag in detections:
-        if tag.tag_id == final_landmark:
-            return tag
+def get_helper_grid_offset(tag_id, central_tag_id):
+    if tag_id == central_tag_id:
+        return 0, 0
 
-    for helper_id in FINAL_STOP_HELPER_PRIORITY:
-        tag = find_tag_by_id(detections, helper_id)
-
-        if tag is not None:
-            return tag
+    if tag_id in HELPER_GRID_OFFSET:
+        return HELPER_GRID_OFFSET[tag_id]
 
     return None
 
 
 def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
-    """
-    Converts visible central/helper tag pose into estimated central landmark pose.
-    Used during travelling.
-    """
-
-    grid_offset = get_helper_grid_offset(
-        tag.tag_id,
-        central_tag_id
-    )
+    grid_offset = get_helper_grid_offset(tag.tag_id, central_tag_id)
 
     if grid_offset is None:
         return None
@@ -644,7 +538,6 @@ def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
     tag_side_px = estimate_tag_side_px(tag)
     spacing_px = tag_side_px * (CLUSTER_SPACING_M / TAG_SIZE_M)
 
-    center_px = tag.center[0] - (helper_x_grid * spacing_px)
     center_py = tag.center[1] - (helper_y_grid * spacing_px)
 
     center_y_error_px = float(center_py - CY)
@@ -660,12 +553,7 @@ def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
     )
 
 
-def get_visible_tag_center_pose(tag):
-    """
-    Used only after pressing c.
-    Centers the selected visible tag itself.
-    """
-
+def get_visible_tag_pose(tag):
     raw_yaw = compute_yaw_deg(tag)
 
     yaw_error = normalize_angle(
@@ -685,204 +573,7 @@ def get_visible_tag_center_pose(tag):
 
 
 # =====================================================
-# TRAVEL SEGMENT MONITOR
-# =====================================================
-
-def start_travel_segment(from_landmark, to_landmark, new_state):
-    global route_state
-    global travel_from_landmark
-    global travel_to_landmark
-    global left_start_cluster
-    global start_cluster_lost_count
-    global target_cluster_seen_count
-    global travel_segment_start_time
-
-    travel_from_landmark = from_landmark
-    travel_to_landmark = to_landmark
-
-    left_start_cluster = False
-    start_cluster_lost_count = 0
-    target_cluster_seen_count = 0
-    travel_segment_start_time = time.time()
-
-    reset_correction_filter()
-
-    route_state = new_state
-
-    print(
-        f"RPI: Starting travel segment "
-        f"{from_landmark} -> {to_landmark}"
-    )
-
-
-def monitor_travel_progress(detections):
-    """
-    Returns:
-        USE_START   = still near start cluster, correct using start landmark
-        USE_TARGET  = target cluster visible, but not yet confirmed
-        ARRIVED     = central target landmark confirmed
-        NUDGE_xxx   = valid side-center + adjacent corner group detected
-        NO_TAG      = no useful tag
-
-    Critical rule:
-        Single 501/503/505/507 does not stop the robot.
-        Side-center + adjacent corner is enough to nudge.
-    """
-
-    global left_start_cluster
-    global start_cluster_lost_count
-    global target_cluster_seen_count
-
-    if travel_from_landmark is None or travel_to_landmark is None:
-        return "NO_TAG"
-
-    elapsed = time.time() - travel_segment_start_time
-
-    # -------------------------------------------------
-    # Central target tag is reliable.
-    # -------------------------------------------------
-
-    if elapsed >= MIN_TRAVEL_TIME_BEFORE_TARGET_SEC:
-        if central_tag_visible(detections, travel_to_landmark):
-            target_cluster_seen_count += 1
-
-            if target_cluster_seen_count >= TARGET_CLUSTER_SEEN_FRAMES_REQUIRED:
-                return "ARRIVED"
-
-            return "USE_TARGET"
-
-    # -------------------------------------------------
-    # Before leaving start:
-    # helpers belong to start landmark.
-    # -------------------------------------------------
-
-    if not left_start_cluster:
-
-        if central_tag_visible(detections, travel_from_landmark):
-            start_cluster_lost_count = 0
-            target_cluster_seen_count = 0
-            return "USE_START"
-
-        start_cluster_lost_count += 1
-
-        if start_cluster_lost_count < START_CLUSTER_LOST_FRAMES_REQUIRED:
-            if any_cluster_visible(detections, travel_from_landmark):
-                return "USE_START"
-
-        if (
-            start_cluster_lost_count >= START_CLUSTER_LOST_FRAMES_REQUIRED
-            and elapsed >= MIN_TRAVEL_TIME_BEFORE_TARGET_SEC
-        ):
-            left_start_cluster = True
-            target_cluster_seen_count = 0
-
-            print(
-                f"RPI: Left landmark {travel_from_landmark} central tag. "
-                f"Now searching for landmark {travel_to_landmark} cluster."
-            )
-
-        return "NO_TAG"
-
-    # -------------------------------------------------
-    # After leaving start:
-    # helpers are interpreted as target helpers.
-    # -------------------------------------------------
-
-    target_tag = choose_best_cluster_tag(
-        detections,
-        travel_to_landmark
-    )
-
-    if target_tag is None:
-        target_cluster_seen_count = 0
-        return "NO_TAG"
-
-    # If central target is visible, arrival will be handled above.
-    if target_tag.tag_id == travel_to_landmark:
-        target_cluster_seen_count += 1
-
-        if target_cluster_seen_count >= TARGET_CLUSTER_SEEN_FRAMES_REQUIRED:
-            return "ARRIVED"
-
-        return "USE_TARGET"
-
-    preferred_helper = detect_target_helper_arrival_pattern(
-        detections,
-        travel_to_landmark
-    )
-
-    if preferred_helper is not None:
-        return f"NUDGE_{preferred_helper}"
-
-    # Otherwise, use the helper only for target correction and keep moving.
-    return "USE_TARGET"
-
-
-# =====================================================
-# ARRIVAL NUDGE
-# =====================================================
-
-def start_arrival_nudge(landmark_id, preferred_helper_id, next_action):
-    global route_state
-    global arrival_nudge_landmark
-    global arrival_nudge_next_action
-    global arrival_nudge_helper_id
-    global arrival_nudge_good_count
-    global arrival_nudge_start_time
-
-    stop_robot()
-
-    arrival_nudge_landmark = landmark_id
-    arrival_nudge_helper_id = preferred_helper_id
-    arrival_nudge_next_action = next_action
-    arrival_nudge_good_count = 0
-    arrival_nudge_start_time = time.time()
-
-    route_state = "ARRIVAL_NUDGE"
-
-    print(
-        f"RPI: Side helper group reached for landmark {landmark_id}. "
-        f"Nudging toward helper {preferred_helper_id}."
-    )
-
-
-def finish_arrival_nudge():
-    global route_state
-
-    stop_robot()
-
-    if arrival_nudge_next_action == "TURN":
-        start_turn_wait(
-            arrival_nudge_landmark,
-            next_move_state_after_turn
-        )
-
-    elif arrival_nudge_next_action == "DONE":
-        route_state = "DONE"
-        print("RPI: Final destination reached. Robot stopped.")
-
-
-def arrival_nudge_velocity(tag):
-    """
-    Move slowly front/back to center the selected side-center helper tag in image Y.
-    If this moves wrong direction, flip FB_SIGN.
-    """
-
-    y_err = float(tag.center[1] - CY)
-
-    if abs(y_err) <= ARRIVAL_NUDGE_CENTER_Y_OK_PX:
-        return 0, 0, y_err, True
-
-    if y_err > 0:
-        fb = ARRIVAL_NUDGE_PPS * FB_SIGN
-    else:
-        fb = -ARRIVAL_NUDGE_PPS * FB_SIGN
-
-    return fb, fb, y_err, False
-
-
-# =====================================================
-# ADAPTIVE TRAVELLING CORRECTION
+# TRAVEL CORRECTION
 # =====================================================
 
 def reset_correction_filter():
@@ -903,11 +594,7 @@ def adaptive_error_level(yaw_error, center_x_m):
     return "SMALL"
 
 
-def travelling_correction_velocity_from_landmark(
-    raw_yaw,
-    yaw_error,
-    center_x_m
-):
+def travelling_velocity(raw_yaw, yaw_error, center_x_m):
     global filtered_correction
 
     error_level = adaptive_error_level(
@@ -983,14 +670,10 @@ def travelling_correction_velocity_from_landmark(
 
 
 # =====================================================
-# TURN LANDMARK CORRECTION
+# TURN / LOCAL CORRECTION
 # =====================================================
 
-def turn_tag_heading_center_velocity_from_visible_tag(
-    raw_yaw,
-    yaw_error,
-    visible_y_error_px
-):
+def visible_tag_center_velocity(raw_yaw, yaw_error, y_error_px, pps):
     yaw_for_control = yaw_error
 
     if abs(yaw_for_control) < YAW_DEADBAND_DEG:
@@ -1004,13 +687,13 @@ def turn_tag_heading_center_velocity_from_visible_tag(
         MAX_TURN_TAG_YAW_CORRECTION_PPS
     ))
 
-    if abs(visible_y_error_px) <= TURN_TAG_CENTER_Y_OK_PX:
+    if abs(y_error_px) <= TURN_TAG_CENTER_Y_OK_PX:
         fb = 0
     else:
-        if visible_y_error_px > 0:
-            fb = TURN_TAG_FB_PPS * FB_SIGN
+        if y_error_px > 0:
+            fb = pps * FB_SIGN
         else:
-            fb = -TURN_TAG_FB_PPS * FB_SIGN
+            fb = -pps * FB_SIGN
 
     left = fb - yaw_corr
     right = fb + yaw_corr
@@ -1025,123 +708,164 @@ def turn_tag_heading_center_velocity_from_visible_tag(
     return left, right, yaw_corr
 
 
-def turn_tag_good(yaw_error, visible_y_error_px):
-    return (
-        abs(yaw_error) <= TURN_TAG_YAW_OK_DEG
-        and abs(visible_y_error_px) <= TURN_TAG_CENTER_Y_OK_PX
-    )
-
-
 # =====================================================
-# ROUTE HELPERS
+# SEGMENT / ARRIVAL
 # =====================================================
 
-def start_turn_wait(landmark_id, next_state_after_turn):
+def start_segment(from_tag, to_tag):
+    global route_state
+    global travel_from_landmark
+    global travel_to_landmark
+    global segment_phase
+    global cluster_lost_count
+    global target_central_seen_count
+
+    travel_from_landmark = from_tag
+    travel_to_landmark = to_tag
+
+    segment_phase = "START_CLUSTER"
+    cluster_lost_count = 0
+    target_central_seen_count = 0
+
+    reset_correction_filter()
+
+    route_state = "MOVE"
+
+    print(f"RPI: Starting segment {from_tag} -> {to_tag}")
+
+
+def next_route_after(tag_id):
+    for i in range(len(ROUTE) - 1):
+        if ROUTE[i] == tag_id:
+            return ROUTE[i + 1]
+
+    return None
+
+
+def handle_landmark_arrival(landmark_id):
     global route_state
     global turn_landmark_id
-    global next_move_state_after_turn
-    global turn_tag_good_count
 
     stop_robot()
     reset_correction_filter()
 
-    turn_landmark_id = landmark_id
-    next_move_state_after_turn = next_state_after_turn
-    turn_tag_good_count = 0
+    if landmark_id in PASS_THROUGH_LANDMARKS:
 
-    route_state = "WAIT_TURN_TAG_CORRECT_COMMAND"
+        next_tag = next_route_after(landmark_id)
 
-    print(f"RPI: Landmark {landmark_id} reached. Robot stopped.")
-    print(f"RPI: Press 'c' to correct Tag {landmark_id} cluster.")
-    print(f"RPI: Press 't' after correction to turn {TURN_DEG_BY_LANDMARK.get(landmark_id, 90.0):.1f} degrees.")
+        if next_tag is not None:
+            print(f"RPI: Pass-through landmark {landmark_id}. Continuing to {next_tag}.")
+            start_segment(landmark_id, next_tag)
+            lock_heading_go()
+
+        return
+
+    if landmark_id in TURN_LANDMARKS:
+
+        turn_landmark_id = landmark_id
+        route_state = "WAIT_TURN_TAG_CORRECT_COMMAND"
+
+        print(f"RPI: Reached turn landmark {landmark_id}.")
+        print("RPI: Press 'c' to correct.")
+        print("RPI: Press 't' after correction to turn.")
+
+        return
+
+    if landmark_id == FINAL_LANDMARK:
+
+        route_state = "DONE"
+        print("RPI: Final landmark reached. Robot stopped.")
 
 
-def choose_travel_landmark(detections):
+def start_local_arrival(landmark_id, helper_id):
     global route_state
-    global next_move_state_after_turn
+    global local_arrival_landmark
+    global local_arrival_helper_id
+    global local_arrival_good_count
+    global local_arrival_start_time
 
-    progress = monitor_travel_progress(detections)
+    stop_robot()
 
-    if route_state == "MOVE_TO_7":
+    local_arrival_landmark = landmark_id
+    local_arrival_helper_id = helper_id
+    local_arrival_good_count = 0
+    local_arrival_start_time = time.time()
 
-        if progress == "ARRIVED":
-            print("RPI: Landmark 7 reached as pass-through. Continuing to Tag 6.")
-            start_travel_segment(TAG_7, TAG_6, "MOVE_TO_6")
-            return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
+    route_state = "LOCAL_ARRIVAL"
 
-        # Pass-through: never nudge or stop at Tag 7.
-        if progress.startswith("NUDGE_"):
-            return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
+    print(
+        f"RPI: Local arrival at landmark {landmark_id}. "
+        f"Nudging to helper {helper_id}."
+    )
 
-        if progress == "USE_START":
-            return choose_best_cluster_tag(detections, START_TAG), START_TAG, "TAG11"
 
-        if progress == "USE_TARGET":
-            return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
+# =====================================================
+# MOVE STATE LOGIC
+# =====================================================
+
+def choose_move_correction(detections):
+    global segment_phase
+    global cluster_lost_count
+    global target_central_seen_count
+
+    central_target = find_tag(detections, travel_to_landmark)
+
+    if central_target is not None:
+        target_central_seen_count += 1
+
+        if target_central_seen_count >= TARGET_CENTRAL_SEEN_FRAMES_REQUIRED:
+            handle_landmark_arrival(travel_to_landmark)
+            return None, None, ""
+
+        return central_target, travel_to_landmark, f"TAG{travel_to_landmark}"
+
+    target_central_seen_count = 0
+
+    if segment_phase == "START_CLUSTER":
+
+        if any_cluster_visible_now(detections, travel_from_landmark):
+            cluster_lost_count = 0
+
+            tag = choose_best_cluster_tag(
+                detections,
+                travel_from_landmark
+            )
+
+            return tag, travel_from_landmark, f"TAG{travel_from_landmark}"
+
+        cluster_lost_count += 1
+
+        if cluster_lost_count >= CLUSTER_LOST_FRAMES_REQUIRED:
+            segment_phase = "SEARCH_TARGET"
+            print(
+                f"RPI: Fully left landmark {travel_from_landmark}. "
+                f"Now helpers can belong to {travel_to_landmark}."
+            )
 
         return None, None, ""
 
-    if route_state == "MOVE_TO_6":
+    if segment_phase == "SEARCH_TARGET":
 
-        if progress == "ARRIVED":
-            start_turn_wait(TAG_6, "MOVE_TO_5")
-            return None, None, ""
+        helper_id = detect_side_pair(
+            detections,
+            travel_to_landmark
+        )
 
-        if progress.startswith("NUDGE_"):
-            helper_id = int(progress.split("_")[1])
-            next_move_state_after_turn = "MOVE_TO_5"
-            start_arrival_nudge(TAG_6, helper_id, "TURN")
-            return None, None, ""
-
-        if progress == "USE_START":
-            return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
-
-        if progress == "USE_TARGET":
-            return choose_best_cluster_tag(detections, TAG_6), TAG_6, "TAG6"
-
-        return None, None, ""
-
-    if route_state == "MOVE_TO_5":
-
-        if progress == "ARRIVED":
-            start_turn_wait(TAG_5, "MOVE_TO_9")
-            return None, None, ""
-
-        if progress.startswith("NUDGE_"):
-            helper_id = int(progress.split("_")[1])
-            next_move_state_after_turn = "MOVE_TO_9"
-            start_arrival_nudge(TAG_5, helper_id, "TURN")
-            return None, None, ""
-
-        if progress == "USE_START":
-            return choose_best_cluster_tag(detections, TAG_6), TAG_6, "TAG6"
-
-        if progress == "USE_TARGET":
-            return choose_best_cluster_tag(detections, TAG_5), TAG_5, "TAG5"
-
-        return None, None, ""
-
-    if route_state == "MOVE_TO_9":
-
-        if progress == "ARRIVED":
-            stop_robot()
-            route_state = "DONE"
-
-            print("RPI: Landmark 9 reached.")
-            print("RPI: Final destination reached. Robot stopped.")
+        if helper_id is not None:
+            start_local_arrival(
+                travel_to_landmark,
+                helper_id
+            )
 
             return None, None, ""
 
-        if progress.startswith("NUDGE_"):
-            helper_id = int(progress.split("_")[1])
-            start_arrival_nudge(TAG_9, helper_id, "DONE")
-            return None, None, ""
+        tag = choose_best_cluster_tag(
+            detections,
+            travel_to_landmark
+        )
 
-        if progress == "USE_START":
-            return choose_best_cluster_tag(detections, TAG_5), TAG_5, "TAG5"
-
-        if progress == "USE_TARGET":
-            return choose_best_cluster_tag(detections, TAG_9), TAG_9, "TAG9"
+        if tag is not None:
+            return tag, travel_to_landmark, f"TAG{travel_to_landmark}"
 
         return None, None, ""
 
@@ -1149,15 +873,15 @@ def choose_travel_landmark(detections):
 
 
 # =====================================================
-# DISPLAY DRAWING
+# DISPLAY
 # =====================================================
 
 def draw_tags(frame, detections):
-    visible_ids = []
+    ids = []
 
     for tag in detections:
 
-        visible_ids.append(tag.tag_id)
+        ids.append(tag.tag_id)
 
         corners = tag.corners.astype(int)
 
@@ -1206,33 +930,27 @@ def draw_tags(frame, detections):
             2
         )
 
-    return visible_ids
+    return ids
 
 
 # =====================================================
-# STARTUP
+# STARTUP PRINT
 # =====================================================
 
 print("Waiting for docking Tag 11...")
-print("Press 's' when Tag 11 is visible and robot is manually aligned.")
+print("Press 's' when Tag 11 is visible and robot is aligned.")
 print("")
-print("Route:")
-print("  11 -> 7 -> 6")
-print("  At 6: stop, press c, then press t")
-print("  6 -> 5")
-print("  At 5: stop, press c, then press t")
-print("  5 -> 9 and stop")
-print("")
-print("Helper arrival rule:")
-print("  Tag 7 pass-through: never stop/nudge")
-print("  Single 501/503/505/507: do not stop, keep moving")
-print("  Side-center + adjacent corner: nudge to side-center helper")
-print("  Central target tag visible: reached")
+print("New logic:")
+print("  Helpers are old landmark helpers until all helpers disappear.")
+print("  After full cluster loss, helpers can belong to target landmark.")
+print("  Tag 7 is pass-through.")
+print("  Tag 6 and Tag 5 are turn landmarks.")
+print("  Tag 9 is final.")
 print("")
 print("Keys:")
-print("  s = start route")
-print("  c = correct current turn landmark")
-print("  t = turn current turn landmark")
+print("  s = start")
+print("  c = correct turn landmark")
+print("  t = turn")
 print("  q = quit")
 
 
@@ -1257,7 +975,7 @@ try:
             tag_size=TAG_SIZE_M
         )
 
-        visible_ids = draw_tags(frame, detections)
+        ids = draw_tags(frame, detections)
 
         # =================================================
         # STATE MACHINE
@@ -1267,11 +985,11 @@ try:
 
             pass
 
-        elif route_state in ("MOVE_TO_7", "MOVE_TO_6", "MOVE_TO_5", "MOVE_TO_9"):
+        elif route_state == "MOVE":
 
-            tag, landmark_id, label = choose_travel_landmark(detections)
+            tag, landmark_id, label = choose_move_correction(detections)
 
-            if tag is not None:
+            if tag is not None and route_state == "MOVE":
 
                 pose = get_landmark_pose_from_cluster_tag(
                     tag,
@@ -1297,7 +1015,7 @@ try:
                         yaw_corr,
                         x_corr,
                         error_level
-                    ) = travelling_correction_velocity_from_landmark(
+                    ) = travelling_velocity(
                         raw_yaw,
                         yaw_error,
                         center_x_m
@@ -1306,221 +1024,52 @@ try:
                     send_velocity(left, right)
 
                     print(
-                        f"{label} CLUSTER_CORR "
-                        f"travel={travel_from_landmark}->{travel_to_landmark} "
-                        f"leftStart={left_start_cluster} "
+                        f"{label} CORR "
+                        f"seg={travel_from_landmark}->{travel_to_landmark} "
+                        f"phase={segment_phase} "
                         f"seen={seen_tag_id} "
                         f"grid=({helper_x_grid},{helper_y_grid}) "
-                        f"rawYaw={raw_yaw:.2f} "
                         f"yawErr={yaw_error:.2f} "
                         f"centerXM={center_x_m:.4f} "
                         f"centerYerr={center_y_error_px:.1f}px "
-                        f"yawCorr={yaw_corr:.1f} "
-                        f"xCorr={x_corr:.1f} "
                         f"level={error_level} "
                         f"corr={correction} "
-                        f"L={left} "
-                        f"R={right}"
+                        f"L={left} R={right}"
                     )
 
-            else:
+            elif route_state == "MOVE":
 
                 lock_heading_go()
 
-        elif route_state == "ARRIVAL_NUDGE":
+        elif route_state == "LOCAL_ARRIVAL":
 
-            central_tag = find_tag_by_id(
+            central = find_tag(
                 detections,
-                arrival_nudge_landmark
+                local_arrival_landmark
             )
 
-            if central_tag is not None:
+            if central is not None:
 
-                stop_robot()
-
-                print(
-                    f"RPI: Central Tag {arrival_nudge_landmark} became visible during nudge."
-                )
-
-                finish_arrival_nudge()
-
-            elif arrival_nudge_landmark == TAG_9:
-
-                final_helper = choose_final_stop_helper(
-                    detections,
-                    TAG_9
-                )
-
-                if final_helper is not None:
-
-                    y_err = float(final_helper.center[1] - CY)
-
-                    if abs(y_err) <= FINAL_HELPER_CENTER_OK_PX:
-
-                        stop_robot()
-                        route_state = "DONE"
-
-                        print(
-                            f"RPI: Final Tag 9 helper {final_helper.tag_id} centered. "
-                            f"Final destination reached."
-                        )
-
-                    else:
-
-                        left, right, y_err, centered = arrival_nudge_velocity(
-                            final_helper
-                        )
-
-                        send_velocity(left, right)
-
-                        print(
-                            f"FINAL_HELPER_NUDGE "
-                            f"helper={final_helper.tag_id} "
-                            f"yErr={y_err:.1f}px "
-                            f"L={left} "
-                            f"R={right}"
-                        )
-
-                else:
-
-                    helper_tag = find_tag_by_id(
-                        detections,
-                        arrival_nudge_helper_id
-                    )
-
-                    if helper_tag is None:
-                        helper_tag = choose_best_cluster_tag(
-                            detections,
-                            arrival_nudge_landmark
-                        )
-
-                    if helper_tag is None:
-
-                        stop_robot()
-                        print("RPI: Final nudge lost Tag 9 cluster.")
-
-                    else:
-
-                        left, right, y_err, centered = arrival_nudge_velocity(
-                            helper_tag
-                        )
-
-                        send_velocity(left, right)
-
-                        print(
-                            f"FINAL_FALLBACK_NUDGE "
-                            f"helper={helper_tag.tag_id} "
-                            f"targetHelper={arrival_nudge_helper_id} "
-                            f"yErr={y_err:.1f}px "
-                            f"L={left} "
-                            f"R={right}"
-                        )
-
-                if time.time() - arrival_nudge_start_time > ARRIVAL_NUDGE_TIMEOUT_SEC:
-
-                    stop_robot()
-                    route_state = "DONE"
-
-                    print(
-                        f"RPI: Final Tag 9 nudge timeout. "
-                        f"Final destination stopped as fallback."
-                    )
+                print(f"RPI: Central tag {local_arrival_landmark} became visible during local arrival.")
+                handle_landmark_arrival(local_arrival_landmark)
 
             else:
 
-                helper_tag = find_tag_by_id(
+                helper = find_tag(
                     detections,
-                    arrival_nudge_helper_id
+                    local_arrival_helper_id
                 )
 
-                if helper_tag is None:
-                    helper_tag = choose_best_cluster_tag(
+                if helper is None:
+                    helper = choose_best_cluster_tag(
                         detections,
-                        arrival_nudge_landmark
+                        local_arrival_landmark
                     )
 
-                if helper_tag is None:
+                if helper is None:
 
-                    stop_robot()
-
-                    print(
-                        f"RPI: Arrival nudge lost landmark {arrival_nudge_landmark} cluster."
-                    )
-
-                    finish_arrival_nudge()
-
-                else:
-
-                    left, right, y_err, centered = arrival_nudge_velocity(
-                        helper_tag
-                    )
-
-                    if centered:
-
-                        arrival_nudge_good_count += 1
-                        stop_robot()
-
-                        print(
-                            f"ARRIVAL_NUDGE_GOOD "
-                            f"landmark={arrival_nudge_landmark} "
-                            f"helper={helper_tag.tag_id} "
-                            f"yErr={y_err:.1f}px "
-                            f"good={arrival_nudge_good_count}/{ARRIVAL_NUDGE_GOOD_FRAMES_REQUIRED}"
-                        )
-
-                        if arrival_nudge_good_count >= ARRIVAL_NUDGE_GOOD_FRAMES_REQUIRED:
-                            finish_arrival_nudge()
-
-                    else:
-
-                        arrival_nudge_good_count = 0
-                        send_velocity(left, right)
-
-                        print(
-                            f"ARRIVAL_NUDGE "
-                            f"landmark={arrival_nudge_landmark} "
-                            f"helper={helper_tag.tag_id} "
-                            f"targetHelper={arrival_nudge_helper_id} "
-                            f"yErr={y_err:.1f}px "
-                            f"L={left} "
-                            f"R={right}"
-                        )
-
-                if time.time() - arrival_nudge_start_time > ARRIVAL_NUDGE_TIMEOUT_SEC:
-
-                    stop_robot()
-
-                    print(
-                        f"RPI: Arrival nudge timeout for landmark {arrival_nudge_landmark}."
-                    )
-
-                    finish_arrival_nudge()
-
-        elif route_state == "WAIT_TURN_TAG_CORRECT_COMMAND":
-
-            stop_robot()
-
-        elif route_state == "TURN_TAG_CORRECTING":
-
-            if turn_landmark_id is None:
-
-                stop_robot()
-                route_state = "DONE"
-
-            else:
-
-                correction_tag = choose_best_correction_tag(
-                    detections,
-                    turn_landmark_id
-                )
-
-                if correction_tag is None:
-
-                    stop_robot()
-                    route_state = "WAIT_TURN_TAG_CORRECT_COMMAND"
-
-                    print(f"RPI: Tag {turn_landmark_id} correction tag lost.")
-                    print("RPI: Robot stopped. Press 'c' again when tag is visible.")
+                    print("RPI: Local arrival tag lost. Stopping as reached.")
+                    handle_landmark_arrival(local_arrival_landmark)
 
                 else:
 
@@ -1530,55 +1079,123 @@ try:
                         visible_x_error_px,
                         visible_y_error_px,
                         seen_tag_id
-                    ) = get_visible_tag_center_pose(correction_tag)
+                    ) = get_visible_tag_pose(helper)
 
-                    if turn_tag_good(yaw_error, visible_y_error_px):
+                    if abs(visible_y_error_px) <= LOCAL_NUDGE_CENTER_Y_OK_PX:
 
-                        turn_tag_good_count += 1
-
+                        local_arrival_good_count += 1
                         stop_robot()
 
                         print(
-                            f"TAG{turn_landmark_id} GOOD "
-                            f"{turn_tag_good_count}/{TURN_TAG_GOOD_FRAMES_REQUIRED} "
-                            f"seen={seen_tag_id} "
-                            f"rawYaw={raw_yaw:.2f} "
-                            f"yawErr={yaw_error:.2f} "
-                            f"visibleXerr={visible_x_error_px:.1f}px "
-                            f"visibleYerr={visible_y_error_px:.1f}px"
+                            f"LOCAL_ARRIVAL_GOOD "
+                            f"landmark={local_arrival_landmark} "
+                            f"helper={seen_tag_id} "
+                            f"yErr={visible_y_error_px:.1f}px "
+                            f"good={local_arrival_good_count}/{LOCAL_NUDGE_GOOD_FRAMES_REQUIRED}"
                         )
 
-                        if turn_tag_good_count >= TURN_TAG_GOOD_FRAMES_REQUIRED:
-
-                            stop_robot()
-                            route_state = "WAIT_TURN_COMMAND"
-
-                            print(f"RPI: Tag {turn_landmark_id} correction complete.")
-                            print("RPI: Press 't' to turn.")
+                        if local_arrival_good_count >= LOCAL_NUDGE_GOOD_FRAMES_REQUIRED:
+                            handle_landmark_arrival(local_arrival_landmark)
 
                     else:
 
-                        turn_tag_good_count = 0
+                        local_arrival_good_count = 0
 
-                        left, right, yaw_corr = turn_tag_heading_center_velocity_from_visible_tag(
+                        left, right, yaw_corr = visible_tag_center_velocity(
                             raw_yaw,
                             yaw_error,
-                            visible_y_error_px
+                            visible_y_error_px,
+                            LOCAL_NUDGE_PPS
                         )
 
                         send_velocity(left, right)
 
                         print(
-                            f"TAG{turn_landmark_id} ALIGN_VISIBLE "
-                            f"seen={seen_tag_id} "
-                            f"rawYaw={raw_yaw:.2f} "
-                            f"yawErr={yaw_error:.2f} "
-                            f"visibleXerr={visible_x_error_px:.1f}px "
-                            f"visibleYerr={visible_y_error_px:.1f}px "
-                            f"yawCorr={yaw_corr} "
-                            f"L={left} "
-                            f"R={right}"
+                            f"LOCAL_ARRIVAL "
+                            f"landmark={local_arrival_landmark} "
+                            f"helper={seen_tag_id} "
+                            f"targetHelper={local_arrival_helper_id} "
+                            f"yErr={visible_y_error_px:.1f}px "
+                            f"L={left} R={right}"
                         )
+
+                if time.time() - local_arrival_start_time > LOCAL_NUDGE_TIMEOUT_SEC:
+
+                    print("RPI: Local arrival timeout. Stopping as reached.")
+                    handle_landmark_arrival(local_arrival_landmark)
+
+        elif route_state == "WAIT_TURN_TAG_CORRECT_COMMAND":
+
+            stop_robot()
+
+        elif route_state == "TURN_TAG_CORRECTING":
+
+            tag = choose_correction_tag(
+                detections,
+                turn_landmark_id
+            )
+
+            if tag is None:
+
+                stop_robot()
+                route_state = "WAIT_TURN_TAG_CORRECT_COMMAND"
+
+                print("RPI: Correction tag lost. Press c again.")
+
+            else:
+
+                (
+                    raw_yaw,
+                    yaw_error,
+                    visible_x_error_px,
+                    visible_y_error_px,
+                    seen_tag_id
+                ) = get_visible_tag_pose(tag)
+
+                good = (
+                    abs(yaw_error) <= TURN_TAG_YAW_OK_DEG
+                    and abs(visible_y_error_px) <= TURN_TAG_CENTER_Y_OK_PX
+                )
+
+                if good:
+
+                    turn_tag_good_count += 1
+                    stop_robot()
+
+                    print(
+                        f"TURN_CORR_GOOD "
+                        f"landmark={turn_landmark_id} "
+                        f"seen={seen_tag_id} "
+                        f"good={turn_tag_good_count}/{TURN_TAG_GOOD_FRAMES_REQUIRED} "
+                        f"yawErr={yaw_error:.2f} "
+                        f"yErr={visible_y_error_px:.1f}px"
+                    )
+
+                    if turn_tag_good_count >= TURN_TAG_GOOD_FRAMES_REQUIRED:
+                        route_state = "WAIT_TURN_COMMAND"
+                        print("RPI: Correction complete. Press t to turn.")
+
+                else:
+
+                    turn_tag_good_count = 0
+
+                    left, right, yaw_corr = visible_tag_center_velocity(
+                        raw_yaw,
+                        yaw_error,
+                        visible_y_error_px,
+                        TURN_TAG_FB_PPS
+                    )
+
+                    send_velocity(left, right)
+
+                    print(
+                        f"TURN_CORR "
+                        f"landmark={turn_landmark_id} "
+                        f"seen={seen_tag_id} "
+                        f"yawErr={yaw_error:.2f} "
+                        f"yErr={visible_y_error_px:.1f}px "
+                        f"L={left} R={right}"
+                    )
 
         elif route_state == "WAIT_TURN_COMMAND":
 
@@ -1592,91 +1209,19 @@ try:
                 if "OK TURN_DONE" in line:
 
                     print(f"RPI: Turn at Tag {turn_landmark_id} complete.")
-                    print("RPI: Verifying current cluster if visible.")
 
-                    post_turn_start_time = time.time()
-                    route_state = "POST_TURN_VERIFY"
+                    next_tag = next_route_after(turn_landmark_id)
 
-        elif route_state == "POST_TURN_VERIFY":
-
-            tag_cluster = choose_best_cluster_tag(
-                detections,
-                turn_landmark_id
-            )
-
-            if tag_cluster is not None:
-
-                pose = get_landmark_pose_from_cluster_tag(
-                    tag_cluster,
-                    turn_landmark_id
-                )
-
-                if pose is not None:
-
-                    (
-                        raw_yaw,
-                        yaw_error,
-                        center_x_m,
-                        center_y_error_px,
-                        seen_tag_id,
-                        helper_x_grid,
-                        helper_y_grid
-                    ) = pose
-
-                    print(
-                        f"POST_TURN VERIFY "
-                        f"landmark={turn_landmark_id} "
-                        f"seen={seen_tag_id} "
-                        f"grid=({helper_x_grid},{helper_y_grid}) "
-                        f"rawYaw={raw_yaw:.2f} "
-                        f"yawErr={yaw_error:.2f} "
-                        f"centerXM={center_x_m:.4f} "
-                        f"centerYerr={center_y_error_px:.1f}px"
-                    )
-
-                    if turn_landmark_id == TAG_6:
-                        start_travel_segment(
-                            TAG_6,
-                            TAG_5,
-                            "MOVE_TO_5"
+                    if next_tag is not None:
+                        start_segment(
+                            turn_landmark_id,
+                            next_tag
                         )
 
-                    elif turn_landmark_id == TAG_5:
-                        start_travel_segment(
-                            TAG_5,
-                            TAG_9,
-                            "MOVE_TO_9"
-                        )
+                        lock_heading_go()
 
                     else:
-                        route_state = next_move_state_after_turn
-                        reset_correction_filter()
-
-                    lock_heading_go()
-
-            elif time.time() - post_turn_start_time > POST_TURN_VERIFY_TIMEOUT_SEC:
-
-                print("RPI: Post-turn verify timeout. Continuing with IMU heading.")
-
-                if turn_landmark_id == TAG_6:
-                    start_travel_segment(
-                        TAG_6,
-                        TAG_5,
-                        "MOVE_TO_5"
-                    )
-
-                elif turn_landmark_id == TAG_5:
-                    start_travel_segment(
-                        TAG_5,
-                        TAG_9,
-                        "MOVE_TO_9"
-                    )
-
-                else:
-                    route_state = next_move_state_after_turn
-                    reset_correction_filter()
-
-                lock_heading_go()
+                        route_state = "DONE"
 
         elif route_state == "DONE":
 
@@ -1707,14 +1252,14 @@ try:
             f"State: {route_state}",
             (40, 50),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            0.75,
             (255, 255, 255),
             2
         )
 
         cv2.putText(
             frame,
-            f"Travel: {travel_from_landmark}->{travel_to_landmark} left:{left_start_cluster}",
+            f"Seg: {travel_from_landmark}->{travel_to_landmark} phase:{segment_phase}",
             (40, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1724,7 +1269,7 @@ try:
 
         cv2.putText(
             frame,
-            f"TurnTag: {turn_landmark_id}",
+            f"Lost:{cluster_lost_count} Seen:{target_central_seen_count}",
             (40, 130),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1734,7 +1279,7 @@ try:
 
         cv2.putText(
             frame,
-            f"Nudge: {arrival_nudge_landmark}->{arrival_nudge_helper_id}",
+            f"TurnTag:{turn_landmark_id} Local:{local_arrival_landmark}->{local_arrival_helper_id}",
             (40, 170),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1744,7 +1289,7 @@ try:
 
         cv2.putText(
             frame,
-            f"Drive: {last_drive_mode} L:{drive_left_pps} R:{drive_right_pps}",
+            f"Drive:{last_drive_mode} L:{drive_left_pps} R:{drive_right_pps}",
             (40, 210),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1754,7 +1299,7 @@ try:
 
         cv2.putText(
             frame,
-            f"Visible: {visible_ids}",
+            f"Visible:{ids}",
             (40, 250),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1762,18 +1307,8 @@ try:
             2
         )
 
-        cv2.putText(
-            frame,
-            f"Lost:{start_cluster_lost_count} Seen:{target_cluster_seen_count}",
-            (40, 290),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            2
-        )
-
         cv2.imshow(
-            "AGV Cluster Route Side Pair Nudge",
+            "AGV Minimal Route Logic",
             frame
         )
 
@@ -1798,14 +1333,13 @@ try:
                 if tag11 is not None:
 
                     print("RPI: Docking landmark 11 visible.")
-                    print("RPI: Requesting ESP32 IMU recalibration.")
-                    print("RPI: Keep AGV completely still.")
+                    print("RPI: Requesting IMU recalibration.")
+                    print("RPI: Keep robot still.")
 
                     stop_robot()
                     time.sleep(0.3)
 
                     ser.reset_input_buffer()
-
                     send_command("IMU RECAL")
 
                     ok = wait_for_esp32_text(
@@ -1816,12 +1350,10 @@ try:
                     if ok:
 
                         print("RPI: IMU calibrated.")
-                        print("RPI: Starting travel 11 -> 7.")
 
-                        start_travel_segment(
+                        start_segment(
                             START_TAG,
-                            TAG_7,
-                            "MOVE_TO_7"
+                            TAG_7
                         )
 
                         lock_heading_go()
@@ -1832,7 +1364,7 @@ try:
 
                 else:
 
-                    print("RPI: Start ignored. Landmark 11 cluster not visible.")
+                    print("RPI: Start ignored. Tag 11 cluster not visible.")
 
         elif key == ord('c'):
 
@@ -1844,28 +1376,25 @@ try:
 
                 else:
 
-                    correction_tag = choose_best_correction_tag(
+                    tag = choose_correction_tag(
                         detections,
                         turn_landmark_id
                     )
 
-                    if correction_tag is None:
+                    if tag is None:
 
-                        print(f"RPI: Cannot correct. Tag {turn_landmark_id} cluster is not visible.")
+                        print("RPI: Cannot correct. No tag visible.")
 
                     else:
 
                         turn_tag_good_count = 0
-
-                        print(f"RPI: Starting Tag {turn_landmark_id} visible-tag correction.")
-                        print("RPI: Priority: central tag, then 501/503/505/507, then any helper.")
-                        print("RPI: Using yaw + selected visible tag image Y only. No xM steering.")
-
                         route_state = "TURN_TAG_CORRECTING"
+
+                        print(f"RPI: Starting correction for Tag {turn_landmark_id}.")
 
             else:
 
-                print("RPI: 'c' ignored. Robot is not waiting for correction.")
+                print("RPI: c ignored. Not waiting for correction.")
 
         elif key == ord('t'):
 
@@ -1885,14 +1414,13 @@ try:
                     print(f"RPI: Sending TURN_REL {turn_deg:.1f}")
 
                     ser.reset_input_buffer()
-
                     send_command(f"TURN_REL {turn_deg:.1f}")
 
                     route_state = "TURNING"
 
             else:
 
-                print("RPI: Turn ignored. Correct current turn tag first, then press 't'.")
+                print("RPI: t ignored. Correct current landmark first.")
 
         elif key == ord('q'):
 
