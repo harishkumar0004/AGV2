@@ -39,7 +39,7 @@ next_move_state_after_turn = None
 # Change individual signs if one turn must be opposite direction.
 TURN_DEG_BY_LANDMARK = {
     TAG_6: 90.0,
-    TAG_5: 90.0,
+    TAG_5: -90.0,
 }
 
 
