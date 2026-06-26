@@ -165,17 +165,30 @@ def astar_path(start: int, goal: int, blocked=None):
 
 
 def heading_between_tags(a: int, b: int):
+    """
+    Physical grid heading.
+
+    In the real AGV layout:
+      0 -> 1 is NORTH
+      1 -> 2 is WEST because Tag 2 is physically left of Tag 1
+
+    Therefore tag numbers increase to the LEFT and upward:
+      same row, +1  => WEST
+      same row, -1  => EAST
+      next row, +5  => NORTH
+      previous row, -5 => SOUTH
+    """
     ar, ac = tag_to_rc(a)
     br, bc = tag_to_rc(b)
 
-    if br == ar - 1 and bc == ac:
-        return NORTH
     if br == ar + 1 and bc == ac:
+        return NORTH
+    if br == ar - 1 and bc == ac:
         return SOUTH
     if br == ar and bc == ac + 1:
-        return EAST
-    if br == ar and bc == ac - 1:
         return WEST
+    if br == ar and bc == ac - 1:
+        return EAST
     return None
 
 
@@ -184,7 +197,9 @@ def turn_delta_deg(current_heading, desired_heading):
     Return TURN_REL angle for the ESP32.
 
     Physical convention used for this AGV/grid:
-      1 -> 2 is +90 degrees.
+      0 -> 1 is NORTH
+      1 -> 2 is WEST because Tag 2 is physically left of Tag 1.
+      From NORTH to WEST, the robot uses +90 degrees.
 
     Therefore the sign is intentionally opposite of the
     previous screen-coordinate convention.
@@ -206,12 +221,48 @@ def turn_delta_deg(current_heading, desired_heading):
         return 180.0
 
     # Desired heading is one counter-clockwise grid step from current heading.
-    # Example: current SOUTH -> desired EAST for 1 -> 2 after docking.
+    # Example: current NORTH -> desired WEST for 1 -> 2 after docking.
     # This must be +90 for the physical AGV.
     if delta_steps == 3:
         return 90.0
 
     return 0.0
+
+
+
+def expected_entry_helper_for_heading(heading):
+    if heading is None:
+        return None
+    return ENTRY_CENTER_BY_HEADING.get(heading)
+
+
+def exit_helper_for_heading(heading):
+    if heading is None:
+        return None
+    return EXIT_CENTER_BY_HEADING.get(heading)
+
+
+def helper_group_name(center_helper):
+    group = HELPER_GROUP_BY_CENTER.get(int(center_helper), set())
+    return "/".join(str(x) for x in sorted(group))
+
+
+def turn_action_between_headings(in_heading, out_heading):
+    if in_heading is None or out_heading is None:
+        return "UNKNOWN"
+
+    delta_steps = (out_heading - in_heading) % 4
+
+    if delta_steps == 0:
+        return "STRAIGHT"
+    if delta_steps == 1:
+        return "RIGHT"
+    if delta_steps == 3:
+        return "LEFT"
+    if delta_steps == 2:
+        return "UTURN"
+
+    return "UNKNOWN"
 
 
 # =====================================================
@@ -249,6 +300,38 @@ HELPER_GRID_OFFSET = {
 HELPER_IDS = set(HELPER_GRID_OFFSET.keys())
 CROSS_HELPERS = {501, 503, 505, 507}
 CORNER_HELPERS = {502, 504, 506, 508}
+
+# Direction-based helper order.
+# Tags are fixed in the same orientation. Based on the approach direction:
+#   WEST  approach: entry side 502/503/504, exit side 506/507/508
+#   EAST  approach: entry side 506/507/508, exit side 502/503/504
+#   NORTH approach: entry side 504/505/506, exit side 508/501/502
+#   SOUTH approach: entry side 508/501/502, exit side 504/505/506
+ENTRY_CENTER_BY_HEADING = {
+    # Tag numbers increase left; moving WEST means approaching the next tag
+    # through the 502/503/504 side.
+    WEST: 503,
+    EAST: 507,
+
+    # Tag rows increase north; moving NORTH means approaching the next tag
+    # through the 504/505/506 side.
+    NORTH: 505,
+    SOUTH: 501,
+}
+
+EXIT_CENTER_BY_HEADING = {
+    WEST: 507,
+    EAST: 503,
+    NORTH: 501,
+    SOUTH: 505,
+}
+
+HELPER_GROUP_BY_CENTER = {
+    503: {502, 503, 504},
+    507: {506, 507, 508},
+    501: {508, 501, 502},
+    505: {504, 505, 506},
+}
 
 CLUSTER_LOST_FRAMES_REQUIRED = 5
 TARGET_CENTRAL_SEEN_FRAMES_REQUIRED = 2
@@ -864,7 +947,7 @@ class AGVQtApp(QMainWindow):
         self.active_path = []
         self.path_index = 0
         self.expected_next_tag = None
-        self.current_heading = SOUTH
+        self.current_heading = NORTH
         self.mission_running = False
 
         # Old behavior segment state.
@@ -890,6 +973,20 @@ class AGVQtApp(QMainWindow):
         #   immediately starting 2 -> 3
         #   same visible 503 falsely becoming Tag 3.
         self.previous_helper_block_ids = set()
+
+        # For distinguishing previous local tag vs arrived local tag.
+        # If two consecutive segments are in the same heading, the expected
+        # arriving side-center helper should normally remain the same.
+        # If the heading changes, helper arrival in START_CLUSTER is blocked
+        # until there is a clean "no helper visible" transition.
+        self.last_arrival_helper_id = None
+        self.last_arrival_heading = None
+        self.segment_heading = None
+        self.expected_straight_helper_id = None
+        self.all_helpers_cleared_once = False
+        self.expected_entry_helper_id = None
+        self.expected_exit_helper_id = None
+        self.segment_next_action = "UNKNOWN"
 
         self.filtered_correction = 0.0
 
@@ -1201,7 +1298,6 @@ class AGVQtApp(QMainWindow):
                 self.waiting_for_manual_alignment = True
                 self.update_ui_state()
 
-
     # -------------------------
     # Serial
     # -------------------------
@@ -1462,6 +1558,34 @@ class AGVQtApp(QMainWindow):
         self.target_helper_seen_count = 0
         self.target_central_seen_count = 0
 
+        self.segment_heading = heading_between_tags(
+            self.travel_from_landmark,
+            self.travel_to_landmark
+        )
+
+        self.expected_entry_helper_id = expected_entry_helper_for_heading(self.segment_heading)
+        self.expected_exit_helper_id = exit_helper_for_heading(self.segment_heading)
+
+        # Determine the next action at the target landmark: straight/right/left/stop/u-turn.
+        if self.mission_running and self.path_index < len(self.active_path):
+            # The target of this segment is active_path[path_index].
+            next_index_after_target = self.path_index + 1
+            if next_index_after_target < len(self.active_path):
+                outgoing_heading = heading_between_tags(
+                    self.travel_to_landmark,
+                    self.active_path[next_index_after_target]
+                )
+                self.segment_next_action = turn_action_between_headings(
+                    self.segment_heading,
+                    outgoing_heading
+                )
+            else:
+                self.segment_next_action = "STOP"
+        else:
+            self.segment_next_action = "STOP"
+
+        self.all_helpers_cleared_once = False
+
         # Previous-local vs arrived-local protection:
         # Any helper IDs visible at the exact start of the new segment belong to
         # the previous landmark. Do not accept those IDs as arrival for the next
@@ -1473,6 +1597,13 @@ class AGVQtApp(QMainWindow):
                 "Blocking previous local helpers at segment start: "
                 + ", ".join(str(x) for x in sorted(self.previous_helper_block_ids))
             )
+
+        self.append_log(
+            f"Direction rule {from_tag}->{to_tag}: heading={HEADING_LABELS.get(self.segment_heading, '---')} "
+            f"entryHelper={self.expected_entry_helper_id} "
+            f"exitHelper={self.expected_exit_helper_id} "
+            f"nextAction={self.segment_next_action}"
+        )
 
         self.reset_correction_filter()
         self.route_state = "MOVE"
@@ -1531,6 +1662,7 @@ class AGVQtApp(QMainWindow):
         No time-based nudge.
         No frame-based helper wait.
         """
+        self.remember_local_arrival_helper(helper_id)
         self.stop_robot()
         self.local_arrival_landmark = int(landmark_id)
         self.local_arrival_helper_id = int(helper_id)
@@ -1587,14 +1719,20 @@ class AGVQtApp(QMainWindow):
         Remove a helper ID from previous_helper_block_ids only after that ID
         disappears from the camera view.
 
-        This is not time-based and not frame-count based. It is a visibility
-        transition rule: previous local tag -> disappeared -> can be considered
-        new/arrived local tag later.
+        Also records whether ALL helpers disappeared once. This is still useful
+        for diagnostics, but arrival is not allowed from the wrong helper side.
+        Direction decides which helper side can represent the new target.
         """
+        ids = visible_ids(detections)
+        helper_ids_now = ids.intersection(HELPER_IDS)
+
+        if not helper_ids_now and not self.all_helpers_cleared_once:
+            self.all_helpers_cleared_once = True
+            self.append_log("All helpers cleared once.")
+
         if not self.previous_helper_block_ids:
             return
 
-        ids = visible_ids(detections)
         still_visible = self.previous_helper_block_ids.intersection(ids)
         cleared = self.previous_helper_block_ids.difference(still_visible)
 
@@ -1608,6 +1746,46 @@ class AGVQtApp(QMainWindow):
 
     def helper_is_previous_blocked(self, helper_id):
         return int(helper_id) in self.previous_helper_block_ids
+
+    def helper_matches_entry_side(self, helper_id):
+        return (
+            self.expected_entry_helper_id is not None
+            and int(helper_id) == int(self.expected_entry_helper_id)
+        )
+
+    def start_pair_helper_allowed(self, helper_id):
+        """
+        Direction-based false-positive eliminator.
+
+        A helper pair can mark the target reached only if its side-center helper
+        matches the expected ENTRY side for the current approach direction.
+
+        Example for WEST movement, such as 1 -> 2 or 8 -> 9:
+          entry side = 502/503/504 -> center 503
+          exit side  = 506/507/508 -> center 507
+
+        Therefore if the robot reached a tag using 503 and then sees 507, 507 is
+        the exit side of the same tag, not the next tag.
+        """
+        helper_id = int(helper_id)
+
+        if self.expected_entry_helper_id is None:
+            return False, "no_expected_entry_helper"
+
+        if helper_id != int(self.expected_entry_helper_id):
+            return (
+                False,
+                f"expected_entry_{self.expected_entry_helper_id}_got_{helper_id}"
+            )
+
+        if self.helper_is_previous_blocked(helper_id):
+            return False, f"entry_{helper_id}_still_previous_blocked"
+
+        return True, "direction_entry_match"
+
+    def remember_local_arrival_helper(self, helper_id):
+        self.last_arrival_helper_id = int(helper_id)
+        self.last_arrival_heading = self.segment_heading
 
 
     def choose_move_correction(self, detections):
@@ -1649,6 +1827,8 @@ class AGVQtApp(QMainWindow):
             self.target_helper_seen_count = 0
 
             if self.target_central_seen_count >= TARGET_CENTRAL_SEEN_FRAMES_REQUIRED:
+                self.last_arrival_helper_id = None
+                self.last_arrival_heading = self.segment_heading
                 self.handle_landmark_arrival(self.travel_to_landmark)
                 return None, None, ""
 
@@ -1695,17 +1875,26 @@ class AGVQtApp(QMainWindow):
             )
 
             if helper_id is not None and evidence_type == "PAIR":
-                if self.helper_is_previous_blocked(helper_id):
-                    if time.time() - getattr(self, "_last_prev_block_log", 0.0) > 0.80:
-                        self._last_prev_block_log = time.time()
+                allowed, reason = self.start_pair_helper_allowed(helper_id)
+
+                if not allowed:
+                    if time.time() - getattr(self, "_last_pair_wait_log", 0.0) > 0.80:
+                        self._last_pair_wait_log = time.time()
                         self.append_log(
-                            f"PREVIOUS HELPER BLOCKED: helper={helper_id} still belongs to Tag {self.travel_from_landmark}; "
-                            f"not accepting as target {self.travel_to_landmark} yet."
+                            f"PAIR REJECTED BY DIRECTION: target={self.travel_to_landmark} "
+                            f"helper={helper_id} group={helper_group_name(helper_id)} "
+                            f"expectedEntry={self.expected_entry_helper_id} "
+                            f"exitSide={self.expected_exit_helper_id} "
+                            f"reason={reason}. Correction only."
                         )
 
+                    # If it is the exit side of the current/previous tag, correct as old.
+                    # Otherwise use it for target correction but do not mark reached.
                     tag = find_tag(detections, helper_id)
                     if tag is not None:
-                        return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
+                        if self.expected_exit_helper_id is not None and int(helper_id) == int(self.expected_exit_helper_id):
+                            return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
+                        return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
                 ready, center_y_error_px = self.local_helper_arrival_ready(
                     detections,
@@ -1715,8 +1904,9 @@ class AGVQtApp(QMainWindow):
 
                 self.append_log(
                     f"MISSION START PAIR ACCEPTED: target={self.travel_to_landmark} "
-                    f"helper={helper_id} centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px. "
-                    "Pair is strong arrival evidence."
+                    f"helper={helper_id} group={helper_group_name(helper_id)} "
+                    f"reason={reason} nextAction={self.segment_next_action} "
+                    f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px."
                 )
                 self.start_local_arrival(self.travel_to_landmark, helper_id)
                 return None, None, ""
@@ -1727,19 +1917,16 @@ class AGVQtApp(QMainWindow):
             if single_helper is not None:
                 if time.time() - getattr(self, "_last_single_log", 0.0) > 0.90:
                     self._last_single_log = time.time()
-                    if self.helper_is_previous_blocked(single_helper):
-                        self.append_log(
-                            f"SINGLE HELPER STILL PREVIOUS: helper={single_helper} belongs to Tag {self.travel_from_landmark}; "
-                            f"correction only, not target {self.travel_to_landmark}."
-                        )
-                    else:
-                        self.append_log(
-                            f"SINGLE HELPER CORRECTION ONLY: target={self.travel_to_landmark} "
-                            f"helper={single_helper} phase=START_CLUSTER; not reached."
-                        )
+                    self.append_log(
+                        f"SINGLE HELPER CORRECTION ONLY: target={self.travel_to_landmark} "
+                        f"helper={single_helper} expectedEntry={self.expected_entry_helper_id} "
+                        f"exitSide={self.expected_exit_helper_id} phase=START_CLUSTER; not reached."
+                    )
 
                 tag = find_tag(detections, single_helper)
                 if tag is not None:
+                    if self.expected_exit_helper_id is not None and int(single_helper) == int(self.expected_exit_helper_id):
+                        return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
                     return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
             # Standalone fallback: helpers that are not valid target arrival remain
@@ -1774,17 +1961,22 @@ class AGVQtApp(QMainWindow):
             )
 
             if helper_id is not None:
-                if self.helper_is_previous_blocked(helper_id):
-                    if time.time() - getattr(self, "_last_prev_block_log", 0.0) > 0.80:
-                        self._last_prev_block_log = time.time()
+                allowed, reason = self.start_pair_helper_allowed(helper_id)
+
+                if not allowed:
+                    if time.time() - getattr(self, "_last_pair_wait_log", 0.0) > 0.80:
+                        self._last_pair_wait_log = time.time()
                         self.append_log(
-                            f"SEARCH helper {helper_id} is still previous-local from Tag {self.travel_from_landmark}; "
-                            f"not accepting as target {self.travel_to_landmark} until it disappears once."
+                            f"SEARCH HELPER REJECTED BY DIRECTION: target={self.travel_to_landmark} "
+                            f"helper={helper_id} expectedEntry={self.expected_entry_helper_id} reason={reason}. "
+                            "Correction only."
                         )
 
                     tag = find_tag(detections, helper_id)
                     if tag is not None:
-                        return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
+                        if self.expected_exit_helper_id is not None and int(helper_id) == int(self.expected_exit_helper_id):
+                            return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
+                        return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
                 ready, center_y_error_px = self.local_helper_arrival_ready(
                     detections,
@@ -1974,10 +2166,24 @@ class AGVQtApp(QMainWindow):
         self.active_path = []
         self.path_index = 0
         self.expected_next_tag = None
-        self.current_heading = SOUTH
+        self.current_heading = NORTH
         self.mission_running = False
         self.route_state = "IDLE"
         self.previous_helper_block_ids = set()
+
+        # For distinguishing previous local tag vs arrived local tag.
+        # If two consecutive segments are in the same heading, the expected
+        # arriving side-center helper should normally remain the same.
+        # If the heading changes, helper arrival in START_CLUSTER is blocked
+        # until there is a clean "no helper visible" transition.
+        self.last_arrival_helper_id = None
+        self.last_arrival_heading = None
+        self.segment_heading = None
+        self.expected_straight_helper_id = None
+        self.all_helpers_cleared_once = False
+        self.expected_entry_helper_id = None
+        self.expected_exit_helper_id = None
+        self.segment_next_action = "UNKNOWN"
 
         self.append_log("Calibration reset")
         self.update_ui_state()
@@ -2025,7 +2231,7 @@ class AGVQtApp(QMainWindow):
         self.calibration_started = False
         self.waiting_for_manual_alignment = False
         self.current_tag = DOCK_TAG
-        self.current_heading = SOUTH
+        self.current_heading = NORTH
 
         self.append_log("Moving from docking Tag 0 to grid Tag 1. Rule: no single-helper arrival during docking; helpers remain OLD until full loss.")
         self.start_segment(DOCK_TAG, GRID_START_TAG)
@@ -2034,7 +2240,7 @@ class AGVQtApp(QMainWindow):
     def finish_calibration_at_tag1(self):
         self.stop_robot()
         self.current_tag = GRID_START_TAG
-        self.current_heading = SOUTH
+        self.current_heading = NORTH
         self.calibration_done = True
         self.calibrating_move_to_tag1 = False
         self.route_state = "IDLE"
@@ -2138,6 +2344,20 @@ class AGVQtApp(QMainWindow):
         self.expected_next_tag = None
         self.route_state = "IDLE"
         self.previous_helper_block_ids = set()
+
+        # For distinguishing previous local tag vs arrived local tag.
+        # If two consecutive segments are in the same heading, the expected
+        # arriving side-center helper should normally remain the same.
+        # If the heading changes, helper arrival in START_CLUSTER is blocked
+        # until there is a clean "no helper visible" transition.
+        self.last_arrival_helper_id = None
+        self.last_arrival_heading = None
+        self.segment_heading = None
+        self.expected_straight_helper_id = None
+        self.all_helpers_cleared_once = False
+        self.expected_entry_helper_id = None
+        self.expected_exit_helper_id = None
+        self.segment_next_action = "UNKNOWN"
         self.stop_robot()
         self.append_log("Mission stopped")
         self.update_ui_state()
