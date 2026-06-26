@@ -494,7 +494,7 @@ LOCAL_NUDGE_CENTER_Y_OK_PX = 30
 LOCAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
 LOCAL_NUDGE_TIMEOUT_SEC = 5.0
 
-# Accept local helper tags as arrival evidence; central tag is not required.
+# Accept local helper tags as arrival evidence where enabled; EAST mirrors WEST and uses them as correction-only.
 LOCAL_HELPER_SEEN_FRAMES_REQUIRED = 1
 
 # Local-center reached rule from ENTRY_SEQUENCE_BY_HEADING.
@@ -510,6 +510,13 @@ LOCAL_HELPER_SEEN_FRAMES_REQUIRED = 1
 #   507 -> CENTRAL   # 507 cannot confirm reached by itself
 #   508 -> 501       # 501 can confirm reached after 508
 ACCEPT_EXPECTED_LOCAL_CENTER_AS_REACHED = True
+
+# Extra gate for expected local-center reached.
+# Example EAST 508 -> 501:
+# 501 is valid, but it must be close to the camera center before Tag 12 is
+# considered reached/pass-through. This fixes early acceptance such as:
+#   helper=501 centerY=316.6px
+EXPECTED_LOCAL_CENTER_REACHED_Y_OK_PX = 90
 
 
 # Stronger correction tuning.
@@ -2293,22 +2300,49 @@ class AGVQtApp(QMainWindow):
         return False
 
 
-    def helper_can_confirm_reached_now(self, helper_id):
+    def helper_can_confirm_reached_now(self, helper_id, center_y_error_px=None):
         """
-        Confirm reached only from integer VALUES in ENTRY_SEQUENCE_BY_HEADING
-        after their entry helper created them as candidates.
+        Reached/pass-through decision.
 
-        Example EAST for target 12:
-            508 -> 501    => 501 can confirm reached.
-            506 -> 505    => 505 can confirm reached.
-            507 -> CENTRAL => 507 is correction only and cannot confirm reached.
+        WEST is the reference behavior:
+            entry side 502/503/504
+            center-side helper 503 -> CENTRAL
+            helper correction continues until the actual central target tag is
+            detected/reached.
+
+        EAST must mirror WEST:
+            entry side 506/507/508
+            center-side helper 507 -> CENTRAL
+            508 -> 501 and 506 -> 505 are valid sequence/correction evidence,
+            but for EAST they must not immediately become the next landmark.
+
+        Therefore, for EAST:
+            501/505 after 508/506 are correction-only.
+            The actual target tag, or the EAST center guide 507 leading to the
+            actual target tag, decides the reached/pass-through event.
         """
         helper_id = int(helper_id)
 
         if not ACCEPT_EXPECTED_LOCAL_CENTER_AS_REACHED:
             return False
 
-        return helper_id in set(getattr(self, "corner_single_arrival_candidates", set()))
+        # EAST mirrors the working WEST behavior:
+        # do not let the value helpers 501/505 end the segment.
+        # They can still be used for correction because
+        # helper_is_valid_sequence_center_now() remains true for candidates.
+        if self.segment_heading == EAST:
+            return False
+
+        if helper_id not in set(getattr(self, "corner_single_arrival_candidates", set())):
+            return False
+
+        if center_y_error_px is None:
+            return False
+
+        # If this constant exists in the file, use it. Otherwise fall back to
+        # the local pair gate used by the older stable build.
+        gate = globals().get("EXPECTED_LOCAL_CENTER_REACHED_Y_OK_PX", LOCAL_PAIR_CENTER_Y_OK_PX)
+        return abs(center_y_error_px) <= gate
 
     def remember_local_arrival_helper(self, helper_id):
         self.last_arrival_helper_id = int(helper_id)
@@ -2442,7 +2476,7 @@ class AGVQtApp(QMainWindow):
                     )
                     return None, None, ""
 
-                if ready and self.helper_can_confirm_reached_now(helper_id):
+                if ready and self.helper_can_confirm_reached_now(helper_id, center_y_error_px):
                     self.append_log(
                         f"EXPECTED LOCAL CENTER REACHED: target={self.travel_to_landmark} "
                         f"helper={helper_id} group={helper_group_name(helper_id)} "
@@ -2452,6 +2486,15 @@ class AGVQtApp(QMainWindow):
                     )
                     self.start_local_arrival(self.travel_to_landmark, helper_id)
                     return None, None, ""
+
+                if helper_id in set(getattr(self, "corner_single_arrival_candidates", set())) and center_y_error_px is not None:
+                    if abs(center_y_error_px) > EXPECTED_LOCAL_CENTER_REACHED_Y_OK_PX:
+                        self.append_log(
+                            f"EXPECTED LOCAL CENTER NOT READY: target={self.travel_to_landmark} "
+                            f"helper={helper_id} seq={self.helper_sequence_note(helper_id)} "
+                            f"centerY={center_y_error_px:.1f}px "
+                            f"need<={EXPECTED_LOCAL_CENTER_REACHED_Y_OK_PX}px. Correction continues."
+                        )
 
                 self.append_log(
                     f"HELPER PAIR CORRECTION ONLY: target={self.travel_to_landmark} "
@@ -2479,7 +2522,7 @@ class AGVQtApp(QMainWindow):
                         "SINGLE"
                     )
 
-                    if ready and self.helper_can_confirm_reached_now(single_helper):
+                    if ready and self.helper_can_confirm_reached_now(single_helper, center_y_error_px):
                         self.append_log(
                             f"EXPECTED SINGLE LOCAL CENTER REACHED: target={self.travel_to_landmark} "
                             f"helper={single_helper} reason={single_reason} "
@@ -2610,7 +2653,7 @@ class AGVQtApp(QMainWindow):
                         )
                         return None, None, ""
 
-                    if self.helper_can_confirm_reached_now(helper_id):
+                    if self.helper_can_confirm_reached_now(helper_id, center_y_error_px):
                         self.append_log(
                             f"SEARCH EXPECTED LOCAL CENTER REACHED: target={self.travel_to_landmark} "
                             f"helper={helper_id} evidence={evidence_type} "
@@ -2951,7 +2994,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: exact_table_local_center_east_xsign active")
+        self.append_log("BUILD: east_mirrors_west_entry_center active")
 
         self.active_path = list(self.path)
         self.path_index = 1
