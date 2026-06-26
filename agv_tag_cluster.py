@@ -855,6 +855,7 @@ class AGVQtApp(QMainWindow):
 
         # Serial state.
         self.ser = None
+        self.waiting_for_serial_response = False
         self.drive_left_pps = 0
         self.drive_right_pps = 0
         self.last_drive_mode = "STOP"
@@ -1167,13 +1168,23 @@ class AGVQtApp(QMainWindow):
 
         try:
             self.ser.write((cmd + "\n").encode())
+            try:
+                self.ser.flush()
+            except Exception:
+                pass
             self.append_log(f"ESP32 <= {cmd}")
         except Exception as e:
             self.append_log(f"Serial send failed: {e}")
 
     def read_esp32_available(self):
+        # Do not let the periodic control timer steal expected replies
+        # while wait_for_esp32_text() is waiting for OK IMU RECAL / OK TURN_DONE.
+        if self.waiting_for_serial_response:
+            return []
+
         if self.ser is None:
             return []
+
         lines = []
         try:
             while self.ser.in_waiting > 0:
@@ -1185,39 +1196,67 @@ class AGVQtApp(QMainWindow):
             self.append_log(f"Serial read failed: {e}")
         return lines
 
-    def wait_for_esp32_text(self, expected_text, timeout_sec=10.0):
+    def wait_for_esp32_text(self, expected_text, timeout_sec=20.0):
+        """
+        Wait for a specific ESP32 reply.
+
+        Important:
+        The normal 60 ms control timer also reads serial. During this wait,
+        pause that reader so it cannot consume the expected OK line first.
+        """
         if self.simulation_checkbox.isChecked():
             return True
+
         if self.ser is None:
             return False
 
+        self.waiting_for_serial_response = True
         start = time.time()
-        while time.time() - start < timeout_sec:
-            QApplication.processEvents()
-            try:
-                line = self.ser.readline().decode(errors="ignore").strip()
-            except Exception:
-                line = ""
+        found = False
 
-            if line:
-                self.append_log(f"ESP32: {line}")
-            if expected_text in line:
-                return True
-            time.sleep(0.03)
-        return False
+        try:
+            while time.time() - start < timeout_sec:
+                try:
+                    line = self.ser.readline().decode(errors="ignore").strip()
+                except Exception:
+                    line = ""
+
+                if line:
+                    self.append_log(f"ESP32: {line}")
+
+                    if expected_text in line:
+                        found = True
+                        break
+
+                    if line.startswith("ERR"):
+                        # Keep reading until timeout because ESP32 may print diagnostic
+                        # lines before the final result, but make the error visible.
+                        self.append_log(f"ESP32 error while waiting for {expected_text}: {line}")
+
+                # Keep UI alive without allowing the periodic serial reader to steal lines.
+                QApplication.processEvents()
+                time.sleep(0.03)
+
+        finally:
+            self.waiting_for_serial_response = False
+
+        return found
 
     def apply_esp32_tuning(self):
         """
         Send fixed ESP32 tuning values.
 
         Do not read hidden QSpinBox widgets here. In the compact UI those widgets
-        may be removed/garbage-collected, so reading them can crash with:
-        RuntimeError: wrapped C/C++ object of type QSpinBox has been deleted
+        may be removed/garbage-collected.
         """
         self.send_esp32(f"SET_BASE {DEFAULT_BASE_PPS}")
+        time.sleep(0.05)
         self.send_esp32(f"SET_IMU_MAX {DEFAULT_IMU_MAX_CORR}")
+        time.sleep(0.05)
         self.send_esp32(f"SET_IMU_KP {DEFAULT_IMU_KP:.1f}")
+        time.sleep(0.05)
         self.send_esp32(f"SET_RAMP {DEFAULT_ACCEL_PPS_PER_SEC} {DEFAULT_DECEL_PPS_PER_SEC}")
+        time.sleep(0.05)
 
     def send_velocity(self, left_pps, right_pps, force=False):
         now = time.time()
@@ -1666,7 +1705,7 @@ class AGVQtApp(QMainWindow):
 
             self.apply_esp32_tuning()
             self.send_esp32("IMU RECAL")
-            ok = self.wait_for_esp32_text("OK IMU RECAL", timeout_sec=10.0)
+            ok = self.wait_for_esp32_text("OK IMU RECAL", timeout_sec=20.0)
             if not ok:
                 QMessageBox.warning(self, "Calibration failed", "ESP32 did not confirm OK IMU RECAL")
                 self.append_log("Calibration failed: no OK IMU RECAL")
