@@ -58,7 +58,7 @@ arrival_nudge_start_time = 0.0
 ARRIVAL_NUDGE_PPS = 500
 ARRIVAL_NUDGE_CENTER_Y_OK_PX = 30
 ARRIVAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
-ARRIVAL_NUDGE_TIMEOUT_SEC = 3.0
+ARRIVAL_NUDGE_TIMEOUT_SEC = 4.0
 
 
 # =====================================================
@@ -123,6 +123,11 @@ CROSS_HELPERS = {501, 503, 505, 507}
 CORNER_HELPERS = {502, 504, 506, 508}
 
 CORRECTION_HELPER_PRIORITY = [501, 503, 505, 507]
+
+# For final Tag 9, prefer stopping at better side-center helpers.
+# In your observed Tag 9 approach, 503 is better than 505.
+FINAL_STOP_HELPER_PRIORITY = [503, 501, 507, 505]
+FINAL_HELPER_CENTER_OK_PX = 35
 
 
 # =====================================================
@@ -511,7 +516,7 @@ def helper_group_stop_allowed_for_target(target_landmark):
     Tag 6 and Tag 5 are action/turn landmarks.
     Tag 9 is final destination.
 
-    For these, only proper corner-side groups can cause nudge.
+    For these, only full corner-side groups can cause nudge.
     Single 501/503/505/507 must not cause stopping.
     """
 
@@ -530,23 +535,13 @@ def detect_target_helper_arrival_pattern(detections, target_landmark):
 
     Important:
     Single 501, 503, 505, or 507 is NOT enough.
-    A valid pattern must contain:
-      - the side-center helper, and
-      - at least one corner helper from that side group.
+    Pair such as 504+505 is also NOT enough.
 
-    Valid examples:
-      502 + 503       -> right side, nudge to 503
-      503 + 504       -> right side, nudge to 503
-      502 + 503 + 504 -> right side, nudge to 503
-
-      506 + 507       -> left side, nudge to 507
-      507 + 508       -> left side, nudge to 507
-
-      508 + 501       -> top side, nudge to 501
-      501 + 502       -> top side, nudge to 501
-
-      506 + 505       -> bottom side, nudge to 505
-      505 + 504       -> bottom side, nudge to 505
+    A valid pattern must contain all 3 helpers from one side group:
+      502,503,504 -> right side, nudge to 503
+      506,507,508 -> left side, nudge to 507
+      508,501,502 -> top side, nudge to 501
+      506,505,504 -> bottom side, nudge to 505
     """
 
     ids = visible_tag_ids(detections)
@@ -576,7 +571,10 @@ def detect_target_helper_arrival_pattern(detections, target_landmark):
         has_side_center = center_helper in ids
         has_corner = len(visible_in_group.intersection(CORNER_HELPERS)) > 0
 
-        if has_side_center and has_corner and visible_count >= 2:
+        # Stronger rule:
+        # Need all 3 tags from the side group.
+        # This prevents 504+505 from stopping too early.
+        if has_side_center and has_corner and visible_count >= 3:
             if visible_count > best_count:
                 best_count = visible_count
                 best_group_name = group_name
@@ -592,6 +590,27 @@ def detect_target_helper_arrival_pattern(detections, target_landmark):
         )
 
         return best_helper
+
+    return None
+
+
+def choose_final_stop_helper(detections, final_landmark):
+    """
+    For final Tag 9:
+    - central 9 is always best
+    - then prefer selected side-center helpers
+    - never stop at corner helpers
+    """
+
+    for tag in detections:
+        if tag.tag_id == final_landmark:
+            return tag
+
+    for helper_id in FINAL_STOP_HELPER_PRIORITY:
+        tag = find_tag_by_id(detections, helper_id)
+
+        if tag is not None:
+            return tag
 
     return None
 
@@ -702,16 +721,13 @@ def monitor_travel_progress(detections):
         USE_START   = still near start cluster, correct using start landmark
         USE_TARGET  = target cluster visible, but not yet confirmed
         ARRIVED     = central target landmark confirmed
-        NUDGE_xxx   = valid corner-side helper group detected
+        NUDGE_xxx   = valid full corner-side helper group detected
         NO_TAG      = no useful tag
 
     Critical rule:
         Single 501/503/505/507 does not stop the robot.
-        Those cross helpers are before/around the center and should be passed
-        if central tag can still become visible.
-
-        Corner-side groups can stop/nudge because they indicate the robot
-        may not be able to reach the central landmark from that approach.
+        Pair like 504+505 also does not stop the robot.
+        A full 3-tag side group is required for nudge.
     """
 
     global left_start_cluster
@@ -791,8 +807,8 @@ def monitor_travel_progress(detections):
 
         return "USE_TARGET"
 
-    # Valid corner-side pattern can trigger nudge.
-    # Single 501/503/505/507 does NOT trigger nudge.
+    # Valid full corner-side pattern can trigger nudge.
+    # Single 501/503/505/507 or pair 504+505 does NOT trigger nudge.
     preferred_helper = detect_target_helper_arrival_pattern(
         detections,
         travel_to_landmark
@@ -828,7 +844,7 @@ def start_arrival_nudge(landmark_id, preferred_helper_id, next_action):
     route_state = "ARRIVAL_NUDGE"
 
     print(
-        f"RPI: Target corner-side helper group reached for landmark {landmark_id}. "
+        f"RPI: Full corner-side helper group reached for landmark {landmark_id}. "
         f"Nudging toward helper {preferred_helper_id}."
     )
 
@@ -1213,7 +1229,8 @@ print("")
 print("Helper arrival rule:")
 print("  Tag 7 pass-through: never stop/nudge")
 print("  Single 501/503/505/507: do not stop, keep moving")
-print("  Corner-side group: nudge to 501/503/505/507")
+print("  Pair 504+505: do not stop, keep moving")
+print("  Full side group of 3 helpers: nudge to side-center helper")
 print("  Central target tag visible: reached")
 print("")
 print("Keys:")
@@ -1330,6 +1347,88 @@ try:
                 )
 
                 finish_arrival_nudge()
+
+            elif arrival_nudge_landmark == TAG_9:
+
+                final_helper = choose_final_stop_helper(
+                    detections,
+                    TAG_9
+                )
+
+                if final_helper is not None:
+
+                    y_err = float(final_helper.center[1] - CY)
+
+                    if abs(y_err) <= FINAL_HELPER_CENTER_OK_PX:
+
+                        stop_robot()
+                        route_state = "DONE"
+
+                        print(
+                            f"RPI: Final Tag 9 helper {final_helper.tag_id} centered. "
+                            f"Final destination reached."
+                        )
+
+                    else:
+
+                        left, right, y_err, centered = arrival_nudge_velocity(
+                            final_helper
+                        )
+
+                        send_velocity(left, right)
+
+                        print(
+                            f"FINAL_HELPER_NUDGE "
+                            f"helper={final_helper.tag_id} "
+                            f"yErr={y_err:.1f}px "
+                            f"L={left} "
+                            f"R={right}"
+                        )
+
+                else:
+
+                    helper_tag = find_tag_by_id(
+                        detections,
+                        arrival_nudge_helper_id
+                    )
+
+                    if helper_tag is None:
+                        helper_tag = choose_best_cluster_tag(
+                            detections,
+                            arrival_nudge_landmark
+                        )
+
+                    if helper_tag is None:
+
+                        stop_robot()
+                        print("RPI: Final nudge lost Tag 9 cluster.")
+
+                    else:
+
+                        left, right, y_err, centered = arrival_nudge_velocity(
+                            helper_tag
+                        )
+
+                        send_velocity(left, right)
+
+                        print(
+                            f"FINAL_FALLBACK_NUDGE "
+                            f"helper={helper_tag.tag_id} "
+                            f"targetHelper={arrival_nudge_helper_id} "
+                            f"yErr={y_err:.1f}px "
+                            f"L={left} "
+                            f"R={right}"
+                        )
+
+                if time.time() - arrival_nudge_start_time > ARRIVAL_NUDGE_TIMEOUT_SEC:
+
+                    stop_robot()
+                    route_state = "DONE"
+
+                    print(
+                        f"RPI: Final Tag 9 nudge timeout. "
+                        f"Final destination stopped as fallback."
+                    )
 
             else:
 
@@ -1678,7 +1777,7 @@ try:
         )
 
         cv2.imshow(
-            "AGV Cluster Route With Correct Helper Priority",
+            "AGV Cluster Route Final Helper Fix",
             frame
         )
 
