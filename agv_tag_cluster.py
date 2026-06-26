@@ -44,14 +44,29 @@ travel_segment_start_time = 0.0
 START_CLUSTER_LOST_FRAMES_REQUIRED = 4
 TARGET_CLUSTER_SEEN_FRAMES_REQUIRED = 2
 
-# Important:
-# helper 501/503/505/507/502/504/506/508 visible alone is NOT enough.
-# The estimated central landmark must be close.
+# Helper visible alone is not always enough.
+# The estimated target center must be close, unless a helper pattern is detected.
 TARGET_CENTER_Y_REACHED_PX = 35
 TARGET_CENTER_X_REACHED_M = 0.018
 TARGET_HELPER_REACHED_FRAMES_REQUIRED = 3
 
 MIN_TRAVEL_TIME_BEFORE_TARGET_SEC = 1.0
+
+
+# =====================================================
+# TARGET ARRIVAL NUDGE
+# =====================================================
+
+arrival_nudge_landmark = None
+arrival_nudge_next_action = None
+arrival_nudge_helper_id = None
+arrival_nudge_good_count = 0
+arrival_nudge_start_time = 0.0
+
+ARRIVAL_NUDGE_PPS = 500
+ARRIVAL_NUDGE_CENTER_Y_OK_PX = 30
+ARRIVAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
+ARRIVAL_NUDGE_TIMEOUT_SEC = 3.0
 
 
 # =====================================================
@@ -78,7 +93,7 @@ VISION_MAX_PPS = 5200
 
 TURN_TAG_FB_PPS = 550
 
-# If pressing c moves front/back wrong way, change this to -1
+# If pressing c or arrival nudge moves front/back wrong way, change this to -1
 FB_SIGN = 1
 
 
@@ -477,6 +492,76 @@ def any_cluster_visible(detections, central_tag_id):
     return choose_best_cluster_tag(detections, central_tag_id) is not None
 
 
+def visible_tag_ids(detections):
+    ids = set()
+
+    for tag in detections:
+        ids.add(tag.tag_id)
+
+    return ids
+
+
+def find_tag_by_id(detections, tag_id):
+    for tag in detections:
+        if tag.tag_id == tag_id:
+            return tag
+
+    return None
+
+
+def detect_target_helper_arrival_pattern(detections, target_landmark):
+    """
+    Detects if the robot is clearly inside the next landmark helper cluster.
+
+    Returns preferred cross helper:
+        503 for right side group 502/503/504
+        507 for left side group 506/507/508
+        501 for top side group 508/501/502
+        505 for bottom side group 506/505/504
+    """
+
+    ids = visible_tag_ids(detections)
+
+    if target_landmark in ids:
+        return None
+
+    right_count = len(ids.intersection({502, 503, 504}))
+    left_count = len(ids.intersection({506, 507, 508}))
+    top_count = len(ids.intersection({508, 501, 502}))
+    bottom_count = len(ids.intersection({506, 505, 504}))
+
+    groups = [
+        ("RIGHT", right_count, 503),
+        ("LEFT", left_count, 507),
+        ("TOP", top_count, 501),
+        ("BOTTOM", bottom_count, 505),
+    ]
+
+    best_group = None
+    best_count = 0
+    best_helper = None
+
+    for group_name, count, helper_id in groups:
+        if count > best_count:
+            best_count = count
+            best_group = group_name
+            best_helper = helper_id
+
+    # Require at least two helpers from one side/corner group.
+    if best_count >= 2:
+        print(
+            f"TARGET_HELPER_PATTERN "
+            f"target={target_landmark} "
+            f"group={best_group} "
+            f"count={best_count} "
+            f"preferredHelper={best_helper}"
+        )
+
+        return best_helper
+
+    return None
+
+
 def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
     """
     Converts visible central/helper tag pose into estimated central landmark pose.
@@ -585,10 +670,8 @@ def monitor_travel_progress(detections):
         USE_START   = still near start cluster, correct using start landmark
         USE_TARGET  = target cluster visible, but not yet centered/reached
         ARRIVED     = target landmark confirmed
+        NUDGE_xxx   = helper pattern detected, enter arrival nudge
         NO_TAG      = no useful tag
-
-    Helper visible alone is not enough for arrival.
-    The estimated central target landmark must be close.
     """
 
     global left_start_cluster
@@ -615,7 +698,7 @@ def monitor_travel_progress(detections):
             return "USE_TARGET"
 
     # -------------------------------------------------
-    # Before leaving start cluster:
+    # Before leaving start:
     # helpers belong to start landmark.
     # -------------------------------------------------
 
@@ -651,7 +734,6 @@ def monitor_travel_progress(detections):
     # -------------------------------------------------
     # After leaving start:
     # helpers are interpreted as target helpers.
-    # But do not stop just because 501/503/505/507 is visible.
     # -------------------------------------------------
 
     target_tag = choose_best_cluster_tag(
@@ -672,6 +754,20 @@ def monitor_travel_progress(detections):
 
         return "USE_TARGET"
 
+    # Special helper-pattern arrival:
+    # 502/503/504 -> nudge toward 503
+    # 506/507/508 -> nudge toward 507
+    # 508/501/502 -> nudge toward 501
+    # 506/505/504 -> nudge toward 505
+    preferred_helper = detect_target_helper_arrival_pattern(
+        detections,
+        travel_to_landmark
+    )
+
+    if preferred_helper is not None:
+        return f"NUDGE_{preferred_helper}"
+
+    # Normal helper-center arrival check.
     pose = get_landmark_pose_from_cluster_tag(
         target_tag,
         travel_to_landmark
@@ -714,6 +810,77 @@ def monitor_travel_progress(detections):
         return "ARRIVED"
 
     return "USE_TARGET"
+
+
+# =====================================================
+# ARRIVAL NUDGE
+# =====================================================
+
+def start_arrival_nudge(landmark_id, preferred_helper_id, next_action):
+    global route_state
+    global arrival_nudge_landmark
+    global arrival_nudge_next_action
+    global arrival_nudge_helper_id
+    global arrival_nudge_good_count
+    global arrival_nudge_start_time
+
+    stop_robot()
+
+    arrival_nudge_landmark = landmark_id
+    arrival_nudge_helper_id = preferred_helper_id
+    arrival_nudge_next_action = next_action
+    arrival_nudge_good_count = 0
+    arrival_nudge_start_time = time.time()
+
+    route_state = "ARRIVAL_NUDGE"
+
+    print(
+        f"RPI: Target helper pattern reached for landmark {landmark_id}. "
+        f"Nudging toward helper {preferred_helper_id}."
+    )
+
+
+def finish_arrival_nudge():
+    global route_state
+
+    stop_robot()
+
+    if arrival_nudge_next_action == "TURN":
+        start_turn_wait(
+            arrival_nudge_landmark,
+            next_move_state_after_turn
+        )
+
+    elif arrival_nudge_next_action == "DONE":
+        route_state = "DONE"
+        print("RPI: Final destination reached. Robot stopped.")
+
+    elif arrival_nudge_next_action == "CONTINUE_TO_6":
+        start_travel_segment(
+            TAG_7,
+            TAG_6,
+            "MOVE_TO_6"
+        )
+        lock_heading_go()
+
+
+def arrival_nudge_velocity(tag):
+    """
+    Move slowly front/back to center the selected helper tag in image Y.
+    If this moves wrong direction, flip FB_SIGN.
+    """
+
+    y_err = float(tag.center[1] - CY)
+
+    if abs(y_err) <= ARRIVAL_NUDGE_CENTER_Y_OK_PX:
+        return 0, 0, y_err, True
+
+    if y_err > 0:
+        fb = ARRIVAL_NUDGE_PPS * FB_SIGN
+    else:
+        fb = -ARRIVAL_NUDGE_PPS * FB_SIGN
+
+    return fb, fb, y_err, False
 
 
 # =====================================================
@@ -886,22 +1053,28 @@ def start_turn_wait(landmark_id, next_state_after_turn):
 
     route_state = "WAIT_TURN_TAG_CORRECT_COMMAND"
 
-    print(f"RPI: Landmark {landmark_id} cluster reached. Robot stopped.")
+    print(f"RPI: Landmark {landmark_id} reached. Robot stopped.")
     print(f"RPI: Press 'c' to correct Tag {landmark_id} cluster.")
-    print(f"RPI: Press 't' after correction to turn {TURN_DEG_BY_LANDMARK[landmark_id]:.1f} degrees.")
+    print(f"RPI: Press 't' after correction to turn {TURN_DEG_BY_LANDMARK.get(landmark_id, 90.0):.1f} degrees.")
 
 
 def choose_travel_landmark(detections):
     global route_state
+    global next_move_state_after_turn
 
     progress = monitor_travel_progress(detections)
 
     if route_state == "MOVE_TO_7":
 
         if progress == "ARRIVED":
-            print("RPI: Landmark 7 cluster reached.")
+            print("RPI: Landmark 7 reached.")
             start_travel_segment(TAG_7, TAG_6, "MOVE_TO_6")
             return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
+
+        if progress.startswith("NUDGE_"):
+            helper_id = int(progress.split("_")[1])
+            start_arrival_nudge(TAG_7, helper_id, "CONTINUE_TO_6")
+            return None, None, ""
 
         if progress == "USE_START":
             return choose_best_cluster_tag(detections, START_TAG), START_TAG, "TAG11"
@@ -915,6 +1088,12 @@ def choose_travel_landmark(detections):
 
         if progress == "ARRIVED":
             start_turn_wait(TAG_6, "MOVE_TO_5")
+            return None, None, ""
+
+        if progress.startswith("NUDGE_"):
+            helper_id = int(progress.split("_")[1])
+            next_move_state_after_turn = "MOVE_TO_5"
+            start_arrival_nudge(TAG_6, helper_id, "TURN")
             return None, None, ""
 
         if progress == "USE_START":
@@ -931,6 +1110,12 @@ def choose_travel_landmark(detections):
             start_turn_wait(TAG_5, "MOVE_TO_9")
             return None, None, ""
 
+        if progress.startswith("NUDGE_"):
+            helper_id = int(progress.split("_")[1])
+            next_move_state_after_turn = "MOVE_TO_9"
+            start_arrival_nudge(TAG_5, helper_id, "TURN")
+            return None, None, ""
+
         if progress == "USE_START":
             return choose_best_cluster_tag(detections, TAG_6), TAG_6, "TAG6"
 
@@ -945,9 +1130,14 @@ def choose_travel_landmark(detections):
             stop_robot()
             route_state = "DONE"
 
-            print("RPI: Landmark 9 cluster reached.")
+            print("RPI: Landmark 9 reached.")
             print("RPI: Final destination reached. Robot stopped.")
 
+            return None, None, ""
+
+        if progress.startswith("NUDGE_"):
+            helper_id = int(progress.split("_")[1])
+            start_arrival_nudge(TAG_9, helper_id, "DONE")
             return None, None, ""
 
         if progress == "USE_START":
@@ -1038,8 +1228,8 @@ print("  5 -> 9 and stop")
 print("")
 print("Helper arrival rule:")
 print("  central target tag visible -> reached")
+print("  helper pattern visible -> arrival nudge to 501/503/505/507")
 print("  helper visible only -> estimate central target position")
-print("  stop only when estimated central target is near image center")
 print("")
 print("Keys:")
 print("  s = start route")
@@ -1138,6 +1328,93 @@ try:
             else:
 
                 lock_heading_go()
+
+        elif route_state == "ARRIVAL_NUDGE":
+
+            central_tag = find_tag_by_id(
+                detections,
+                arrival_nudge_landmark
+            )
+
+            if central_tag is not None:
+
+                stop_robot()
+
+                print(
+                    f"RPI: Central Tag {arrival_nudge_landmark} became visible during nudge."
+                )
+
+                finish_arrival_nudge()
+
+            else:
+
+                helper_tag = find_tag_by_id(
+                    detections,
+                    arrival_nudge_helper_id
+                )
+
+                if helper_tag is None:
+                    helper_tag = choose_best_cluster_tag(
+                        detections,
+                        arrival_nudge_landmark
+                    )
+
+                if helper_tag is None:
+
+                    stop_robot()
+
+                    print(
+                        f"RPI: Arrival nudge lost landmark {arrival_nudge_landmark} cluster."
+                    )
+
+                    finish_arrival_nudge()
+
+                else:
+
+                    left, right, y_err, centered = arrival_nudge_velocity(
+                        helper_tag
+                    )
+
+                    if centered:
+
+                        arrival_nudge_good_count += 1
+                        stop_robot()
+
+                        print(
+                            f"ARRIVAL_NUDGE_GOOD "
+                            f"landmark={arrival_nudge_landmark} "
+                            f"helper={helper_tag.tag_id} "
+                            f"yErr={y_err:.1f}px "
+                            f"good={arrival_nudge_good_count}/{ARRIVAL_NUDGE_GOOD_FRAMES_REQUIRED}"
+                        )
+
+                        if arrival_nudge_good_count >= ARRIVAL_NUDGE_GOOD_FRAMES_REQUIRED:
+                            finish_arrival_nudge()
+
+                    else:
+
+                        arrival_nudge_good_count = 0
+                        send_velocity(left, right)
+
+                        print(
+                            f"ARRIVAL_NUDGE "
+                            f"landmark={arrival_nudge_landmark} "
+                            f"helper={helper_tag.tag_id} "
+                            f"targetHelper={arrival_nudge_helper_id} "
+                            f"yErr={y_err:.1f}px "
+                            f"L={left} "
+                            f"R={right}"
+                        )
+
+                if time.time() - arrival_nudge_start_time > ARRIVAL_NUDGE_TIMEOUT_SEC:
+
+                    stop_robot()
+
+                    print(
+                        f"RPI: Arrival nudge timeout for landmark {arrival_nudge_landmark}."
+                    )
+
+                    finish_arrival_nudge()
 
         elif route_state == "WAIT_TURN_TAG_CORRECT_COMMAND":
 
@@ -1377,7 +1654,7 @@ try:
 
         cv2.putText(
             frame,
-            f"Drive: {last_drive_mode} L:{drive_left_pps} R:{drive_right_pps}",
+            f"Nudge: {arrival_nudge_landmark}->{arrival_nudge_helper_id}",
             (40, 170),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1387,7 +1664,7 @@ try:
 
         cv2.putText(
             frame,
-            f"Visible: {visible_ids}",
+            f"Drive: {last_drive_mode} L:{drive_left_pps} R:{drive_right_pps}",
             (40, 210),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1397,7 +1674,7 @@ try:
 
         cv2.putText(
             frame,
-            f"Lost:{start_cluster_lost_count} Seen:{target_cluster_seen_count} HelperGood:{target_helper_reached_count}",
+            f"Visible: {visible_ids}",
             (40, 250),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1405,8 +1682,18 @@ try:
             2
         )
 
+        cv2.putText(
+            frame,
+            f"Lost:{start_cluster_lost_count} Seen:{target_cluster_seen_count} HelperGood:{target_helper_reached_count}",
+            (40, 290),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2
+        )
+
         cv2.imshow(
-            "AGV Cluster Route With Helper Center Arrival",
+            "AGV Cluster Route With Arrival Nudge",
             frame
         )
 
