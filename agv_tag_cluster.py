@@ -34,7 +34,6 @@ PASS_THROUGH_LANDMARKS = {TAG_7}
 
 route_state = "WAIT_START"
 
-route_index = 0
 travel_from_landmark = None
 travel_to_landmark = None
 
@@ -47,11 +46,10 @@ turn_landmark_id = None
 
 segment_phase = "START_CLUSTER"
 cluster_lost_count = 0
+target_central_seen_count = 0
 
 CLUSTER_LOST_FRAMES_REQUIRED = 5
 TARGET_CENTRAL_SEEN_FRAMES_REQUIRED = 2
-
-target_central_seen_count = 0
 
 
 # =====================================================
@@ -406,15 +404,10 @@ def any_cluster_visible_now(detections, central_tag_id):
     return any_helper_visible(detections)
 
 
-def is_cluster_tag(tag_id, central_tag_id):
-    return tag_id == central_tag_id or tag_id in HELPER_IDS
-
-
 def choose_best_cluster_tag(detections, central_tag_id):
     """
-    Important:
-    This function assumes the route state already tells us which landmark
-    the helper tags belong to.
+    This function assumes the current state already knows
+    which landmark the helper tags belong to.
     """
 
     central = find_tag(detections, central_tag_id)
@@ -472,6 +465,8 @@ def detect_side_pair(detections, target_landmark):
     """
     Called only after the old cluster has completely disappeared.
 
+    Tag 7 is pass-through, so side-pair local arrival is disabled for Tag 7.
+
     Single 501/503/505/507 is not enough.
     Side-center + adjacent corner is enough.
 
@@ -481,7 +476,7 @@ def detect_side_pair(detections, target_landmark):
     506 + 505 or 505 + 504 -> 505
     """
 
-    if target_landmark == TAG_7:
+    if target_landmark in PASS_THROUGH_LANDMARKS:
         return None
 
     ids = visible_ids(detections)
@@ -743,22 +738,16 @@ def next_route_after(tag_id):
 
 
 def handle_landmark_arrival(landmark_id):
+    """
+    Turn and final landmarks stop.
+    Pass-through landmarks are handled separately before this function is called.
+    """
+
     global route_state
     global turn_landmark_id
 
     stop_robot()
     reset_correction_filter()
-
-    if landmark_id in PASS_THROUGH_LANDMARKS:
-
-        next_tag = next_route_after(landmark_id)
-
-        if next_tag is not None:
-            print(f"RPI: Pass-through landmark {landmark_id}. Continuing to {next_tag}.")
-            start_segment(landmark_id, next_tag)
-            lock_heading_go()
-
-        return
 
     if landmark_id in TURN_LANDMARKS:
 
@@ -799,6 +788,31 @@ def start_local_arrival(landmark_id, helper_id):
     )
 
 
+def pass_through_to_next(current_tag, visible_tag):
+    """
+    Switch segment without stopping.
+    Return the visible pass-through tag so the same frame still sends VISION velocity.
+    This prevents the visible jerk at Tag 7.
+    """
+
+    next_tag = next_route_after(current_tag)
+
+    if next_tag is None:
+        return None, None, ""
+
+    print(
+        f"RPI: Pass-through landmark {current_tag}. "
+        f"Switching to {current_tag}->{next_tag} without stopping."
+    )
+
+    start_segment(
+        current_tag,
+        next_tag
+    )
+
+    return visible_tag, current_tag, f"TAG{current_tag}"
+
+
 # =====================================================
 # MOVE STATE LOGIC
 # =====================================================
@@ -808,13 +822,26 @@ def choose_move_correction(detections):
     global cluster_lost_count
     global target_central_seen_count
 
-    central_target = find_tag(detections, travel_to_landmark)
+    central_target = find_tag(
+        detections,
+        travel_to_landmark
+    )
 
     if central_target is not None:
         target_central_seen_count += 1
 
         if target_central_seen_count >= TARGET_CENTRAL_SEEN_FRAMES_REQUIRED:
-            handle_landmark_arrival(travel_to_landmark)
+
+            if travel_to_landmark in PASS_THROUGH_LANDMARKS:
+                return pass_through_to_next(
+                    travel_to_landmark,
+                    central_target
+                )
+
+            handle_landmark_arrival(
+                travel_to_landmark
+            )
+
             return None, None, ""
 
         return central_target, travel_to_landmark, f"TAG{travel_to_landmark}"
@@ -940,10 +967,10 @@ def draw_tags(frame, detections):
 print("Waiting for docking Tag 11...")
 print("Press 's' when Tag 11 is visible and robot is aligned.")
 print("")
-print("New logic:")
+print("Current logic:")
 print("  Helpers are old landmark helpers until all helpers disappear.")
 print("  After full cluster loss, helpers can belong to target landmark.")
-print("  Tag 7 is pass-through.")
+print("  Tag 7 is pass-through with no stop.")
 print("  Tag 6 and Tag 5 are turn landmarks.")
 print("  Tag 9 is final.")
 print("")
@@ -1050,8 +1077,13 @@ try:
 
             if central is not None:
 
-                print(f"RPI: Central tag {local_arrival_landmark} became visible during local arrival.")
-                handle_landmark_arrival(local_arrival_landmark)
+                print(
+                    f"RPI: Central tag {local_arrival_landmark} became visible during local arrival."
+                )
+
+                handle_landmark_arrival(
+                    local_arrival_landmark
+                )
 
             else:
 
@@ -1069,7 +1101,9 @@ try:
                 if helper is None:
 
                     print("RPI: Local arrival tag lost. Stopping as reached.")
-                    handle_landmark_arrival(local_arrival_landmark)
+                    handle_landmark_arrival(
+                        local_arrival_landmark
+                    )
 
                 else:
 
@@ -1095,7 +1129,9 @@ try:
                         )
 
                         if local_arrival_good_count >= LOCAL_NUDGE_GOOD_FRAMES_REQUIRED:
-                            handle_landmark_arrival(local_arrival_landmark)
+                            handle_landmark_arrival(
+                                local_arrival_landmark
+                            )
 
                     else:
 
@@ -1122,7 +1158,9 @@ try:
                 if time.time() - local_arrival_start_time > LOCAL_NUDGE_TIMEOUT_SEC:
 
                     print("RPI: Local arrival timeout. Stopping as reached.")
-                    handle_landmark_arrival(local_arrival_landmark)
+                    handle_landmark_arrival(
+                        local_arrival_landmark
+                    )
 
         elif route_state == "WAIT_TURN_TAG_CORRECT_COMMAND":
 
@@ -1210,7 +1248,9 @@ try:
 
                     print(f"RPI: Turn at Tag {turn_landmark_id} complete.")
 
-                    next_tag = next_route_after(turn_landmark_id)
+                    next_tag = next_route_after(
+                        turn_landmark_id
+                    )
 
                     if next_tag is not None:
                         start_segment(
@@ -1308,7 +1348,7 @@ try:
         )
 
         cv2.imshow(
-            "AGV Minimal Route Logic",
+            "AGV Minimal Route Logic - Smooth Pass Through",
             frame
         )
 
