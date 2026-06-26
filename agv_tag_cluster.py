@@ -389,6 +389,11 @@ ENTRY_CENTER_BY_HEADING_STRICT = {
 ENTRY_SEQUENCE_BY_HEADING = {
     # User-confirmed physical sequence.
     #
+    # Meaning:
+    #   key helper  -> first helper seen at entry side
+    #   value int   -> expected next helper / center helper
+    #   "CENTRAL"  -> next expected object is the actual central landmark tag
+    #
     # Helpers are correction / sequence evidence only.
     # The landmark is reached only when the central target tag is visible.
     WEST: {
@@ -417,6 +422,8 @@ ENTRY_SEQUENCE_BY_HEADING = {
 }
 
 CORNER_TO_NEXT_CENTER_BY_HEADING = {
+    # Only helper -> helper entries from ENTRY_SEQUENCE_BY_HEADING.
+    # Do not include "CENTRAL" entries here.
     WEST: {
         502: {501},
         504: {505},
@@ -434,6 +441,9 @@ CORNER_TO_NEXT_CENTER_BY_HEADING = {
         502: {503},
     },
 }
+# Valid helper centers for correction / sequence.
+# These are NOT final arrival points.
+# Final reached/pass-through is confirmed only by the central target tag.
 # Valid helper centers for correction / sequence.
 # These are NOT final arrival points.
 # Final reached/pass-through is confirmed only by the central target tag.
@@ -1391,8 +1401,6 @@ class AGVQtApp(QMainWindow):
         )
 
 
-
-
     # -------------------------
     # Camera
     # -------------------------
@@ -2177,31 +2185,79 @@ class AGVQtApp(QMainWindow):
         return None
 
     def helper_sequence_note(self, helper_id):
+        """
+        Explain the role of a helper using ENTRY_SEQUENCE_BY_HEADING.
+
+        Important:
+        In the table, some helpers are KEYS and some helpers are VALUES.
+
+        Example EAST:
+            508 -> 501
+
+        Here 501 is valid after 508, even though 501 is not a key in EAST.
+        Therefore 501 must not be logged as just "no_sequence" when it has
+        already been created as an expected sequence candidate.
+        """
+        helper_id = int(helper_id)
         seq = ENTRY_SEQUENCE_BY_HEADING.get(self.segment_heading, {})
-        nxt = seq.get(int(helper_id), None)
 
-        if nxt is None:
-            return "no_sequence"
-
+        # Case 1: helper is an entry helper key.
+        nxt = seq.get(helper_id, None)
         if nxt == "CENTRAL":
-            return f"helper_{helper_id}_expect_central_tag_{self.travel_to_landmark}"
+            return f"entry_helper_{helper_id}_expect_central_tag_{self.travel_to_landmark}"
+        if nxt is not None:
+            return f"entry_helper_{helper_id}_expect_helper_{nxt}"
 
-        return f"helper_{helper_id}_expect_helper_{nxt}"
+        # Case 2: helper is an expected value from a previous entry helper.
+        creators = []
+        for entry_id, expected in seq.items():
+            if isinstance(expected, int) and int(expected) == helper_id:
+                creators.append(int(entry_id))
+
+        if helper_id in set(getattr(self, "corner_single_arrival_candidates", set())):
+            if creators:
+                return (
+                    f"expected_helper_{helper_id}_valid_after_entry_"
+                    + ",".join(str(x) for x in sorted(creators))
+                    + f"_toward_central_tag_{self.travel_to_landmark}"
+                )
+            return f"expected_helper_{helper_id}_valid_candidate_toward_central_tag_{self.travel_to_landmark}"
+
+        if creators:
+            return (
+                f"expected_helper_{helper_id}_but_waiting_for_entry_"
+                + ",".join(str(x) for x in sorted(creators))
+            )
+
+        return "not_in_entry_sequence_for_this_heading"
 
     def helper_expects_central_now(self, helper_id):
         seq = ENTRY_SEQUENCE_BY_HEADING.get(self.segment_heading, {})
         return seq.get(int(helper_id), None) == "CENTRAL"
 
+    def helper_is_expected_value_for_heading(self, helper_id):
+        helper_id = int(helper_id)
+        seq = ENTRY_SEQUENCE_BY_HEADING.get(self.segment_heading, {})
+        for expected in seq.values():
+            if isinstance(expected, int) and int(expected) == helper_id:
+                return True
+        return False
+
     def helper_is_valid_sequence_center_now(self, helper_id):
         helper_id = int(helper_id)
 
         # Direct center-side helper for this heading is always allowed.
+        # Example EAST: 507 -> CENTRAL.
         if self.helper_expects_central_now(helper_id):
             return True
 
-        # Other helper centers are allowed only if a previous entry helper
-        # created them as a sequence candidate.
-        return helper_id in set(getattr(self, "corner_single_arrival_candidates", set()))
+        # Expected helper values are valid only after the corresponding entry
+        # helper has created them as a candidate.
+        # Example EAST: 508 -> 501, so 501 is valid after 508 was seen.
+        if helper_id in set(getattr(self, "corner_single_arrival_candidates", set())):
+            return True
+
+        return False
 
     def remember_local_arrival_helper(self, helper_id):
         self.last_arrival_helper_id = int(helper_id)
@@ -2810,7 +2866,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: x_only_exact_user_sequence_gated active")
+        self.append_log("BUILD: exact_table_expected_helper_logic active")
 
         self.active_path = list(self.path)
         self.path_index = 1
