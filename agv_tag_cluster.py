@@ -58,7 +58,7 @@ arrival_nudge_start_time = 0.0
 ARRIVAL_NUDGE_PPS = 500
 ARRIVAL_NUDGE_CENTER_Y_OK_PX = 30
 ARRIVAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
-ARRIVAL_NUDGE_TIMEOUT_SEC = 4.0
+ARRIVAL_NUDGE_TIMEOUT_SEC = 5.0
 
 
 # =====================================================
@@ -516,8 +516,8 @@ def helper_group_stop_allowed_for_target(target_landmark):
     Tag 6 and Tag 5 are action/turn landmarks.
     Tag 9 is final destination.
 
-    For these, only full corner-side groups can cause nudge.
     Single 501/503/505/507 must not cause stopping.
+    Side-center + adjacent corner can cause nudge.
     """
 
     if target_landmark == TAG_7:
@@ -533,15 +533,16 @@ def detect_target_helper_arrival_pattern(detections, target_landmark):
     """
     Detects side/corner group of target cluster.
 
-    Important:
     Single 501, 503, 505, or 507 is NOT enough.
-    Pair such as 504+505 is also NOT enough.
 
-    A valid pattern must contain all 3 helpers from one side group:
-      502,503,504 -> right side, nudge to 503
-      506,507,508 -> left side, nudge to 507
-      508,501,502 -> top side, nudge to 501
-      506,505,504 -> bottom side, nudge to 505
+    But a side-center helper plus one adjacent corner helper IS enough:
+      502 + 503 or 503 + 504 -> right side, nudge to 503
+      506 + 507 or 507 + 508 -> left side, nudge to 507
+      508 + 501 or 501 + 502 -> top side, nudge to 501
+      506 + 505 or 505 + 504 -> bottom side, nudge to 505
+
+    This prevents missing Tag 6/5 when all three side tags are not detected
+    in exactly the same frame.
     """
 
     ids = visible_tag_ids(detections)
@@ -553,28 +554,27 @@ def detect_target_helper_arrival_pattern(detections, target_landmark):
         return None
 
     side_groups = [
-        ("RIGHT", {502, 503, 504}, 503),
-        ("LEFT", {506, 507, 508}, 507),
-        ("TOP", {508, 501, 502}, 501),
-        ("BOTTOM", {506, 505, 504}, 505),
+        ("RIGHT",  {502, 503, 504}, 503, {502, 504}),
+        ("LEFT",   {506, 507, 508}, 507, {506, 508}),
+        ("TOP",    {508, 501, 502}, 501, {508, 502}),
+        ("BOTTOM", {506, 505, 504}, 505, {506, 504}),
     ]
 
     best_group_name = None
     best_helper = None
     best_count = 0
 
-    for group_name, group_ids, center_helper in side_groups:
+    for group_name, group_ids, center_helper, corner_ids in side_groups:
 
         visible_in_group = ids.intersection(group_ids)
         visible_count = len(visible_in_group)
 
         has_side_center = center_helper in ids
-        has_corner = len(visible_in_group.intersection(CORNER_HELPERS)) > 0
+        has_adjacent_corner = len(ids.intersection(corner_ids)) > 0
 
-        # Stronger rule:
-        # Need all 3 tags from the side group.
-        # This prevents 504+505 from stopping too early.
-        if has_side_center and has_corner and visible_count >= 3:
+        # Single center helper alone is not enough.
+        # Center helper + one adjacent corner is enough.
+        if has_side_center and has_adjacent_corner and visible_count >= 2:
             if visible_count > best_count:
                 best_count = visible_count
                 best_group_name = group_name
@@ -721,13 +721,12 @@ def monitor_travel_progress(detections):
         USE_START   = still near start cluster, correct using start landmark
         USE_TARGET  = target cluster visible, but not yet confirmed
         ARRIVED     = central target landmark confirmed
-        NUDGE_xxx   = valid full corner-side helper group detected
+        NUDGE_xxx   = valid side-center + adjacent corner group detected
         NO_TAG      = no useful tag
 
     Critical rule:
         Single 501/503/505/507 does not stop the robot.
-        Pair like 504+505 also does not stop the robot.
-        A full 3-tag side group is required for nudge.
+        Side-center + adjacent corner is enough to nudge.
     """
 
     global left_start_cluster
@@ -807,8 +806,6 @@ def monitor_travel_progress(detections):
 
         return "USE_TARGET"
 
-    # Valid full corner-side pattern can trigger nudge.
-    # Single 501/503/505/507 or pair 504+505 does NOT trigger nudge.
     preferred_helper = detect_target_helper_arrival_pattern(
         detections,
         travel_to_landmark
@@ -844,7 +841,7 @@ def start_arrival_nudge(landmark_id, preferred_helper_id, next_action):
     route_state = "ARRIVAL_NUDGE"
 
     print(
-        f"RPI: Full corner-side helper group reached for landmark {landmark_id}. "
+        f"RPI: Side helper group reached for landmark {landmark_id}. "
         f"Nudging toward helper {preferred_helper_id}."
     )
 
@@ -1229,8 +1226,7 @@ print("")
 print("Helper arrival rule:")
 print("  Tag 7 pass-through: never stop/nudge")
 print("  Single 501/503/505/507: do not stop, keep moving")
-print("  Pair 504+505: do not stop, keep moving")
-print("  Full side group of 3 helpers: nudge to side-center helper")
+print("  Side-center + adjacent corner: nudge to side-center helper")
 print("  Central target tag visible: reached")
 print("")
 print("Keys:")
@@ -1777,7 +1773,7 @@ try:
         )
 
         cv2.imshow(
-            "AGV Cluster Route Final Helper Fix",
+            "AGV Cluster Route Side Pair Nudge",
             frame
         )
 
