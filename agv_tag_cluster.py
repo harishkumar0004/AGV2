@@ -21,29 +21,15 @@ TAG_6 = 6
 TAG_5 = 5
 TAG_9 = 9
 
-# Main route:
-# 11 -> 7 -> 6 -> turn -> 5 -> turn -> 9
 route_state = "WAIT_START"
 
-# Current turn landmark waiting/correcting/turning
 turn_landmark_id = None
-
-# After turning at this landmark, move to this target
 next_move_state_after_turn = None
 
 
 # =====================================================
 # TRAVEL SEGMENT TRACKING
 # =====================================================
-# Because helper IDs 501-508 are reused at every landmark,
-# the code must know whether the robot is still near the old landmark
-# or has already left it.
-#
-# During A -> B:
-#   before leaving A:
-#       helper 501 means A helper
-#   after leaving A:
-#       helper 501 means B helper
 
 travel_from_landmark = None
 travel_to_landmark = None
@@ -51,15 +37,20 @@ travel_to_landmark = None
 left_start_cluster = False
 start_cluster_lost_count = 0
 target_cluster_seen_count = 0
+target_helper_reached_count = 0
+
 travel_segment_start_time = 0.0
 
-# Lost central start tag for this many frames before assuming we left old landmark.
 START_CLUSTER_LOST_FRAMES_REQUIRED = 4
-
-# See target cluster helper/center for this many frames before accepting arrival.
 TARGET_CLUSTER_SEEN_FRAMES_REQUIRED = 2
 
-# Prevent immediately treating old helpers as target helpers just after starting movement.
+# Important:
+# helper 501/503/505/507/502/504/506/508 visible alone is NOT enough.
+# The estimated central landmark must be close.
+TARGET_CENTER_Y_REACHED_PX = 35
+TARGET_CENTER_X_REACHED_M = 0.018
+TARGET_HELPER_REACHED_FRAMES_REQUIRED = 3
+
 MIN_TRAVEL_TIME_BEFORE_TARGET_SEC = 1.0
 
 
@@ -67,7 +58,6 @@ MIN_TRAVEL_TIME_BEFORE_TARGET_SEC = 1.0
 # TURN SETTINGS
 # =====================================================
 
-# Change individual signs if one turn must be opposite direction.
 TURN_DEG_BY_LANDMARK = {
     TAG_6: 90.0,
     TAG_5: -90.0,
@@ -80,19 +70,15 @@ TURN_DEG_BY_LANDMARK = {
 
 MAX_PPS = 10000
 
-# Normal travelling speed
 VISION_BASE_PPS = 3500
-
-# Slower speed when correction error is large
 VISION_BASE_PPS_SLOW = 2600
 
 VISION_MIN_PPS = 1600
 VISION_MAX_PPS = 5200
 
-# Turning landmark correction speed
 TURN_TAG_FB_PPS = 550
 
-# If pressing c moves front/back the wrong way, change this to -1
+# If pressing c moves front/back wrong way, change this to -1
 FB_SIGN = 1
 
 
@@ -126,7 +112,6 @@ HELPER_GRID_OFFSET = {
     508: (-1, -1),
 }
 
-# For manual c correction, prefer these cross helpers before corner helpers.
 CORRECTION_HELPER_PRIORITY = [501, 503, 505, 507]
 
 
@@ -134,11 +119,9 @@ CORRECTION_HELPER_PRIORITY = [501, 503, 505, 507]
 # GLOBAL ADAPTIVE CORRECTION PARAMETERS
 # =====================================================
 
-# Normal correction gains
 KP_YAW_PPS_PER_DEG = 18
 KP_X_PPS_PER_M = 16000
 
-# Strong correction gains when error is large
 KP_YAW_STRONG_PPS_PER_DEG = 28
 KP_X_STRONG_PPS_PER_M = 45000
 
@@ -148,18 +131,15 @@ X_SIGN = -1.0
 YAW_DEADBAND_DEG = 0.30
 X_DEADBAND_M = 0.0005
 
-# Error thresholds for automatic correction strength
 X_MEDIUM_ERROR_M = 0.008
 X_LARGE_ERROR_M = 0.018
 
 YAW_MEDIUM_ERROR_DEG = 3.0
 YAW_LARGE_ERROR_DEG = 7.0
 
-# Correction limits
 MAX_VISION_CORRECTION_PPS = 220
 MAX_VISION_CORRECTION_STRONG_PPS = 500
 
-# Smoothing
 CORRECTION_FILTER_ALPHA = 0.30
 CORRECTION_FILTER_ALPHA_STRONG = 0.50
 
@@ -170,9 +150,7 @@ filtered_correction = 0.0
 # TURN LANDMARK CORRECTION PARAMETERS
 # =====================================================
 
-# Pressing c: yaw correction only + visible tag image center Y.
 KP_TURN_TAG_YAW_PPS_PER_DEG = 20
-
 MAX_TURN_TAG_YAW_CORRECTION_PPS = 150
 
 TURN_TAG_YAW_OK_DEG = 3.0
@@ -424,7 +402,7 @@ def choose_best_cluster_tag(detections, central_tag_id):
     """
     Used for travelling.
     Prefer central landmark tag if visible.
-    Otherwise choose helper tag closest to image center.
+    Otherwise choose helper closest to image center.
     """
 
     candidate_tags = []
@@ -436,19 +414,16 @@ def choose_best_cluster_tag(detections, central_tag_id):
     if not candidate_tags:
         return None
 
-    # Prefer central tag
     for tag in candidate_tags:
         if tag.tag_id == central_tag_id:
             return tag
 
-    # Otherwise helper closest to image center
     best_tag = None
     best_dist = 999999999.0
 
     for tag in candidate_tags:
         dx = tag.center[0] - CX
         dy = tag.center[1] - CY
-
         dist = dx * dx + dy * dy
 
         if dist < best_dist:
@@ -461,20 +436,16 @@ def choose_best_cluster_tag(detections, central_tag_id):
 def choose_best_correction_tag(detections, central_tag_id):
     """
     Used after pressing c.
-    Manual correction should keep a visible tag centered.
-
     Priority:
     1. central landmark tag
     2. cross helpers 501, 503, 505, 507
     3. any helper closest to image center
     """
 
-    # 1. Prefer central tag
     for tag in detections:
         if tag.tag_id == central_tag_id:
             return tag
 
-    # 2. Prefer cross helpers
     best_tag = None
     best_dist = 999999999.0
 
@@ -491,7 +462,6 @@ def choose_best_correction_tag(detections, central_tag_id):
     if best_tag is not None:
         return best_tag
 
-    # 3. Fallback: any cluster tag
     return choose_best_cluster_tag(detections, central_tag_id)
 
 
@@ -531,10 +501,8 @@ def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
 
     helper_x_m = compute_lateral_x_m(tag)
 
-    # Estimate central landmark x position from helper tag.
     center_x_m = helper_x_m - (helper_x_grid * CLUSTER_SPACING_M)
 
-    # Estimate central landmark image center Y from helper grid position.
     tag_side_px = estimate_tag_side_px(tag)
     spacing_px = tag_side_px * (CLUSTER_SPACING_M / TAG_SIZE_M)
 
@@ -557,7 +525,7 @@ def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
 def get_visible_tag_center_pose(tag):
     """
     Used only after pressing c.
-    This centers the currently visible selected tag itself.
+    Centers the selected visible tag itself.
     """
 
     raw_yaw = compute_yaw_deg(tag)
@@ -589,6 +557,7 @@ def start_travel_segment(from_landmark, to_landmark, new_state):
     global left_start_cluster
     global start_cluster_lost_count
     global target_cluster_seen_count
+    global target_helper_reached_count
     global travel_segment_start_time
 
     travel_from_landmark = from_landmark
@@ -597,6 +566,7 @@ def start_travel_segment(from_landmark, to_landmark, new_state):
     left_start_cluster = False
     start_cluster_lost_count = 0
     target_cluster_seen_count = 0
+    target_helper_reached_count = 0
     travel_segment_start_time = time.time()
 
     reset_correction_filter()
@@ -613,25 +583,28 @@ def monitor_travel_progress(detections):
     """
     Returns:
         USE_START   = still near start cluster, correct using start landmark
-        USE_TARGET  = target cluster visible but not confirmed yet
-        ARRIVED     = target cluster confirmed
+        USE_TARGET  = target cluster visible, but not yet centered/reached
+        ARRIVED     = target landmark confirmed
         NO_TAG      = no useful tag
 
-    Important:
-    Since helper IDs 501-508 are reused at all landmarks,
-    leaving is based mainly on losing the unique central start tag.
+    Helper visible alone is not enough for arrival.
+    The estimated central target landmark must be close.
     """
 
     global left_start_cluster
     global start_cluster_lost_count
     global target_cluster_seen_count
+    global target_helper_reached_count
 
     if travel_from_landmark is None or travel_to_landmark is None:
         return "NO_TAG"
 
     elapsed = time.time() - travel_segment_start_time
 
-    # If target central tag is visible, it is a reliable arrival indicator.
+    # -------------------------------------------------
+    # Central target tag is reliable.
+    # -------------------------------------------------
+
     if elapsed >= MIN_TRAVEL_TIME_BEFORE_TARGET_SEC:
         if central_tag_visible(detections, travel_to_landmark):
             target_cluster_seen_count += 1
@@ -641,18 +614,21 @@ def monitor_travel_progress(detections):
 
             return "USE_TARGET"
 
+    # -------------------------------------------------
     # Before leaving start cluster:
-    # use unique start central tag to decide whether we are still near start.
+    # helpers belong to start landmark.
+    # -------------------------------------------------
+
     if not left_start_cluster:
 
         if central_tag_visible(detections, travel_from_landmark):
             start_cluster_lost_count = 0
             target_cluster_seen_count = 0
+            target_helper_reached_count = 0
             return "USE_START"
 
         start_cluster_lost_count += 1
 
-        # While waiting to confirm leaving, still use start helpers if visible.
         if start_cluster_lost_count < START_CLUSTER_LOST_FRAMES_REQUIRED:
             if any_cluster_visible(detections, travel_from_landmark):
                 return "USE_START"
@@ -663,6 +639,7 @@ def monitor_travel_progress(detections):
         ):
             left_start_cluster = True
             target_cluster_seen_count = 0
+            target_helper_reached_count = 0
 
             print(
                 f"RPI: Left landmark {travel_from_landmark} central tag. "
@@ -671,13 +648,23 @@ def monitor_travel_progress(detections):
 
         return "NO_TAG"
 
-    # After leaving start, helpers are interpreted as target helpers.
-    target_visible = any_cluster_visible(
+    # -------------------------------------------------
+    # After leaving start:
+    # helpers are interpreted as target helpers.
+    # But do not stop just because 501/503/505/507 is visible.
+    # -------------------------------------------------
+
+    target_tag = choose_best_cluster_tag(
         detections,
         travel_to_landmark
     )
 
-    if target_visible:
+    if target_tag is None:
+        target_cluster_seen_count = 0
+        target_helper_reached_count = 0
+        return "NO_TAG"
+
+    if target_tag.tag_id == travel_to_landmark:
         target_cluster_seen_count += 1
 
         if target_cluster_seen_count >= TARGET_CLUSTER_SEEN_FRAMES_REQUIRED:
@@ -685,8 +672,48 @@ def monitor_travel_progress(detections):
 
         return "USE_TARGET"
 
-    target_cluster_seen_count = 0
-    return "NO_TAG"
+    pose = get_landmark_pose_from_cluster_tag(
+        target_tag,
+        travel_to_landmark
+    )
+
+    if pose is None:
+        return "USE_TARGET"
+
+    (
+        raw_yaw,
+        yaw_error,
+        center_x_m,
+        center_y_error_px,
+        seen_tag_id,
+        helper_x_grid,
+        helper_y_grid
+    ) = pose
+
+    helper_center_good = (
+        abs(center_y_error_px) <= TARGET_CENTER_Y_REACHED_PX
+        and abs(center_x_m) <= TARGET_CENTER_X_REACHED_M
+    )
+
+    if helper_center_good:
+        target_helper_reached_count += 1
+    else:
+        target_helper_reached_count = 0
+
+    print(
+        f"TARGET_HELPER_CHECK "
+        f"target={travel_to_landmark} "
+        f"seen={seen_tag_id} "
+        f"grid=({helper_x_grid},{helper_y_grid}) "
+        f"centerXM={center_x_m:.4f} "
+        f"centerYerr={center_y_error_px:.1f}px "
+        f"good={target_helper_reached_count}/{TARGET_HELPER_REACHED_FRAMES_REQUIRED}"
+    )
+
+    if target_helper_reached_count >= TARGET_HELPER_REACHED_FRAMES_REQUIRED:
+        return "ARRIVED"
+
+    return "USE_TARGET"
 
 
 # =====================================================
@@ -762,8 +789,6 @@ def travelling_correction_velocity_from_landmark(
     yaw_corr = kp_yaw * yaw_for_control
     x_corr = kp_x * x_for_control * X_SIGN
 
-    # If yaw and x correction fight, reduce yaw effect.
-    # Lateral x correction is more important for reaching the next landmark.
     if abs(x_for_control) > X_DEADBAND_M:
         if yaw_corr * x_corr < 0:
             yaw_corr *= 0.25
@@ -801,21 +826,11 @@ def turn_tag_heading_center_velocity_from_visible_tag(
     yaw_error,
     visible_y_error_px
 ):
-    """
-    Used after pressing c:
-    - yaw correction
-    - front/back correction using visible tag center Y
-    - no xM steering
-    """
-
     yaw_for_control = yaw_error
 
     if abs(yaw_for_control) < YAW_DEADBAND_DEG:
         yaw_for_control = 0.0
 
-    # Your measured convention:
-    # yaw positive = robot rotated left.
-    # Negative sign rotates it back toward zero.
     yaw_corr = -KP_TURN_TAG_YAW_PPS_PER_DEG * yaw_for_control
 
     yaw_corr = int(np.clip(
@@ -877,18 +892,6 @@ def start_turn_wait(landmark_id, next_state_after_turn):
 
 
 def choose_travel_landmark(detections):
-    """
-    Uses leaving/reaching cluster logic.
-
-    While travelling A -> B:
-        before A central tag is lost:
-            use A cluster for correction
-        after A central tag is lost:
-            use B cluster for correction
-        if B cluster is confirmed:
-            ARRIVED
-    """
-
     global route_state
 
     progress = monitor_travel_progress(detections)
@@ -901,12 +904,10 @@ def choose_travel_landmark(detections):
             return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
 
         if progress == "USE_START":
-            tag = choose_best_cluster_tag(detections, START_TAG)
-            return tag, START_TAG, "TAG11"
+            return choose_best_cluster_tag(detections, START_TAG), START_TAG, "TAG11"
 
         if progress == "USE_TARGET":
-            tag = choose_best_cluster_tag(detections, TAG_7)
-            return tag, TAG_7, "TAG7"
+            return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
 
         return None, None, ""
 
@@ -917,12 +918,10 @@ def choose_travel_landmark(detections):
             return None, None, ""
 
         if progress == "USE_START":
-            tag = choose_best_cluster_tag(detections, TAG_7)
-            return tag, TAG_7, "TAG7"
+            return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
 
         if progress == "USE_TARGET":
-            tag = choose_best_cluster_tag(detections, TAG_6)
-            return tag, TAG_6, "TAG6"
+            return choose_best_cluster_tag(detections, TAG_6), TAG_6, "TAG6"
 
         return None, None, ""
 
@@ -933,12 +932,10 @@ def choose_travel_landmark(detections):
             return None, None, ""
 
         if progress == "USE_START":
-            tag = choose_best_cluster_tag(detections, TAG_6)
-            return tag, TAG_6, "TAG6"
+            return choose_best_cluster_tag(detections, TAG_6), TAG_6, "TAG6"
 
         if progress == "USE_TARGET":
-            tag = choose_best_cluster_tag(detections, TAG_5)
-            return tag, TAG_5, "TAG5"
+            return choose_best_cluster_tag(detections, TAG_5), TAG_5, "TAG5"
 
         return None, None, ""
 
@@ -954,12 +951,10 @@ def choose_travel_landmark(detections):
             return None, None, ""
 
         if progress == "USE_START":
-            tag = choose_best_cluster_tag(detections, TAG_5)
-            return tag, TAG_5, "TAG5"
+            return choose_best_cluster_tag(detections, TAG_5), TAG_5, "TAG5"
 
         if progress == "USE_TARGET":
-            tag = choose_best_cluster_tag(detections, TAG_9)
-            return tag, TAG_9, "TAG9"
+            return choose_best_cluster_tag(detections, TAG_9), TAG_9, "TAG9"
 
         return None, None, ""
 
@@ -1041,14 +1036,10 @@ print("  6 -> 5")
 print("  At 5: stop, press c, then press t")
 print("  5 -> 9 and stop")
 print("")
-print("Cluster model:")
-print("  central landmark tag is the route node")
-print("  helper tags 501-508 estimate the central landmark during travel")
-print("  pressing c centers central/cross-helper/visible tag itself")
-print("")
-print("Travel monitor:")
-print("  before leaving start central tag, helpers belong to start landmark")
-print("  after leaving start central tag, helpers belong to target landmark")
+print("Helper arrival rule:")
+print("  central target tag visible -> reached")
+print("  helper visible only -> estimate central target position")
+print("  stop only when estimated central target is near image center")
 print("")
 print("Keys:")
 print("  s = start route")
@@ -1406,7 +1397,7 @@ try:
 
         cv2.putText(
             frame,
-            f"Lost:{start_cluster_lost_count} Seen:{target_cluster_seen_count} Good:{turn_tag_good_count}",
+            f"Lost:{start_cluster_lost_count} Seen:{target_cluster_seen_count} HelperGood:{target_helper_reached_count}",
             (40, 250),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1415,7 +1406,7 @@ try:
         )
 
         cv2.imshow(
-            "AGV Cluster Route With Visible Tag Correction",
+            "AGV Cluster Route With Helper Center Arrival",
             frame
         )
 
