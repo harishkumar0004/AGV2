@@ -387,34 +387,56 @@ ENTRY_CENTER_BY_HEADING_STRICT = {
 #   if the entry corner appears first, the next adjacent side-center is still
 #   valid target-side evidence.
 ENTRY_SEQUENCE_BY_HEADING = {
-    # User-confirmed entry side -> expected next center/helper.
+    # User-confirmed physical sequence.
     #
-    # Helpers are correction/sequence evidence only.
+    # Helpers are correction / sequence evidence only.
     # The landmark is reached only when the central target tag is visible.
-    WEST:  {502: 503, 504: "CENTRAL", 501: 505},
-    EAST:  {506: 507, 508: "CENTRAL", 505: 501},
-    NORTH: {504: 505, 506: "CENTRAL", 503: 507},
-    SOUTH: {508: 501, 502: "CENTRAL", 507: 503},
+    WEST: {
+        502: 501,
+        503: "CENTRAL",
+        504: 505,
+    },
+
+    EAST: {
+        506: 505,
+        507: "CENTRAL",
+        508: 501,
+    },
+
+    NORTH: {
+        504: 503,
+        505: "CENTRAL",
+        506: 507,
+    },
+
+    SOUTH: {
+        508: 507,
+        501: "CENTRAL",
+        502: 503,
+    },
 }
 
 CORNER_TO_NEXT_CENTER_BY_HEADING = {
     WEST: {
-        502: {503},
-        501: {505},
+        502: {501},
+        504: {505},
     },
     EAST: {
-        506: {507},
-        505: {501},
+        506: {505},
+        508: {501},
     },
     NORTH: {
-        504: {505},
-        503: {507},
+        504: {503},
+        506: {507},
     },
     SOUTH: {
-        508: {501},
-        507: {503},
+        508: {507},
+        502: {503},
     },
 }
+# Valid helper centers for correction / sequence.
+# These are NOT final arrival points.
+# Final reached/pass-through is confirmed only by the central target tag.
 # Valid helper centers for correction / sequence.
 # These are NOT final arrival points.
 # Final reached/pass-through is confirmed only by the central target tag.
@@ -425,10 +447,10 @@ CORNER_TO_NEXT_CENTER_BY_HEADING = {
 # These are NOT final arrival points.
 # Final reached/pass-through is confirmed only by the central target tag.
 VALID_ENTRY_CENTERS_BY_HEADING = {
-    WEST: {503, 504, 505},
-    EAST: {507, 508, 501},
-    NORTH: {505, 506, 507},
-    SOUTH: {501, 502, 503},
+    WEST: {501, 503, 505},
+    EAST: {501, 505, 507},
+    NORTH: {503, 505, 507},
+    SOUTH: {501, 503, 507},
 }
 
 # Corner-only transition rule is heading-specific.
@@ -1369,6 +1391,8 @@ class AGVQtApp(QMainWindow):
         )
 
 
+
+
     # -------------------------
     # Camera
     # -------------------------
@@ -2164,6 +2188,21 @@ class AGVQtApp(QMainWindow):
 
         return f"helper_{helper_id}_expect_helper_{nxt}"
 
+    def helper_expects_central_now(self, helper_id):
+        seq = ENTRY_SEQUENCE_BY_HEADING.get(self.segment_heading, {})
+        return seq.get(int(helper_id), None) == "CENTRAL"
+
+    def helper_is_valid_sequence_center_now(self, helper_id):
+        helper_id = int(helper_id)
+
+        # Direct center-side helper for this heading is always allowed.
+        if self.helper_expects_central_now(helper_id):
+            return True
+
+        # Other helper centers are allowed only if a previous entry helper
+        # created them as a sequence candidate.
+        return helper_id in set(getattr(self, "corner_single_arrival_candidates", set()))
+
     def remember_local_arrival_helper(self, helper_id):
         self.last_arrival_helper_id = int(helper_id)
         self.last_arrival_heading = self.segment_heading
@@ -2285,6 +2324,16 @@ class AGVQtApp(QMainWindow):
                     helper_id,
                     evidence_type
                 )
+
+                if not self.helper_is_valid_sequence_center_now(helper_id):
+                    self.append_log(
+                        f"HELPER PAIR REJECTED BY SEQUENCE: target={self.travel_to_landmark} "
+                        f"helper={helper_id} group={helper_group_name(helper_id)} "
+                        f"validEntryCenters={sorted(self.valid_entry_centers_for_heading())} "
+                        f"reason={reason} seq={self.helper_sequence_note(helper_id)} "
+                        f"candidates={sorted(self.corner_single_arrival_candidates)}. IMU hold."
+                    )
+                    return None, None, ""
 
                 self.append_log(
                     f"HELPER PAIR CORRECTION ONLY: target={self.travel_to_landmark} "
@@ -2423,6 +2472,15 @@ class AGVQtApp(QMainWindow):
                 if ready:
                     # Helper is only correction / sequence evidence.
                     # Do not mark target reached until central target tag is visible.
+                    if not self.helper_is_valid_sequence_center_now(helper_id):
+                        self.append_log(
+                            f"SEARCH HELPER REJECTED BY SEQUENCE: target={self.travel_to_landmark} "
+                            f"helper={helper_id} evidence={evidence_type} "
+                            f"seq={self.helper_sequence_note(helper_id)} "
+                            f"candidates={sorted(self.corner_single_arrival_candidates)}. IMU hold."
+                        )
+                        return None, None, ""
+
                     tag = find_tag(detections, helper_id)
                     if tag is not None:
                         return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
@@ -2752,7 +2810,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: x_only_user_confirmed_entry_sequence active")
+        self.append_log("BUILD: x_only_exact_user_sequence_gated active")
 
         self.active_path = list(self.path)
         self.path_index = 1
