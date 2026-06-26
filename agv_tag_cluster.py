@@ -253,11 +253,8 @@ CORNER_HELPERS = {502, 504, 506, 508}
 CLUSTER_LOST_FRAMES_REQUIRED = 5
 TARGET_CENTRAL_SEEN_FRAMES_REQUIRED = 2
 
-# For turning waypoints, helper IDs are reused globally.
-# So do not wait for all helpers to disappear. Instead, once the previous
-# central tag is no longer visible for a few frames, treat any visible
-# helper as the target local cluster arrival.
-OLD_CENTRAL_LOST_FOR_TURN_HELPER_FRAMES = 3
+# Local helper arrival confirmation. Cross helpers are important.
+TARGET_HELPER_SEEN_FRAMES_REQUIRED = 1
 
 LOCAL_NUDGE_CENTER_Y_OK_PX = 30
 LOCAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
@@ -451,29 +448,42 @@ def detect_side_pair(detections, target_landmark):
 
 def detect_local_arrival_helper(detections, target_landmark):
     """
-    Restored cluster behavior for local landmark arrival.
+    Working cluster arrival logic restored for Qt.
 
-    The robot should not require the central landmark tag to stop/update.
-    If the target central tag is not visible, accept helper evidence:
-      1) side-center + adjacent corner pair, preferred
-      2) a single cross helper 501/503/505/507
-      3) any helper if nothing else is available
+    Called only after the old cluster has disappeared and helpers are allowed
+    to belong to the target landmark.
 
-    This lets the robot stop/nudge/update when it sees local cluster tags.
+    Priority:
+      1) target central tag -> handled elsewhere, not here
+      2) side-center + adjacent corner pair
+      3) single important cross helper: 501, 503, 505, 507
+      4) any corner helper as weaker evidence
+
+    This fixes the major issue where the robot passes Tag 1/turning tags when
+    central tag is not visible but local helper tags are visible.
     """
-    if find_tag(detections, target_landmark) is not None:
-        return None
-
-    pair_helper = detect_side_pair(detections, target_landmark)
-    if pair_helper is not None:
-        return pair_helper
-
     ids = visible_ids(detections)
 
+    if target_landmark in ids:
+        return None
+
+    groups = [
+        (503, {502, 504}),
+        (507, {506, 508}),
+        (501, {508, 502}),
+        (505, {506, 504}),
+    ]
+
+    for center_helper, corners in groups:
+        if center_helper in ids and len(ids.intersection(corners)) > 0:
+            return center_helper
+
+    # User-validated important local tags.
     for helper_id in [501, 503, 505, 507]:
         if helper_id in ids:
             return helper_id
 
+    # Last fallback: corner helper.
     for helper_id in [502, 504, 506, 508]:
         if helper_id in ids:
             return helper_id
@@ -839,7 +849,6 @@ class AGVQtApp(QMainWindow):
         self.route_state = "IDLE"
         self.segment_phase = "START_CLUSTER"
         self.cluster_lost_count = 0
-        self.old_central_lost_count = 0
         self.target_central_seen_count = 0
         self.travel_from_landmark = None
         self.travel_to_landmark = None
@@ -1060,7 +1069,7 @@ class AGVQtApp(QMainWindow):
         self.heading_edit.setText(HEADING_LABELS.get(self.current_heading, "---"))
         self.expected_next_edit.setText(str(self.expected_next_tag) if self.expected_next_tag is not None else "---")
         self.path_edit.setText(" → ".join(str(x) for x in self.path) if self.path else "---")
-        self.route_state_edit.setText(f"{self.route_state} / {self.segment_phase} / oldLost={self.old_central_lost_count}")
+        self.route_state_edit.setText(f"{self.route_state} / {self.segment_phase}")
 
         if self.calibration_done:
             self.calib_state.setText("DONE - GRID START TAG 1")
@@ -1101,7 +1110,7 @@ class AGVQtApp(QMainWindow):
         # Add state overlay.
         cv2.putText(
             frame_bgr,
-            f"State:{self.route_state} Seg:{self.travel_from_landmark}->{self.travel_to_landmark}",
+            f"State:{self.route_state} Seg:{self.travel_from_landmark}->{self.travel_to_landmark} phase:{self.segment_phase} lost:{self.cluster_lost_count}",
             (25, 35),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1398,7 +1407,6 @@ class AGVQtApp(QMainWindow):
         self.travel_to_landmark = int(to_tag)
         self.segment_phase = "START_CLUSTER"
         self.cluster_lost_count = 0
-        self.old_central_lost_count = 0
         self.target_central_seen_count = 0
         self.reset_correction_filter()
         self.route_state = "MOVE"
@@ -1457,79 +1465,18 @@ class AGVQtApp(QMainWindow):
         self.local_arrival_good_count = 0
         self.local_arrival_start_time = time.time()
         self.route_state = "LOCAL_ARRIVAL"
-        self.append_log(f"Local arrival at Tag {landmark_id}, nudging to helper {helper_id}")
-
-    def waypoint_requires_turn_after_arrival(self, waypoint_tag):
-        """
-        True when the current target waypoint is not final and the next path
-        segment requires a heading change. These are the 'turning tags'.
-
-        Example path 8 -> 9 -> 10 -> 15:
-          Tag 10 requires turn because 9->10 is EAST and 10->15 is SOUTH.
-        """
-        if not self.mission_running:
-            return False
-
-        if not self.active_path:
-            return False
-
-        if self.path_index >= len(self.active_path):
-            return False
-
-        if int(self.active_path[self.path_index]) != int(waypoint_tag):
-            return False
-
-        if self.path_index + 1 >= len(self.active_path):
-            return False
-
-        prev_tag = self.current_tag
-        current_waypoint = int(waypoint_tag)
-        next_tag = int(self.active_path[self.path_index + 1])
-
-        incoming_heading = heading_between_tags(prev_tag, current_waypoint)
-        outgoing_heading = heading_between_tags(current_waypoint, next_tag)
-
-        if incoming_heading is None or outgoing_heading is None:
-            return False
-
-        return incoming_heading != outgoing_heading
-
-    def strong_local_helper_seen(self, detections, target_landmark):
-        """
-        Helper evidence for a turning waypoint.
-
-        Important:
-        Helper IDs 501-508 are reused at every landmark. The earlier logic waited
-        for all helpers to disappear before treating helpers as the target cluster.
-        In real tests, this fails at turning tags because the robot moves from the
-        previous local helpers directly into the next local helpers with no clean
-        helper-free gap.
-
-        Therefore, for turning waypoints:
-          - wait until the previous central tag is lost for a few frames
-          - then accept any visible helper as target-local arrival evidence
-        """
-        ids = visible_ids(detections)
-
-        # Prefer stronger side pair evidence.
-        pair_helper = detect_side_pair(detections, target_landmark)
-        if pair_helper is not None:
-            return pair_helper
-
-        # Then any cross helper.
-        for helper_id in [501, 503, 505, 507]:
-            if helper_id in ids:
-                return helper_id
-
-        # Then any corner helper.
-        for helper_id in [502, 504, 506, 508]:
-            if helper_id in ids:
-                return helper_id
-
-        return None
-
+        self.append_log(f"Local arrival at Tag {landmark_id}, helper {helper_id} accepted. Central tag not required.")
 
     def choose_move_correction(self, detections):
+        """
+        Restored from the last working standalone cluster code.
+
+        Important behavior:
+          - While START_CLUSTER, helper tags are treated as OLD landmark helpers.
+          - Only after old cluster is fully lost, helpers can belong to TARGET.
+          - In SEARCH_TARGET, local helper tags are respected; central target
+            tag is NOT required.
+        """
         central_target = find_tag(detections, self.travel_to_landmark)
 
         if central_target is not None:
@@ -1544,36 +1491,14 @@ class AGVQtApp(QMainWindow):
         self.target_central_seen_count = 0
 
         if self.segment_phase == "START_CLUSTER":
-            old_central_visible = find_tag(detections, self.travel_from_landmark) is not None
-
-            if old_central_visible:
-                self.old_central_lost_count = 0
-            else:
-                self.old_central_lost_count += 1
-
-            # Turning waypoint fix:
-            # Do not require central target tag, and do not require a helper-free gap.
-            # Once the previous central tag is gone for a few frames, any local helper
-            # seen at a turning waypoint is enough to stop and turn.
-            if self.waypoint_requires_turn_after_arrival(self.travel_to_landmark):
-                helper_id = self.strong_local_helper_seen(detections, self.travel_to_landmark)
-
-                if (
-                    helper_id is not None
-                    and self.old_central_lost_count >= OLD_CENTRAL_LOST_FOR_TURN_HELPER_FRAMES
-                ):
-                    self.append_log(
-                        f"TURN WAYPOINT ARRIVAL BY LOCAL HELPER: helper Tag {helper_id} "
-                        f"seen for target {self.travel_to_landmark}; "
-                        f"oldCentralLost={self.old_central_lost_count}. Stopping now."
-                    )
-                    self.handle_landmark_arrival(self.travel_to_landmark)
-                    return None, None, ""
-
-            # Original correction behavior while still at/near the old cluster.
             if any_cluster_visible_now(detections, self.travel_from_landmark):
                 self.cluster_lost_count = 0
-                tag = choose_best_cluster_tag(detections, self.travel_from_landmark)
+
+                tag = choose_best_cluster_tag(
+                    detections,
+                    self.travel_from_landmark
+                )
+
                 return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
 
             self.cluster_lost_count += 1
@@ -1581,25 +1506,38 @@ class AGVQtApp(QMainWindow):
             if self.cluster_lost_count >= CLUSTER_LOST_FRAMES_REQUIRED:
                 self.segment_phase = "SEARCH_TARGET"
                 self.append_log(
-                    f"Fully left Tag {self.travel_from_landmark}. Helpers now belong to target {self.travel_to_landmark}."
+                    f"Fully left Tag {self.travel_from_landmark}. "
+                    f"Now helpers can belong to target {self.travel_to_landmark}."
                 )
 
             return None, None, ""
 
         if self.segment_phase == "SEARCH_TARGET":
-            helper_id = detect_local_arrival_helper(detections, self.travel_to_landmark)
+            helper_id = detect_local_arrival_helper(
+                detections,
+                self.travel_to_landmark
+            )
+
             if helper_id is not None:
                 self.append_log(
-                    f"ARRIVAL BY LOCAL HELPER: helper Tag {helper_id} seen for target {self.travel_to_landmark}. "
-                    "Stopping now; central tag is not required."
+                    f"LOCAL HELPER ARRIVAL CANDIDATE: target={self.travel_to_landmark} "
+                    f"helper={helper_id}. Central tag not required."
                 )
 
-                # Previous cluster behavior:
-                # local helper tags are enough arrival evidence once the old cluster is fully lost.
-                self.handle_landmark_arrival(self.travel_to_landmark)
+                # Same as the old working script: stop first, then use LOCAL_ARRIVAL
+                # to either confirm helper center or finish by timeout/loss.
+                self.start_local_arrival(
+                    self.travel_to_landmark,
+                    helper_id
+                )
+
                 return None, None, ""
 
-            tag = choose_best_cluster_tag(detections, self.travel_to_landmark)
+            tag = choose_best_cluster_tag(
+                detections,
+                self.travel_to_landmark
+            )
+
             if tag is not None:
                 return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
@@ -1624,8 +1562,7 @@ class AGVQtApp(QMainWindow):
                     self.lock_heading_go()
                 self.update_ui_state()
 
-            # No timeout here. ESP32 IMU turn owns completion.
-            # For 180 degree turns, the robot may need longer; Python must wait.
+            # No Python-side timeout. ESP32 IMU owns turn completion.
             return
 
         if self.route_state == "MOVE":
@@ -1695,7 +1632,7 @@ class AGVQtApp(QMainWindow):
             helper = choose_best_cluster_tag(detections, self.local_arrival_landmark)
 
         if helper is None:
-            self.append_log("Local arrival tag lost. Stopping as reached.")
+            self.append_log("Local arrival helper lost. Treating landmark as reached, same as old cluster code.")
             self.handle_landmark_arrival(self.local_arrival_landmark)
             return
 
