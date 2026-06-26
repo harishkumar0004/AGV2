@@ -472,6 +472,20 @@ KP_X_STRONG_PPS_PER_M = 85000
 
 X_SIGN = -1.0
 
+# IMPORTANT:
+# During grid travel the ESP32/IMU owns heading hold.
+# Camera correction should mainly correct lateral X offset.
+#
+# The logs showed AprilTag yaw around +/-90 deg on side/helper views,
+# causing huge wrong steering:
+#   TAG2 CORR seen=502 yawErr=89 -> strong turn
+# Then another helper produced the opposite correction.
+#
+# Therefore travel correction uses lateral X only. Yaw is still logged, but not
+# used for wheel correction while moving between grid tags.
+USE_YAW_IN_TRAVEL_CORRECTION = False
+
+
 YAW_DEADBAND_DEG = 0.30
 X_DEADBAND_M = 0.0005
 
@@ -750,7 +764,11 @@ def get_visible_tag_pose(tag):
 
 def adaptive_error_level(yaw_error, center_x_m):
     abs_x = abs(center_x_m)
-    abs_yaw = abs(yaw_error)
+
+    if USE_YAW_IN_TRAVEL_CORRECTION:
+        abs_yaw = abs(yaw_error)
+    else:
+        abs_yaw = 0.0
 
     if abs_x >= X_LARGE_ERROR_M or abs_yaw >= YAW_LARGE_ERROR_DEG:
         return "LARGE"
@@ -1346,6 +1364,7 @@ class AGVQtApp(QMainWindow):
 
 
 
+
     # -------------------------
     # Camera
     # -------------------------
@@ -1565,9 +1584,18 @@ class AGVQtApp(QMainWindow):
     def lock_heading_go(self):
         if getattr(self, "skip_next_segment_lock", False):
             self.skip_next_segment_lock = False
+
+            if self.last_drive_mode == "IMU":
+                self.append_log("Skipped LOCK_HEADING_GO after straight pass-through; already in IMU heading hold.")
+                return
+
+            # Do not carry the previous visual VEL command into the next segment.
+            self.filtered_correction = 0.0
+            self.send_esp32("LOCK_HEADING_GO")
             self.last_drive_mode = "IMU"
-            self.append_log("Skipped LOCK_HEADING_GO after straight pass-through; keeping same IMU heading.")
+            self.append_log("LOCK_HEADING_GO sent after pass-through to clear visual VEL.")
             return
+
         if self.last_drive_mode == "IMU":
             return
         self.filtered_correction = 0.0
@@ -1606,6 +1634,9 @@ class AGVQtApp(QMainWindow):
 
         yaw_for_control = yaw_error
         x_for_control = center_x_m
+
+        if not USE_YAW_IN_TRAVEL_CORRECTION:
+            yaw_for_control = 0.0
 
         if abs(yaw_for_control) < YAW_DEADBAND_DEG:
             yaw_for_control = 0.0
@@ -2710,7 +2741,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: helpers_correction_only_central_reached active")
+        self.append_log("BUILD: x_only_vision_helpers_correction active")
 
         self.active_path = list(self.path)
         self.path_index = 1
