@@ -385,6 +385,13 @@ HELPER_GROUP_BY_CENTER = {
 }
 
 CLUSTER_LOST_FRAMES_REQUIRED = 5
+
+# Normal mission safety:
+# Do not use helper-only visibility from the previous landmark as OLD-cluster
+# steering after the old central tag is gone. On the 13->12 test, helper 508
+# from Tag 13 was treated as TAG13 correction and pulled the robot away.
+# Calibration 0->1 still uses old helper behavior separately.
+DISABLE_OLD_HELPER_ONLY_STEERING_IN_MISSION = True
 TARGET_CENTRAL_SEEN_FRAMES_REQUIRED = 2
 
 # Local helper arrival confirmation. Cross helpers are important.
@@ -1292,6 +1299,8 @@ class AGVQtApp(QMainWindow):
             expected_tag=self.expected_next_tag,
         )
 
+
+
     # -------------------------
     # Camera
     # -------------------------
@@ -1354,7 +1363,6 @@ class AGVQtApp(QMainWindow):
                 self.dock_tag_confirmed = True
                 self.waiting_for_manual_alignment = True
                 self.update_ui_state()
-
 
     # -------------------------
     # Serial
@@ -2158,8 +2166,31 @@ class AGVQtApp(QMainWindow):
                 # Wait for a valid pair, valid corner->single sequence, or central tag.
                 return None, None, ""
 
-            # Standalone fallback: helpers that are not valid target arrival remain
-            # old-cluster correction until a clean loss happens.
+            # Normal mission safety:
+            # At this point old_central is not visible and no valid target
+            # side-pair/single was accepted. Do NOT steer using helper-only
+            # old-cluster evidence.
+            #
+            # This was the 13->12 failure:
+            #   seen=508 was treated as TAG13 correction, then the robot drifted
+            #   away before detecting Tag 12 / Tag 11.
+            #
+            # Safer behavior: consider the old central tag left, go to
+            # SEARCH_TARGET after the normal lost count, and let IMU hold until
+            # a valid target central/helper appears.
+            if DISABLE_OLD_HELPER_ONLY_STEERING_IN_MISSION:
+                self.cluster_lost_count += 1
+
+                if self.cluster_lost_count >= CLUSTER_LOST_FRAMES_REQUIRED:
+                    self.segment_phase = "SEARCH_TARGET"
+                    self.append_log(
+                        f"Fully left Tag {self.travel_from_landmark} central. "
+                        f"Ignoring old helper-only steering; target {self.travel_to_landmark} can use central/valid helpers."
+                    )
+
+                return None, None, ""
+
+            # Legacy fallback, kept disabled by default.
             if any_cluster_visible_now(detections, self.travel_from_landmark):
                 self.cluster_lost_count = 0
                 tag = choose_best_cluster_tag(detections, self.travel_from_landmark)
@@ -2201,11 +2232,8 @@ class AGVQtApp(QMainWindow):
                             "Correction only."
                         )
 
-                    tag = find_tag(detections, helper_id)
-                    if tag is not None:
-                        if self.expected_exit_helper_id is not None and int(helper_id) == int(self.expected_exit_helper_id):
-                            return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
-                        return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
+                    # Do not steer from rejected helper evidence in SEARCH_TARGET either.
+                    return None, None, ""
 
                 ready, center_y_error_px = self.local_helper_arrival_ready(
                     detections,
@@ -2543,6 +2571,8 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
+        self.append_log("BUILD: slow_safe_no_old_helper_steering active")
+
         self.active_path = list(self.path)
         self.path_index = 1
         self.expected_next_tag = self.active_path[self.path_index]
@@ -2634,4 +2664,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
