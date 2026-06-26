@@ -255,9 +255,16 @@ TARGET_CENTRAL_SEEN_FRAMES_REQUIRED = 2
 
 # Local helper arrival confirmation. Cross helpers are important.
 TARGET_HELPER_SEEN_FRAMES_REQUIRED = 1
-# Minimum time after segment start before helpers are allowed to confirm target arrival.
-# Prevents immediately accepting old-cluster helpers at segment start.
-# Previous central tag should be absent briefly before accepting helper-only target arrival.
+
+# Qt/A* mission fix:
+# In the 5x3 grid, helpers can remain continuously visible while moving from
+# one cluster to the next. The standalone program waited for a clean helper-free
+# gap, but the Qt grid sometimes never gets that gap. Therefore for normal
+# mission segments only, helper arrival can be accepted after the old CENTRAL
+# tag has disappeared for a few frames and the robot has travelled for a short time.
+# This is disabled during docking 0->1 to avoid mistaking Tag 0 helper 505 as Tag 1.
+MISSION_HELPER_MIN_TRAVEL_SEC = 0.70
+MISSION_OLD_CENTRAL_LOST_FRAMES = 3
 
 LOCAL_NUDGE_CENTER_Y_OK_PX = 30
 LOCAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
@@ -1061,13 +1068,28 @@ class AGVQtApp(QMainWindow):
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(220)
+
+        self.log_autoscroll_checkbox = QCheckBox("Auto-scroll log")
+        self.log_autoscroll_checkbox.setChecked(True)
+
+        self.clear_log_btn = QPushButton("Clear Log")
+        self.clear_log_btn.clicked.connect(self.log.clear)
+
+        log_controls = QHBoxLayout()
+        log_controls.addWidget(self.log_autoscroll_checkbox)
+        log_controls.addWidget(self.clear_log_btn)
+
+        log_layout.addLayout(log_controls)
         log_layout.addWidget(self.log)
         right.addWidget(log_group, 1)
 
     def append_log(self, text):
         ts = time.strftime("%H:%M:%S")
         self.log.append(f"[{ts}] {text}")
-        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
+        # Keep log usable on RPi: user can turn off auto-scroll and inspect older lines.
+        if hasattr(self, "log_autoscroll_checkbox") and self.log_autoscroll_checkbox.isChecked():
+            self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def update_ui_state(self):
         self.current_tag_edit.setText(str(self.current_tag) if self.current_tag is not None else "---")
@@ -1075,7 +1097,7 @@ class AGVQtApp(QMainWindow):
         self.heading_edit.setText(HEADING_LABELS.get(self.current_heading, "---"))
         self.expected_next_edit.setText(str(self.expected_next_tag) if self.expected_next_tag is not None else "---")
         self.path_edit.setText(" → ".join(str(x) for x in self.path) if self.path else "---")
-        self.route_state_edit.setText(f"{self.route_state} / {self.segment_phase} / lost={self.cluster_lost_count} h={self.target_helper_seen_count}")
+        self.route_state_edit.setText(f"{self.route_state} / {self.segment_phase} / lost={self.cluster_lost_count} oldC={self.old_central_lost_count} h={self.target_helper_seen_count}")
 
         if self.calibration_done:
             self.calib_state.setText("DONE - GRID START TAG 1")
@@ -1413,8 +1435,10 @@ class AGVQtApp(QMainWindow):
         self.travel_to_landmark = int(to_tag)
         self.segment_phase = "START_CLUSTER"
         self.cluster_lost_count = 0
+        self.old_central_lost_count = 0
         self.target_helper_seen_count = 0
         self.target_central_seen_count = 0
+        self.segment_start_time = time.time()
         self.reset_correction_filter()
         self.route_state = "MOVE"
         self.expected_next_tag = int(to_tag)
@@ -1474,6 +1498,60 @@ class AGVQtApp(QMainWindow):
         self.route_state = "LOCAL_ARRIVAL"
         self.append_log(f"Local arrival at Tag {landmark_id}, helper {helper_id} accepted. Central tag not required.")
 
+    def mission_helper_arrival_allowed(self, detections):
+        """
+        Allow helper-only arrival BEFORE SEARCH_TARGET only for normal A* mission.
+
+        This is NOT used during calibration/docking Tag 0 -> Tag 1.
+        That protection prevents Tag 0 helper 505 from being accepted as Tag 1.
+
+        For mission segments, this fixes Tag 3 / Tag 10 cases where local tags are
+        visible but the code never reaches SEARCH_TARGET because helper IDs 501-508
+        are continuously visible from old cluster to target cluster.
+        """
+        if self.calibrating_move_to_tag1:
+            return False
+
+        if not self.mission_running:
+            return False
+
+        old_central_visible = find_tag(detections, self.travel_from_landmark) is not None
+
+        if old_central_visible:
+            self.old_central_lost_count = 0
+        else:
+            self.old_central_lost_count += 1
+
+        travelled_long_enough = (time.time() - self.segment_start_time) >= MISSION_HELPER_MIN_TRAVEL_SEC
+        old_central_gone = self.old_central_lost_count >= MISSION_OLD_CENTRAL_LOST_FRAMES
+
+        return travelled_long_enough and old_central_gone
+
+    def mission_target_helper_candidate(self, detections):
+        """
+        Helper candidate for mission-only early local arrival.
+
+        Priority follows the standalone code plus your important helpers:
+          1) side-center + adjacent corner pair
+          2) important cross helpers 501, 503, 505, 507
+        Corner-only helpers are not enough for early mission arrival.
+        """
+        if find_tag(detections, self.travel_to_landmark) is not None:
+            return None
+
+        pair_helper = detect_side_pair(detections, self.travel_to_landmark)
+        if pair_helper is not None:
+            return pair_helper
+
+        ids = visible_ids(detections)
+
+        for helper_id in [501, 503, 505, 507]:
+            if helper_id in ids:
+                return helper_id
+
+        return None
+
+
     def choose_move_correction(self, detections):
         """
         Standalone cluster program logic, adapted to Qt/A*.
@@ -1501,6 +1579,33 @@ class AGVQtApp(QMainWindow):
         self.target_central_seen_count = 0
 
         if self.segment_phase == "START_CLUSTER":
+            # Standalone behavior is still the base:
+            # helpers are considered OLD landmark helpers until full old-cluster loss.
+            #
+            # Qt/A* mission addition:
+            # During normal mission only, if the old central tag has disappeared
+            # for a few frames and a target-local helper pattern/cross-helper is visible,
+            # accept local arrival. This is disabled during docking 0->1.
+            helper_id = self.mission_target_helper_candidate(detections)
+
+            if helper_id is not None and self.mission_helper_arrival_allowed(detections):
+                self.target_helper_seen_count += 1
+
+                self.append_log(
+                    f"MISSION EARLY LOCAL HELPER: target={self.travel_to_landmark} "
+                    f"helper={helper_id} count={self.target_helper_seen_count}/{TARGET_HELPER_SEEN_FRAMES_REQUIRED} "
+                    f"oldCentralLost={self.old_central_lost_count}. Central tag not required."
+                )
+
+                if self.target_helper_seen_count >= TARGET_HELPER_SEEN_FRAMES_REQUIRED:
+                    self.start_local_arrival(
+                        self.travel_to_landmark,
+                        helper_id
+                    )
+                    return None, None, ""
+            else:
+                self.target_helper_seen_count = 0
+
             # EXACT standalone behavior:
             # If current/old central OR any helper is visible, it still belongs
             # to the old landmark. Keep correcting using old landmark.
@@ -1625,7 +1730,7 @@ class AGVQtApp(QMainWindow):
                 self.send_velocity(left, right)
 
                 # Log at lower rate only.
-                if time.time() - getattr(self, "_last_corr_log", 0.0) > 0.70:
+                if time.time() - getattr(self, "_last_corr_log", 0.0) > 1.20:
                     self._last_corr_log = time.time()
                     self.append_log(
                         f"{label} CORR seg={self.travel_from_landmark}->{self.travel_to_landmark} "
@@ -1772,7 +1877,7 @@ class AGVQtApp(QMainWindow):
         self.current_tag = DOCK_TAG
         self.current_heading = SOUTH
 
-        self.append_log("Moving from docking Tag 0 to grid Tag 1 using standalone cluster logic: Tag 0 helpers remain OLD until full cluster loss.")
+        self.append_log("Moving from docking Tag 0 to grid Tag 1. Docking protection ON: Tag 0 helpers remain OLD; helper-only early arrival is disabled.")
         self.start_segment(DOCK_TAG, GRID_START_TAG)
         self.lock_heading_go()
 
