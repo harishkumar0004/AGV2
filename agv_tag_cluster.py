@@ -898,7 +898,7 @@ class AGVQtApp(QMainWindow):
         camera_layout = QVBoxLayout(camera_group)
         self.camera_label = QLabel("Camera not started")
         self.camera_label.setAlignment(Qt.AlignCenter)
-        self.camera_label.setMinimumSize(520, 390)
+        self.camera_label.setMinimumSize(560, 420)
         self.camera_label.setStyleSheet("background:#111;color:white;border:1px solid #555;")
         self.camera_status = QLabel("Camera status: idle")
         self.camera_status.setStyleSheet("font-weight:bold;")
@@ -1036,7 +1036,7 @@ class AGVQtApp(QMainWindow):
         log_layout = QVBoxLayout(log_group)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(220)
+        self.log.setMinimumHeight(260)
         log_layout.addWidget(self.log)
         right.addWidget(log_group, 1)
 
@@ -1095,7 +1095,7 @@ class AGVQtApp(QMainWindow):
             f"State:{self.route_state} Seg:{self.travel_from_landmark}->{self.travel_to_landmark}",
             (25, 35),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
+            0.55,
             (255, 255, 255),
             2,
         )
@@ -1104,7 +1104,7 @@ class AGVQtApp(QMainWindow):
             f"Drive:{self.last_drive_mode} L:{self.drive_left_pps} R:{self.drive_right_pps}",
             (25, 65),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
+            0.55,
             (255, 255, 255),
             2,
         )
@@ -1483,10 +1483,16 @@ class AGVQtApp(QMainWindow):
             helper_id = detect_local_arrival_helper(detections, self.travel_to_landmark)
             if helper_id is not None:
                 self.append_log(
-                    f"Local helper Tag {helper_id} seen for target {self.travel_to_landmark}. "
-                    "Central tag is not required."
+                    f"ARRIVAL BY LOCAL HELPER: helper Tag {helper_id} seen for target {self.travel_to_landmark}. "
+                    "Stopping now; central tag is not required."
                 )
-                self.start_local_arrival(self.travel_to_landmark, helper_id)
+
+                # Important restore:
+                # For path waypoints such as 10 in 8 -> 9 -> 10 -> 15,
+                # do not continue nudging forward while waiting for the central tag.
+                # The old tested behavior treated local cluster helpers as enough
+                # arrival evidence once the previous cluster was fully lost.
+                self.handle_landmark_arrival(self.travel_to_landmark)
                 return None, None, ""
 
             tag = choose_best_cluster_tag(detections, self.travel_to_landmark)
