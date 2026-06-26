@@ -345,14 +345,23 @@ EXIT_CENTER_BY_HEADING = {
 #   501 is entry center for pair 508+501 or 501+502
 #   505 is entry center for pair 504+505 or 505+506
 #   507 is rejected because pair 506+507 or 507+508 is the exit side
-# Strict entry/exit sides by travel direction.
+# Direction-specific entry/exit helpers.
 #
-# For EAST travel, for example 15->14->13->12->11:
-#   target entry side = 506/507/508, center = 507
-#   current-tag exit side = 502/503/504, center = 503
+# User-confirmed entry side:
+#   WEST  entry side = 502, 503, 504  center 503
+#   EAST  entry side = 506, 507, 508  center 507
+#   NORTH entry side = 504, 505, 506  center 505
+#   SOUTH entry side = 508, 501, 502  center 501
 #
-# Therefore at 13->12, helper 508 must be treated as target-side
-# correction evidence, not as old Tag 13 correction.
+# Important: the robot may see only one row of the cluster first.
+# Example for NORTH:
+#   504 can appear first, then 503 can appear next -> valid target-side evidence
+#   506 can appear first, then 507 can appear next -> valid target-side evidence
+#
+# Therefore each heading has:
+#   - a strict entry side
+#   - a strict entry center
+#   - valid next side-centers after entry corners
 ENTRY_HELPER_IDS_BY_HEADING = {
     WEST: {502, 503, 504},
     EAST: {506, 507, 508},
@@ -367,13 +376,6 @@ EXIT_HELPER_IDS_BY_HEADING = {
     SOUTH: {504, 505, 506},
 }
 
-VALID_ENTRY_CENTERS_BY_HEADING = {
-    WEST: {503},
-    EAST: {507},
-    NORTH: {505},
-    SOUTH: {501},
-}
-
 ENTRY_CENTER_BY_HEADING_STRICT = {
     WEST: 503,
     EAST: 507,
@@ -381,29 +383,40 @@ ENTRY_CENTER_BY_HEADING_STRICT = {
     SOUTH: 501,
 }
 
-# Corner-only transition rule.
-# If a corner is seen without a valid side-center pair, the next cross helper
-# beside that corner can be accepted as local arrival when it appears alone.
-#
-# This handles cases like:
-#   only 502 seen first -> next local center 501 can mark reached
-#   only 504 seen first -> next local center 505 can mark reached
-#
-# The direction gate below still rejects the known exit side.
-CORNER_TO_NEXT_SINGLE_CENTERS = {
-    # User-confirmed corner transition:
-    #   only 502 seen first -> next local center must be 501
-    #   only 504 seen first -> next local center must be 505
-    #
-    # Do NOT allow 502->503 or 504->503. That caused Tag 10 local 503
-    # to be accepted as Tag 15 after seeing 504.
-    502: {501},
-    504: {505},
-
-    # Symmetric corner transitions for the other two corners.
-    506: {505},
-    508: {501},
+# Corner-only entry sequence:
+#   if the entry corner appears first, the next adjacent side-center is still
+#   valid target-side evidence.
+CORNER_TO_NEXT_CENTER_BY_HEADING = {
+    WEST: {
+        502: {501},
+        504: {505},
+    },
+    EAST: {
+        506: {505},
+        508: {501},
+    },
+    NORTH: {
+        504: {503},
+        506: {507},
+    },
+    SOUTH: {
+        508: {507},
+        502: {503},
+    },
 }
+
+# Valid pair/single centers for target-side arrival.
+# This includes the strict entry center plus the valid next side-centers from
+# the entry-corner sequence.
+VALID_ENTRY_CENTERS_BY_HEADING = {
+    WEST: {503, 501, 505},
+    EAST: {507, 505, 501},
+    NORTH: {505, 503, 507},
+    SOUTH: {501, 507, 503},
+}
+
+# Corner-only transition rule is heading-specific.
+# See CORNER_TO_NEXT_CENTER_BY_HEADING above.
 
 
 HELPER_GROUP_BY_CENTER = {
@@ -1911,35 +1924,35 @@ class AGVQtApp(QMainWindow):
 
     def update_corner_single_arrival_candidates(self, detections):
         """
-        Track direction-aware corner-only entry evidence.
+        Track direction-aware corner -> next-side-center sequence.
 
-        Example EAST travel into Tag 13/12/11:
-            entry side is 506/507/508
-            if corner 506 or 508 appears alone, the next valid local center is 507
+        Example NORTH:
+            entry side = 504/505/506
+            504 first, then 503 is valid
+            506 first, then 507 is valid
 
-        This is not time-based or frame-count based; it is a local tag sequence.
+        Example EAST:
+            entry side = 506/507/508
+            506 first, then 505 is valid
+            508 first, then 501 is valid
         """
         ids = visible_ids(detections)
         new_candidates = set()
 
-        entry_center = ENTRY_CENTER_BY_HEADING_STRICT.get(self.segment_heading)
-        entry_helpers = ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set())
+        entry_corners = CORNER_TO_NEXT_CENTER_BY_HEADING.get(self.segment_heading, {})
+        valid_centers = self.valid_entry_centers_for_heading()
 
-        if entry_center is None:
-            return
-
-        for corner_id in CORNER_HELPERS:
+        for corner_id, next_centers in entry_corners.items():
             if corner_id not in ids:
                 continue
-            if corner_id not in entry_helpers:
-                continue
 
-            # If the center is already visible with this corner, pair handling
-            # is stronger and will run before single-center sequence handling.
-            if entry_center in ids:
-                continue
-
-            new_candidates.add(entry_center)
+            for center_id in next_centers:
+                if center_id in valid_centers and not self.helper_is_exit_side(center_id):
+                    # If the center is already visible with the corner, pair
+                    # handling can accept it immediately. Still adding it here
+                    # allows the same sequence to remain valid if the corner
+                    # disappears just before the center is read.
+                    new_candidates.add(center_id)
 
         if new_candidates:
             before = set(self.corner_single_arrival_candidates)
@@ -1948,7 +1961,7 @@ class AGVQtApp(QMainWindow):
             if added and time.time() - getattr(self, "_last_corner_candidate_log", 0.0) > 0.50:
                 self._last_corner_candidate_log = time.time()
                 self.append_log(
-                    "Direction entry-corner evidence: only allow next local center(s) "
+                    "Entry-corner sequence: allow next local center(s) "
                     + ", ".join(str(x) for x in sorted(added))
                     + f" for target {self.travel_to_landmark}"
                 )
@@ -1988,6 +2001,10 @@ class AGVQtApp(QMainWindow):
 
         if helper_id in self.corner_single_arrival_candidates:
             return True, f"pair_matches_corner_sequence_{helper_id}"
+
+        strict_entry_center = ENTRY_CENTER_BY_HEADING_STRICT.get(self.segment_heading)
+        if strict_entry_center is not None and helper_id == int(strict_entry_center):
+            return True, f"pair_matches_strict_entry_center_{helper_id}"
 
         return False, (
             "pair_does_not_match_corner_sequence_"
@@ -2031,20 +2048,24 @@ class AGVQtApp(QMainWindow):
 
     def entry_side_helper_visible(self, detections):
         """
-        Return a visible helper that belongs to the target entry side for the
-        current travel direction. Central target still wins elsewhere.
+        Return a visible helper that is valid target-side correction evidence.
 
-        For EAST, entry side is 506/507/508. This fixes 13->12:
-        helper 508 is target-side correction evidence, not old Tag 13 correction.
+        Valid target-side correction helpers:
+          - any helper on the strict entry side for this heading
+          - any side-center allowed by a previous entry-corner sequence
         """
-        entry_helpers = ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set())
+        entry_helpers = set(ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set()))
+        sequence_centers = set(getattr(self, "corner_single_arrival_candidates", set()))
+        allowed_helpers = entry_helpers.union(sequence_centers)
 
         best_tag = None
         best_dist = 999999999.0
 
         for tag in detections:
             tid = int(tag.tag_id)
-            if tid not in entry_helpers:
+            if tid not in allowed_helpers:
+                continue
+            if self.helper_is_exit_side(tid):
                 continue
 
             dx = tag.center[0] - CX
@@ -2622,7 +2643,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: strict_entry_side_target_correction active")
+        self.append_log("BUILD: entry_side_plus_corner_sequence active")
 
         self.active_path = list(self.path)
         self.path_index = 1
