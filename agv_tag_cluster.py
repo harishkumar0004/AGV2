@@ -260,7 +260,8 @@ TARGET_HELPER_SEEN_FRAMES_REQUIRED = 1
 # No time-based arrival and no single-helper arrival.
 # A side-pair helper is accepted only when the estimated landmark center
 # is reasonably close to the camera center line.
-LOCAL_PAIR_CENTER_Y_OK_PX = 120
+LOCAL_PAIR_CENTER_Y_OK_PX = 70
+LOCAL_SINGLE_CENTER_Y_OK_PX = 90
 # Minimum time after segment start before helpers are allowed to confirm target arrival.
 # Prevents immediately accepting old-cluster helpers at segment start.
 # Previous central tag should be absent briefly before accepting helper-only target arrival.
@@ -435,46 +436,13 @@ def choose_correction_tag(detections, central_tag_id):
 
 
 def detect_side_pair(detections, target_landmark):
-    ids = visible_ids(detections)
-
-    if target_landmark in ids:
-        return None
-
-    groups = [
-        (503, {502, 504}),
-        (507, {506, 508}),
-        (501, {508, 502}),
-        (505, {506, 504}),
-    ]
-
-    for center_helper, corners in groups:
-        if center_helper in ids and len(ids.intersection(corners)) > 0:
-            return center_helper
-
-    return None
-
-
-
-def detect_local_arrival_helper(detections, target_landmark):
     """
-    Standalone-style local arrival detector.
+    Valid side-pair local arrival evidence.
 
-    GOOD DECISION:
-    Do NOT accept a single helper tag as reached.
-
-    Reason:
-    Helper IDs 501-508 are reused at every landmark. A single 501/503/505/507
-    can still be from the landmark we are leaving. This caused the 9 -> 10 false
-    arrival and wrong turn toward 13.
-
-    Accept only the same side-pair evidence used in the standalone logic:
-      502 + 503 or 503 + 504 -> 503
-      506 + 507 or 507 + 508 -> 507
-      508 + 501 or 501 + 502 -> 501
-      506 + 505 or 505 + 504 -> 505
-
-    The important tags 501, 503, 505, 507 are still important, but only as the
-    side-center helper of a valid pair.
+    502 + 503 or 503 + 504 -> 503
+    506 + 507 or 507 + 508 -> 507
+    508 + 501 or 501 + 502 -> 501
+    506 + 505 or 505 + 504 -> 505
     """
     ids = visible_ids(detections)
 
@@ -493,6 +461,56 @@ def detect_local_arrival_helper(detections, target_landmark):
             return center_helper
 
     return None
+
+
+def detect_single_cross_helper(detections, target_landmark):
+    """
+    Single important local helper: 501 / 503 / 505 / 507.
+
+    This is never accepted during START_CLUSTER.
+    It is accepted only in SEARCH_TARGET for normal mission, never during
+    calibration/docking 0 -> 1.
+    """
+    ids = visible_ids(detections)
+
+    if target_landmark in ids:
+        return None
+
+    best_tag = None
+    best_dist = 999999999.0
+
+    for tag in detections:
+        if int(tag.tag_id) in CROSS_HELPERS:
+            dx = tag.center[0] - CX
+            dy = tag.center[1] - CY
+            dist = dx * dx + dy * dy
+            if dist < best_dist:
+                best_dist = dist
+                best_tag = tag
+
+    if best_tag is None:
+        return None
+
+    return int(best_tag.tag_id)
+
+
+def detect_local_arrival_helper(detections, target_landmark, allow_single_cross=False):
+    """
+    Local helper arrival detector.
+
+    PAIR is valid whenever helper arrival is allowed.
+    SINGLE is valid only when allow_single_cross=True.
+    """
+    pair_helper = detect_side_pair(detections, target_landmark)
+    if pair_helper is not None:
+        return pair_helper, "PAIR"
+
+    if allow_single_cross:
+        single_helper = detect_single_cross_helper(detections, target_landmark)
+        if single_helper is not None:
+            return single_helper, "SINGLE"
+
+    return None, None
 
 
 def get_helper_grid_offset(tag_id, central_tag_id):
@@ -1085,10 +1103,8 @@ class AGVQtApp(QMainWindow):
         ts = time.strftime("%H:%M:%S")
         self.log.append(f"[{ts}] {text}")
 
-        # Keep log usable on RPi: user can turn off auto-scroll and inspect older lines.
         if hasattr(self, "log_autoscroll_checkbox") and self.log_autoscroll_checkbox.isChecked():
             self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
-
 
     def update_ui_state(self):
         self.current_tag_edit.setText(str(self.current_tag) if self.current_tag is not None else "---")
@@ -1488,22 +1504,28 @@ class AGVQtApp(QMainWindow):
             self.lock_heading_go()
 
     def start_local_arrival(self, landmark_id, helper_id):
+        """
+        Local helper arrival is a pure stop/update event.
+
+        No time-based nudge.
+        No frame-based helper wait.
+        """
         self.stop_robot()
         self.local_arrival_landmark = int(landmark_id)
         self.local_arrival_helper_id = int(helper_id)
         self.local_arrival_good_count = 0
         self.local_arrival_start_time = time.time()
-        self.route_state = "LOCAL_ARRIVAL"
-        self.append_log(f"Local arrival at Tag {landmark_id}, helper {helper_id} accepted. Central tag not required.")
+        self.append_log(
+            f"Local helper accepted as reached: target={landmark_id} helper={helper_id}. "
+            "STOP now; no nudge/frame wait."
+        )
+        self.handle_landmark_arrival(landmark_id)
 
-    def local_pair_arrival_ready(self, detections, helper_id):
+    def local_helper_arrival_ready(self, detections, helper_id, evidence_type):
         """
-        Geometry-only confirmation for side-pair local arrival.
+        Geometry-only helper confirmation.
 
-        This avoids time/frame based arrival. The pair must be visible and the
-        estimated target landmark center from that helper must be near the camera
-        center line. If not, we keep using vision correction instead of declaring
-        the waypoint reached.
+        No timing and no repeated-frame requirement.
         """
         helper = find_tag(detections, helper_id)
         if helper is None:
@@ -1523,27 +1545,37 @@ class AGVQtApp(QMainWindow):
             helper_y_grid,
         ) = pose
 
-        ready = abs(center_y_error_px) <= LOCAL_PAIR_CENTER_Y_OK_PX
-        return ready, center_y_error_px
+        if evidence_type == "PAIR":
+            limit = LOCAL_PAIR_CENTER_Y_OK_PX
+        else:
+            limit = LOCAL_SINGLE_CENTER_Y_OK_PX
 
+        ready = abs(center_y_error_px) <= limit
+        return ready, center_y_error_px
 
     def choose_move_correction(self, detections):
         """
-        Corrected cluster logic.
+        Final helper rule set.
+
+        0 -> 1 calibration:
+          - START_CLUSTER: helpers are OLD Tag 0, never reached.
+          - SEARCH_TARGET: central target OR side-pair only.
+          - single helper is not accepted.
+
+        Normal A* mission:
+          - START_CLUSTER:
+              central target can stop.
+              side-pair near center can stop.
+              single 501/503/505/507 is correction only, not reached.
+          - SEARCH_TARGET:
+              central target can stop.
+              side-pair can stop.
+              single 501/503/505/507 can stop when centered.
 
         Removed:
           - time-based helper arrival
-          - frame-based helper arrival
-          - single-helper arrival
-
-        Used:
-          - central target tag arrival
-          - side-pair local helper arrival, geometry-gated
-          - old central tag has priority while visible
-
-        This prevents the 9 -> 10 false arrival caused by seeing one local helper
-        too early, while still allowing Tag 3/turning tags to stop when a valid
-        side-pair local cluster is really under the camera.
+          - frame-count helper arrival
+          - single-helper early arrival
         """
         central_target = find_tag(detections, self.travel_to_landmark)
 
@@ -1558,53 +1590,84 @@ class AGVQtApp(QMainWindow):
             return central_target, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
         self.target_central_seen_count = 0
-
-        # Old central tag has priority. If we still see the exact old central,
-        # we are not at the next landmark yet.
         old_central = find_tag(detections, self.travel_from_landmark)
-        if self.segment_phase == "START_CLUSTER" and old_central is not None:
-            self.cluster_lost_count = 0
-            return old_central, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
-
-        # Local helper arrival is allowed only by valid side-pair, never single helper.
-        helper_id = detect_local_arrival_helper(detections, self.travel_to_landmark)
-
-        if helper_id is not None:
-            ready, center_y_error_px = self.local_pair_arrival_ready(detections, helper_id)
-
-            if time.time() - getattr(self, "_last_pair_log", 0.0) > 0.60:
-                self._last_pair_log = time.time()
-                self.append_log(
-                    f"LOCAL PAIR CHECK target={self.travel_to_landmark} helper={helper_id} "
-                    f"phase={self.segment_phase} centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px "
-                    f"ready={ready}"
-                )
-
-            if ready:
-                self.start_local_arrival(
-                    self.travel_to_landmark,
-                    helper_id
-                )
-                return None, None, ""
-
-            # Pair is visible but not yet centered enough; use it for target correction.
-            tag = find_tag(detections, helper_id)
-            if tag is not None:
-                return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
         if self.segment_phase == "START_CLUSTER":
-            # Standalone base behavior:
-            # If helpers are visible but no valid target pair is ready, keep them
-            # as old-cluster correction. This protects docking 0 -> 1 and avoids
-            # single-helper false arrival.
-            if any_cluster_visible_now(detections, self.travel_from_landmark):
-                self.cluster_lost_count = 0
 
-                tag = choose_best_cluster_tag(
+            # Calibration/docking 0 -> 1:
+            # strict standalone behavior. Do not accept helper arrival while
+            # Tag 0 helpers are still around.
+            if self.calibrating_move_to_tag1:
+                if any_cluster_visible_now(detections, self.travel_from_landmark):
+                    self.cluster_lost_count = 0
+                    tag = choose_best_cluster_tag(detections, self.travel_from_landmark)
+                    return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
+
+                self.cluster_lost_count += 1
+
+                if self.cluster_lost_count >= CLUSTER_LOST_FRAMES_REQUIRED:
+                    self.segment_phase = "SEARCH_TARGET"
+                    self.append_log(
+                        f"Fully left docking Tag {self.travel_from_landmark}. "
+                        f"Now target {self.travel_to_landmark} can use central tag or side-pair helpers."
+                    )
+
+                return None, None, ""
+
+            # Normal mission: if exact old central is still visible, do not accept helpers.
+            if old_central is not None:
+                self.cluster_lost_count = 0
+                return old_central, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
+
+            # Normal mission START_CLUSTER:
+            # side-pair can stop, but single cross helper is correction only.
+            helper_id, evidence_type = detect_local_arrival_helper(
+                detections,
+                self.travel_to_landmark,
+                allow_single_cross=False
+            )
+
+            if helper_id is not None:
+                ready, center_y_error_px = self.local_helper_arrival_ready(
                     detections,
-                    self.travel_from_landmark
+                    helper_id,
+                    evidence_type
                 )
 
+                if time.time() - getattr(self, "_last_pair_log", 0.0) > 0.60:
+                    self._last_pair_log = time.time()
+                    self.append_log(
+                        f"MISSION START {evidence_type} target={self.travel_to_landmark} helper={helper_id} "
+                        f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px ready={ready}"
+                    )
+
+                if ready:
+                    self.start_local_arrival(self.travel_to_landmark, helper_id)
+                    return None, None, ""
+
+                tag = find_tag(detections, helper_id)
+                if tag is not None:
+                    return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
+
+            single_helper = detect_single_cross_helper(detections, self.travel_to_landmark)
+
+            if single_helper is not None:
+                if time.time() - getattr(self, "_last_single_log", 0.0) > 0.90:
+                    self._last_single_log = time.time()
+                    self.append_log(
+                        f"SINGLE HELPER CORRECTION ONLY: target={self.travel_to_landmark} "
+                        f"helper={single_helper} phase=START_CLUSTER; not reached."
+                    )
+
+                tag = find_tag(detections, single_helper)
+                if tag is not None:
+                    return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
+
+            # Standalone fallback: if helpers are visible but not safe target arrival,
+            # keep correcting relative to old cluster.
+            if any_cluster_visible_now(detections, self.travel_from_landmark):
+                self.cluster_lost_count = 0
+                tag = choose_best_cluster_tag(detections, self.travel_from_landmark)
                 return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
 
             self.cluster_lost_count += 1
@@ -1613,16 +1676,45 @@ class AGVQtApp(QMainWindow):
                 self.segment_phase = "SEARCH_TARGET"
                 self.append_log(
                     f"Fully left Tag {self.travel_from_landmark}. "
-                    f"Now side-pair helpers can belong to target {self.travel_to_landmark}."
+                    f"Now target {self.travel_to_landmark} can use central, side-pair, or single cross helper."
                 )
 
             return None, None, ""
 
         if self.segment_phase == "SEARCH_TARGET":
-            tag = choose_best_cluster_tag(
+
+            allow_single = not self.calibrating_move_to_tag1
+
+            helper_id, evidence_type = detect_local_arrival_helper(
                 detections,
-                self.travel_to_landmark
+                self.travel_to_landmark,
+                allow_single_cross=allow_single
             )
+
+            if helper_id is not None:
+                ready, center_y_error_px = self.local_helper_arrival_ready(
+                    detections,
+                    helper_id,
+                    evidence_type
+                )
+
+                if time.time() - getattr(self, "_last_pair_log", 0.0) > 0.60:
+                    self._last_pair_log = time.time()
+                    self.append_log(
+                        f"SEARCH {evidence_type} target={self.travel_to_landmark} helper={helper_id} "
+                        f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px "
+                        f"ready={ready} singleAllowed={allow_single}"
+                    )
+
+                if ready:
+                    self.start_local_arrival(self.travel_to_landmark, helper_id)
+                    return None, None, ""
+
+                tag = find_tag(detections, helper_id)
+                if tag is not None:
+                    return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
+
+            tag = choose_best_cluster_tag(detections, self.travel_to_landmark)
 
             if tag is not None:
                 return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
@@ -1840,7 +1932,7 @@ class AGVQtApp(QMainWindow):
         self.current_tag = DOCK_TAG
         self.current_heading = SOUTH
 
-        self.append_log("Moving from docking Tag 0 to grid Tag 1 using standalone cluster logic: Tag 0 helpers remain OLD until full cluster loss.")
+        self.append_log("Moving from docking Tag 0 to grid Tag 1. Rule: no single-helper arrival during docking; helpers remain OLD until full loss.")
         self.start_segment(DOCK_TAG, GRID_START_TAG)
         self.lock_heading_go()
 
@@ -1997,4 +2089,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
