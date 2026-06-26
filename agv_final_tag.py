@@ -530,12 +530,10 @@ KP_YAW_STRONG_PPS_PER_DEG = 42
 KP_X_STRONG_PPS_PER_M = 85000
 
 # Direction-specific X correction sign.
-# This is the only X-sign source used by travel correction. The camera pose X
-# axis does not flip with robot heading, so EAST must use the same sign as the
-# working directions; otherwise the lateral correction amplifies eastward drift.
+# This is the only X-sign source used by travel correction.
 X_SIGN_BY_HEADING = {
     NORTH: -1.0,
-    EAST: -1.0,
+    EAST: 1.0,
     SOUTH: -1.0,
     WEST: -1.0,
 }
@@ -1495,7 +1493,6 @@ class AGVQtApp(QMainWindow):
                 self.update_ui_state()
 
 
-
     # -------------------------
     # Serial
     # -------------------------
@@ -2308,43 +2305,32 @@ class AGVQtApp(QMainWindow):
         """
         Reached/pass-through decision.
 
-        WEST is the reference behavior:
-            entry side 502/503/504
-            center-side helper 503 -> CENTRAL
-            helper correction continues until the actual central target tag is
-            detected/reached.
+        Generic rule for every heading:
+          - A helper that maps to "CENTRAL" is correction-only.
+            Example EAST: 507 -> CENTRAL. 507 guides toward the target tag,
+            but does not confirm reached by itself.
+          - An integer VALUE helper from ENTRY_SEQUENCE_BY_HEADING can confirm
+            reached only after its entry corner created it as a candidate.
+            Example EAST: 508 -> 501. 501 can confirm reached only after 508.
+          - Even then, it must be near the camera center line.
 
-        EAST must mirror WEST:
-            entry side 506/507/508
-            center-side helper 507 -> CENTRAL
-            508 -> 501 and 506 -> 505 are valid sequence/correction evidence,
-            but for EAST they must not immediately become the next landmark.
-
-        Therefore, for EAST:
-            501/505 after 508/506 are correction-only.
-            The actual target tag, or the EAST center guide 507 leading to the
-            actual target tag, decides the reached/pass-through event.
+        This keeps the table as the single source of direction logic and does
+        not use separate EAST parameters.
         """
         helper_id = int(helper_id)
 
         if not ACCEPT_EXPECTED_LOCAL_CENTER_AS_REACHED:
             return False
 
-        # EAST mirrors the working WEST behavior:
-        # do not let the value helpers 501/505 end the segment.
-        # They can still be used for correction because
-        # helper_is_valid_sequence_center_now() remains true for candidates.
-        if self.segment_heading == EAST:
-            return False
-
+        # Only integer VALUE helpers that were created by a valid entry corner
+        # may confirm reached. Direct "CENTRAL" helpers such as EAST 507 or
+        # WEST 503 remain correction-only unless the actual central tag appears.
         if helper_id not in set(getattr(self, "corner_single_arrival_candidates", set())):
             return False
 
         if center_y_error_px is None:
             return False
 
-        # If this constant exists in the file, use it. Otherwise fall back to
-        # the local pair gate used by the older stable build.
         gate = globals().get("EXPECTED_LOCAL_CENTER_REACHED_Y_OK_PX", LOCAL_PAIR_CENTER_Y_OK_PX)
         return abs(center_y_error_px) <= gate
 
@@ -2998,7 +2984,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: single_xsign_pass_through_carry active")
+        self.append_log("BUILD: generic_local_center_reached active")
 
         self.active_path = list(self.path)
         self.path_index = 1
@@ -3087,7 +3073,6 @@ def main():
     win = AGVQtApp()
     win.show()
     sys.exit(app.exec_())
-
 
 
 if __name__ == "__main__":
