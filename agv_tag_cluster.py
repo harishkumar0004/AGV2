@@ -497,13 +497,19 @@ LOCAL_NUDGE_TIMEOUT_SEC = 5.0
 # Accept local helper tags as arrival evidence; central tag is not required.
 LOCAL_HELPER_SEEN_FRAMES_REQUIRED = 1
 
-# Exact-table helper arrival rule.
-# Do not accept arbitrary helpers.
-# Accept only:
-#   1) direct CENTRAL helper from ENTRY_SEQUENCE_BY_HEADING, or
-#   2) expected helper created by the previous entry helper.
-# Example EAST: 508 -> 501, so 501 can confirm Tag 12 after 508.
-ACCEPT_EXPECTED_HELPER_AS_REACHED = True
+# Local-center reached rule from ENTRY_SEQUENCE_BY_HEADING.
+#
+# Integer VALUES in the table are local center helpers and may confirm reached
+# after their entry helper created them as candidates.
+#
+# A helper that maps to "CENTRAL" is correction evidence only. It guides toward
+# the actual central landmark tag, but it does not confirm reached by itself.
+#
+# Example EAST for target 12:
+#   506 -> 505       # 505 can confirm reached after 506
+#   507 -> CENTRAL   # 507 cannot confirm reached by itself
+#   508 -> 501       # 501 can confirm reached after 508
+ACCEPT_EXPECTED_LOCAL_CENTER_AS_REACHED = True
 
 
 # Stronger correction tuning.
@@ -517,21 +523,6 @@ KP_YAW_STRONG_PPS_PER_DEG = 42
 KP_X_STRONG_PPS_PER_M = 85000
 
 X_SIGN = -1.0
-
-# Direction-specific X correction sign.
-#
-# Use this when one travel direction corrects in the opposite physical direction.
-# Your latest log shows NORTH travel 5->10 / 10->15:
-#   seen=504 centerXM=-0.0093 corr=+225 L=3625 R=4075
-# and you reported the correction is physically wrong.
-#
-# Therefore flip only NORTH first. Do not change EAST/WEST/SOUTH yet.
-X_SIGN_BY_HEADING = {
-    NORTH: 1.0,
-    EAST: -1.0,
-    SOUTH: -1.0,
-    WEST: -1.0,
-}
 
 # IMPORTANT:
 # During grid travel the ESP32/IMU owns heading hold.
@@ -1703,8 +1694,7 @@ class AGVQtApp(QMainWindow):
             x_for_control = 0.0
 
         yaw_corr = kp_yaw * yaw_for_control
-        direction_x_sign = X_SIGN_BY_HEADING.get(getattr(self, "segment_heading", None), X_SIGN)
-        x_corr = kp_x * x_for_control * direction_x_sign
+        x_corr = kp_x * x_for_control * X_SIGN
 
         if abs(x_for_control) > X_DEADBAND_M:
             if yaw_corr * x_corr < 0:
@@ -2283,18 +2273,22 @@ class AGVQtApp(QMainWindow):
 
         return False
 
+
     def helper_can_confirm_reached_now(self, helper_id):
+        """
+        Confirm reached only from integer VALUES in ENTRY_SEQUENCE_BY_HEADING
+        after their entry helper created them as candidates.
+
+        Example EAST for target 12:
+            508 -> 501    => 501 can confirm reached.
+            506 -> 505    => 505 can confirm reached.
+            507 -> CENTRAL => 507 is correction only and cannot confirm reached.
+        """
         helper_id = int(helper_id)
 
-        if not ACCEPT_EXPECTED_HELPER_AS_REACHED:
+        if not ACCEPT_EXPECTED_LOCAL_CENTER_AS_REACHED:
             return False
 
-        # Direct center helper in the user's table.
-        if self.helper_expects_central_now(helper_id):
-            return True
-
-        # Expected helper produced by an entry helper in the user's table.
-        # Example EAST: 508 produced candidate 501.
         return helper_id in set(getattr(self, "corner_single_arrival_candidates", set()))
 
     def remember_local_arrival_helper(self, helper_id):
@@ -2431,7 +2425,7 @@ class AGVQtApp(QMainWindow):
 
                 if ready and self.helper_can_confirm_reached_now(helper_id):
                     self.append_log(
-                        f"EXPECTED HELPER REACHED: target={self.travel_to_landmark} "
+                        f"EXPECTED LOCAL CENTER REACHED: target={self.travel_to_landmark} "
                         f"helper={helper_id} group={helper_group_name(helper_id)} "
                         f"seq={self.helper_sequence_note(helper_id)} "
                         f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px. "
@@ -2468,7 +2462,7 @@ class AGVQtApp(QMainWindow):
 
                     if ready and self.helper_can_confirm_reached_now(single_helper):
                         self.append_log(
-                            f"EXPECTED SINGLE HELPER REACHED: target={self.travel_to_landmark} "
+                            f"EXPECTED SINGLE LOCAL CENTER REACHED: target={self.travel_to_landmark} "
                             f"helper={single_helper} reason={single_reason} "
                             f"seq={self.helper_sequence_note(single_helper)} "
                             f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px. "
@@ -2599,7 +2593,7 @@ class AGVQtApp(QMainWindow):
 
                     if self.helper_can_confirm_reached_now(helper_id):
                         self.append_log(
-                            f"SEARCH EXPECTED HELPER REACHED: target={self.travel_to_landmark} "
+                            f"SEARCH EXPECTED LOCAL CENTER REACHED: target={self.travel_to_landmark} "
                             f"helper={helper_id} evidence={evidence_type} "
                             f"seq={self.helper_sequence_note(helper_id)} "
                             f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px. "
@@ -2700,7 +2694,6 @@ class AGVQtApp(QMainWindow):
                         f"{label} CORR seg={self.travel_from_landmark}->{self.travel_to_landmark} "
                         f"phase={self.segment_phase} seen={seen_tag_id} grid=({helper_x_grid},{helper_y_grid}) "
                         f"yawErr={yaw_error:.2f} centerXM={center_x_m:.4f} level={error_level} "
-                        f"xSign={X_SIGN_BY_HEADING.get(getattr(self, 'segment_heading', None), X_SIGN):.1f} "
                         f"corr={correction} L={left} R={right}"
                     )
         elif self.route_state == "MOVE":
@@ -2938,7 +2931,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: exact_table_expected_helper_reached active")
+        self.append_log("BUILD: exact_table_local_center_reached active")
 
         self.active_path = list(self.path)
         self.path_index = 1
