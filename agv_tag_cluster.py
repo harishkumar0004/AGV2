@@ -847,7 +847,9 @@ class AGVQtApp(QMainWindow):
         self.turning_waiting = False
         self.pending_after_turn_segment = False
         self.turn_start_time = 0.0
-        self.turn_timeout_sec = 20.0
+        # No Python-side turn timeout.
+        # Wait until ESP32 reports OK TURN_DONE, even for slow 180 degree turns.
+        self.turn_timeout_sec = None
 
         # Camera state.
         self.latest_detections = []
@@ -898,7 +900,7 @@ class AGVQtApp(QMainWindow):
         camera_layout = QVBoxLayout(camera_group)
         self.camera_label = QLabel("Camera not started")
         self.camera_label.setAlignment(Qt.AlignCenter)
-        self.camera_label.setMinimumSize(560, 420)
+        self.camera_label.setMinimumSize(520, 390)
         self.camera_label.setStyleSheet("background:#111;color:white;border:1px solid #555;")
         self.camera_status = QLabel("Camera status: idle")
         self.camera_status.setStyleSheet("font-weight:bold;")
@@ -1036,7 +1038,7 @@ class AGVQtApp(QMainWindow):
         log_layout = QVBoxLayout(log_group)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(260)
+        self.log.setMinimumHeight(220)
         log_layout.addWidget(self.log)
         right.addWidget(log_group, 1)
 
@@ -1095,7 +1097,7 @@ class AGVQtApp(QMainWindow):
             f"State:{self.route_state} Seg:{self.travel_from_landmark}->{self.travel_to_landmark}",
             (25, 35),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.65,
             (255, 255, 255),
             2,
         )
@@ -1104,7 +1106,7 @@ class AGVQtApp(QMainWindow):
             f"Drive:{self.last_drive_mode} L:{self.drive_left_pps} R:{self.drive_right_pps}",
             (25, 65),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.65,
             (255, 255, 255),
             2,
         )
@@ -1432,7 +1434,7 @@ class AGVQtApp(QMainWindow):
             self.turning_waiting = True
             self.pending_after_turn_segment = True
             self.turn_start_time = time.time()
-            self.append_log(f"Turning before next segment: TURN_REL {turn_deg:.1f}")
+            self.append_log(f"Turning before next segment: TURN_REL {turn_deg:.1f} -- waiting for ESP32 OK TURN_DONE")
             self.send_esp32(f"TURN_REL {turn_deg:.1f}")
             self.current_heading = desired_heading
         else:
@@ -1449,6 +1451,63 @@ class AGVQtApp(QMainWindow):
         self.route_state = "LOCAL_ARRIVAL"
         self.append_log(f"Local arrival at Tag {landmark_id}, nudging to helper {helper_id}")
 
+    def waypoint_requires_turn_after_arrival(self, waypoint_tag):
+        """
+        True when the current target waypoint is not final and the next path
+        segment requires a heading change. These are the 'turning tags'.
+
+        Example path 8 -> 9 -> 10 -> 15:
+          Tag 10 requires turn because 9->10 is EAST and 10->15 is SOUTH.
+        """
+        if not self.mission_running:
+            return False
+
+        if not self.active_path:
+            return False
+
+        if self.path_index >= len(self.active_path):
+            return False
+
+        if int(self.active_path[self.path_index]) != int(waypoint_tag):
+            return False
+
+        if self.path_index + 1 >= len(self.active_path):
+            return False
+
+        prev_tag = self.current_tag
+        current_waypoint = int(waypoint_tag)
+        next_tag = int(self.active_path[self.path_index + 1])
+
+        incoming_heading = heading_between_tags(prev_tag, current_waypoint)
+        outgoing_heading = heading_between_tags(current_waypoint, next_tag)
+
+        if incoming_heading is None or outgoing_heading is None:
+            return False
+
+        return incoming_heading != outgoing_heading
+
+    def strong_local_helper_seen(self, detections, target_landmark):
+        """
+        Strong helper evidence used before full old-cluster loss.
+
+        Because helper IDs are reused at every landmark, a single helper can be
+        ambiguous while leaving the previous landmark. For turning waypoints,
+        however, we still need to stop when local side tags appear. This function
+        accepts the side-pair pattern first, then cross helpers.
+        """
+        pair_helper = detect_side_pair(detections, target_landmark)
+        if pair_helper is not None:
+            return pair_helper
+
+        ids = visible_ids(detections)
+
+        for helper_id in [501, 503, 505, 507]:
+            if helper_id in ids:
+                return helper_id
+
+        return None
+
+
     def choose_move_correction(self, detections):
         central_target = find_tag(detections, self.travel_to_landmark)
 
@@ -1464,6 +1523,23 @@ class AGVQtApp(QMainWindow):
         self.target_central_seen_count = 0
 
         if self.segment_phase == "START_CLUSTER":
+            # Minor but important bug fix:
+            # For turning waypoints, do not require the central target tag.
+            # If local helper tags of the target are seen, stop/update immediately.
+            # This fixes cases like 8 -> 9 -> 10 -> 15 where Tag 10 is reached
+            # by side/local tags but central Tag 10 is not visible.
+            if self.waypoint_requires_turn_after_arrival(self.travel_to_landmark):
+                helper_id = self.strong_local_helper_seen(detections, self.travel_to_landmark)
+                old_central_visible = find_tag(detections, self.travel_from_landmark) is not None
+
+                if helper_id is not None and not old_central_visible:
+                    self.append_log(
+                        f"TURN WAYPOINT ARRIVAL BY LOCAL HELPER: helper Tag {helper_id} "
+                        f"seen for target {self.travel_to_landmark}. Central tag is not required."
+                    )
+                    self.handle_landmark_arrival(self.travel_to_landmark)
+                    return None, None, ""
+
             if any_cluster_visible_now(detections, self.travel_from_landmark):
                 self.cluster_lost_count = 0
                 tag = choose_best_cluster_tag(detections, self.travel_from_landmark)
@@ -1487,11 +1563,8 @@ class AGVQtApp(QMainWindow):
                     "Stopping now; central tag is not required."
                 )
 
-                # Important restore:
-                # For path waypoints such as 10 in 8 -> 9 -> 10 -> 15,
-                # do not continue nudging forward while waiting for the central tag.
-                # The old tested behavior treated local cluster helpers as enough
-                # arrival evidence once the previous cluster was fully lost.
+                # Previous cluster behavior:
+                # local helper tags are enough arrival evidence once the old cluster is fully lost.
                 self.handle_landmark_arrival(self.travel_to_landmark)
                 return None, None, ""
 
@@ -1509,7 +1582,6 @@ class AGVQtApp(QMainWindow):
 
         if self.route_state == "TURNING" and self.turning_waiting:
             done = any("OK TURN_DONE" in line for line in lines)
-            timeout = (time.time() - self.turn_start_time) > self.turn_timeout_sec
 
             if done:
                 self.append_log("ESP32 reported OK TURN_DONE")
@@ -1521,18 +1593,8 @@ class AGVQtApp(QMainWindow):
                     self.lock_heading_go()
                 self.update_ui_state()
 
-            elif timeout:
-                # Do NOT continue movement on timeout.
-                # The previous version continued after timeout, which can make
-                # a slow 90 degree turn look like only 45 degrees before travel starts.
-                self.append_log("Turn timeout: stopping. ESP32 did not report OK TURN_DONE.")
-                self.turning_waiting = False
-                self.mission_running = False
-                self.route_state = "TURN_TIMEOUT"
-                self.expected_next_tag = None
-                self.stop_robot()
-                self.update_ui_state()
-
+            # No timeout here. ESP32 IMU turn owns completion.
+            # For 180 degree turns, the robot may need longer; Python must wait.
             return
 
         if self.route_state == "MOVE":
@@ -1820,7 +1882,7 @@ class AGVQtApp(QMainWindow):
             self.route_state = "TURNING"
             self.turning_waiting = True
             self.turn_start_time = time.time()
-            self.append_log(f"Initial turn: TURN_REL {turn_deg:.1f}")
+            self.append_log(f"Initial turn: TURN_REL {turn_deg:.1f} -- waiting for ESP32 OK TURN_DONE")
             self.send_esp32(f"TURN_REL {turn_deg:.1f}")
             self.current_heading = desired_heading
         else:
