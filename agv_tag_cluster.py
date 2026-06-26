@@ -67,6 +67,7 @@ CELL_TRAVEL_SEC = 1.20
 
 # Docking tag 0 to grid tag 1 move time.
 DOCK_TO_TAG1_TRAVEL_SEC = 1.20
+DOCK_TO_TAG1_TIMEOUT_SEC = 8.0
 
 # Direction labels for display and turn computation.
 NORTH = 0
@@ -553,6 +554,7 @@ class AGVQtApp(QMainWindow):
         self.dock_tag_confirmed = False
         self.waiting_for_manual_alignment = False
         self.calibration_done = False
+        self.dock_move_active = False
 
         # Mission state.
         self.current_tag = GRID_START_TAG
@@ -733,6 +735,8 @@ class AGVQtApp(QMainWindow):
 
         if self.calibration_done:
             self.calib_state.setText("DONE - GRID START TAG 1")
+        elif self.dock_move_active:
+            self.calib_state.setText("MOVING 0 -> 1, WAITING FOR TAG 1")
         elif self.waiting_for_manual_alignment:
             self.calib_state.setText("TAG 0 DETECTED - PRESS S")
         elif self.calibration_started:
@@ -786,6 +790,14 @@ class AGVQtApp(QMainWindow):
     def on_detections_ready(self, detections):
         self.latest_detections = detections
         self.latest_ids = [d.tag_id for d in detections]
+
+        # Closed-loop docking movement: after IMU calibration and LOCK_HEADING_GO,
+        # do not declare calibration done until the camera actually sees Tag 1.
+        if self.dock_move_active:
+            if GRID_START_TAG in self.latest_ids:
+                self.append_log("Dock-to-grid feedback OK: Tag 1 detected")
+                self.finish_dock_to_tag1()
+            return
 
         # Calibration feedback.
         if self.calibration_started and not self.calibration_done:
@@ -910,6 +922,7 @@ class AGVQtApp(QMainWindow):
         self.dock_tag_confirmed = False
         self.waiting_for_manual_alignment = False
         self.calibration_done = False
+        self.dock_move_active = False
         self.current_tag = GRID_START_TAG
         self.goal_tag = None
         self.path = []
@@ -943,41 +956,66 @@ class AGVQtApp(QMainWindow):
 
         self.append_log("Manual alignment confirmed by S key")
 
-        if not self.simulation_checkbox.isChecked():
-            if not self.connect_esp32():
-                return
-
-            self.send_esp32("STOP")
-            time.sleep(0.2)
-
-            try:
-                self.ser.reset_input_buffer()
-            except Exception:
-                pass
-
-            self.send_esp32("SET_BASE 6500")
-            self.send_esp32("SET_IMU_MAX 350")
-            self.send_esp32("IMU RECAL")
-
-            ok = self.wait_for_esp32_text("OK IMU RECAL", timeout_sec=10.0)
-
-            if not ok:
-                QMessageBox.warning(self, "Calibration failed", "ESP32 did not confirm OK IMU RECAL")
-                self.append_log("Calibration failed: no OK IMU RECAL")
-                return
-
-            self.append_log("IMU calibrated. Moving from docking Tag 0 to grid Tag 1")
-            self.send_esp32("LOCK_HEADING_GO")
-            QTimer.singleShot(int(DOCK_TO_TAG1_TRAVEL_SEC * 1000), self.finish_dock_to_tag1)
-        else:
-            self.append_log("Simulation calibration: setting robot to grid Tag 1")
+        if self.simulation_checkbox.isChecked():
+            self.append_log("Simulation calibration only: no ESP32 motion will be sent.")
+            self.append_log("For the real robot to move 0 -> 1, uncheck Simulation mode before pressing S.")
             self.finish_dock_to_tag1()
+            return
+
+        if not self.connect_esp32():
+            return
+
+        self.send_esp32("STOP")
+        time.sleep(0.2)
+
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+
+        self.send_esp32("SET_BASE 6500")
+        self.send_esp32("SET_IMU_MAX 350")
+        self.send_esp32("IMU RECAL")
+
+        ok = self.wait_for_esp32_text("OK IMU RECAL", timeout_sec=10.0)
+
+        if not ok:
+            QMessageBox.warning(self, "Calibration failed", "ESP32 did not confirm OK IMU RECAL")
+            self.append_log("Calibration failed: no OK IMU RECAL")
+            return
+
+        self.append_log("IMU calibrated. Starting real dock move 0 -> 1.")
+        self.append_log("Calibration will complete only after camera detects Tag 1.")
+
+        self.dock_move_active = True
+        self.current_tag = DOCK_TAG
+        self.expected_next_tag = GRID_START_TAG
+        self.update_ui_state()
+
+        self.send_esp32("LOCK_HEADING_GO")
+        QTimer.singleShot(int(DOCK_TO_TAG1_TIMEOUT_SEC * 1000), self.check_dock_to_tag1_timeout)
+
+    def check_dock_to_tag1_timeout(self):
+        if not self.dock_move_active:
+            return
+        self.append_log("Dock-to-Tag-1 timeout: Tag 1 was not detected. Stopping robot.")
+        self.send_esp32("STOP")
+        QMessageBox.warning(
+            self,
+            "Dock move timeout",
+            "Robot did not detect Tag 1 after leaving docking Tag 0. Check serial motion, direction, and camera view."
+        )
+        self.dock_move_active = False
+        self.expected_next_tag = None
+        self.update_ui_state()
 
     def finish_dock_to_tag1(self):
         self.send_esp32("STOP")
 
+        self.dock_move_active = False
         self.current_tag = GRID_START_TAG
         self.current_heading = SOUTH
+        self.expected_next_tag = None
         self.calibration_done = True
         self.calibration_started = False
         self.waiting_for_manual_alignment = False
