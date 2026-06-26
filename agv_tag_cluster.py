@@ -172,17 +172,37 @@ def heading_between_tags(a: int, b: int):
 
 
 def turn_delta_deg(current_heading, desired_heading):
+    """
+    Return TURN_REL angle for the ESP32.
+
+    Physical convention used for this AGV/grid:
+      1 -> 2 is +90 degrees.
+
+    Therefore the sign is intentionally opposite of the
+    previous screen-coordinate convention.
+    """
     if current_heading is None or desired_heading is None:
         return 0.0
+
     delta_steps = (desired_heading - current_heading) % 4
+
     if delta_steps == 0:
         return 0.0
+
+    # Desired heading is one clockwise grid step from current heading.
+    # For this robot/IMU setup that must be sent as -90.
     if delta_steps == 1:
-        return 90.0
+        return -90.0
+
     if delta_steps == 2:
         return 180.0
+
+    # Desired heading is one counter-clockwise grid step from current heading.
+    # Example: current SOUTH -> desired EAST for 1 -> 2 after docking.
+    # This must be +90 for the physical AGV.
     if delta_steps == 3:
-        return -90.0
+        return 90.0
+
     return 0.0
 
 
