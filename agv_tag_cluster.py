@@ -33,6 +33,27 @@ next_move_state_after_turn = None
 
 
 # =====================================================
+# TRAVEL SEGMENT TRACKING
+# =====================================================
+# This allows helper tags 501-508 to be interpreted correctly.
+#
+# Example:
+# During 6 -> 5:
+#   before leaving 6 cluster, helper 501 means landmark 6 helper.
+#   after leaving 6 cluster, helper 501 means landmark 5 helper.
+
+travel_from_landmark = None
+travel_to_landmark = None
+
+left_start_cluster = False
+start_cluster_lost_count = 0
+target_cluster_seen_count = 0
+
+START_CLUSTER_LOST_FRAMES_REQUIRED = 4
+TARGET_CLUSTER_SEEN_FRAMES_REQUIRED = 2
+
+
+# =====================================================
 # TURN SETTINGS
 # =====================================================
 
@@ -390,6 +411,9 @@ def choose_best_cluster_tag(detections, central_tag_id):
     """
     Prefer central landmark tag if visible.
     Otherwise choose helper tag closest to image center.
+
+    Because helper IDs 501-508 are reused, this function must be called
+    only when the route state already knows which landmark cluster it expects.
     """
 
     candidate_tags = []
@@ -401,10 +425,12 @@ def choose_best_cluster_tag(detections, central_tag_id):
     if not candidate_tags:
         return None
 
+    # Prefer central tag
     for tag in candidate_tags:
         if tag.tag_id == central_tag_id:
             return tag
 
+    # Otherwise helper closest to image center
     best_tag = None
     best_dist = 999999999.0
 
@@ -419,6 +445,18 @@ def choose_best_cluster_tag(detections, central_tag_id):
             best_tag = tag
 
     return best_tag
+
+
+def central_tag_visible(detections, central_tag_id):
+    for tag in detections:
+        if tag.tag_id == central_tag_id:
+            return True
+
+    return False
+
+
+def any_cluster_visible(detections, central_tag_id):
+    return choose_best_cluster_tag(detections, central_tag_id) is not None
 
 
 def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
@@ -465,6 +503,109 @@ def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
         helper_x_grid,
         helper_y_grid
     )
+
+
+# =====================================================
+# TRAVEL SEGMENT MONITOR
+# =====================================================
+
+def start_travel_segment(from_landmark, to_landmark, new_state):
+    global route_state
+    global travel_from_landmark
+    global travel_to_landmark
+    global left_start_cluster
+    global start_cluster_lost_count
+    global target_cluster_seen_count
+
+    travel_from_landmark = from_landmark
+    travel_to_landmark = to_landmark
+
+    left_start_cluster = False
+    start_cluster_lost_count = 0
+    target_cluster_seen_count = 0
+
+    reset_correction_filter()
+
+    route_state = new_state
+
+    print(
+        f"RPI: Starting travel segment "
+        f"{from_landmark} -> {to_landmark}"
+    )
+
+
+def monitor_travel_progress(detections):
+    """
+    Returns:
+        USE_START   = still near start cluster, correct using start landmark
+        USE_TARGET  = target cluster visible but not confirmed yet
+        ARRIVED     = target cluster confirmed
+        NO_TAG      = no useful tag
+
+    Important:
+    Since helper IDs 501-508 are reused at all landmarks, helper tags
+    can only be interpreted after we know whether the robot has left
+    the start cluster.
+    """
+
+    global left_start_cluster
+    global start_cluster_lost_count
+    global target_cluster_seen_count
+
+    if travel_from_landmark is None or travel_to_landmark is None:
+        return "NO_TAG"
+
+    # Central target tag is unique. If it is visible, we can trust arrival.
+    if central_tag_visible(detections, travel_to_landmark):
+        target_cluster_seen_count += 1
+
+        if target_cluster_seen_count >= TARGET_CLUSTER_SEEN_FRAMES_REQUIRED:
+            return "ARRIVED"
+
+        return "USE_TARGET"
+
+    # Before leaving start cluster, helpers are assumed to belong to start landmark.
+    if not left_start_cluster:
+
+        start_visible = any_cluster_visible(
+            detections,
+            travel_from_landmark
+        )
+
+        if start_visible:
+            start_cluster_lost_count = 0
+            target_cluster_seen_count = 0
+            return "USE_START"
+
+        start_cluster_lost_count += 1
+
+        if start_cluster_lost_count >= START_CLUSTER_LOST_FRAMES_REQUIRED:
+            left_start_cluster = True
+            target_cluster_seen_count = 0
+
+            print(
+                f"RPI: Left landmark {travel_from_landmark} cluster. "
+                f"Now searching for landmark {travel_to_landmark} cluster."
+            )
+
+        return "NO_TAG"
+
+    # After leaving start cluster, helpers are interpreted as target helpers.
+    target_visible = any_cluster_visible(
+        detections,
+        travel_to_landmark
+    )
+
+    if target_visible:
+        target_cluster_seen_count += 1
+
+        if target_cluster_seen_count >= TARGET_CLUSTER_SEEN_FRAMES_REQUIRED:
+            return "ARRIVED"
+
+        return "USE_TARGET"
+
+    target_cluster_seen_count = 0
+    return "NO_TAG"
 
 
 # =====================================================
@@ -649,91 +790,95 @@ def start_turn_wait(landmark_id, next_state_after_turn):
 
     route_state = "WAIT_TURN_TAG_CORRECT_COMMAND"
 
-    print(f"RPI: Central Tag {landmark_id} detected. Robot stopped.")
+    print(f"RPI: Landmark {landmark_id} cluster reached. Robot stopped.")
     print(f"RPI: Press 'c' to correct Tag {landmark_id} cluster.")
     print(f"RPI: Press 't' after correction to turn {TURN_DEG_BY_LANDMARK[landmark_id]:.1f} degrees.")
 
 
 def choose_travel_landmark(detections):
     """
-    Because helper IDs are reused, central tag detection is used for route switching.
-    Helpers are used only for local pose estimate of the expected previous/current landmark.
+    Uses leaving/reaching cluster logic.
+
+    While travelling A -> B:
+        before A cluster is lost:
+            use A cluster for correction
+        after A cluster is lost:
+            use B cluster for correction
+        if B cluster is confirmed:
+            ARRIVED
     """
 
     global route_state
 
-    central_7_real = None
-    central_6_real = None
-    central_5_real = None
-    central_9_real = None
-
-    for tag in detections:
-        if tag.tag_id == TAG_7:
-            central_7_real = tag
-        elif tag.tag_id == TAG_6:
-            central_6_real = tag
-        elif tag.tag_id == TAG_5:
-            central_5_real = tag
-        elif tag.tag_id == TAG_9:
-            central_9_real = tag
+    progress = monitor_travel_progress(detections)
 
     if route_state == "MOVE_TO_7":
 
-        if central_7_real is not None:
-            print("RPI: Central Tag 7 detected. Now moving toward Tag 6.")
-            reset_correction_filter()
-            route_state = "MOVE_TO_6"
-
+        if progress == "ARRIVED":
+            print("RPI: Landmark 7 cluster reached.")
+            start_travel_segment(TAG_7, TAG_6, "MOVE_TO_6")
             return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
 
-        tag11_cluster = choose_best_cluster_tag(detections, START_TAG)
+        if progress == "USE_START":
+            tag = choose_best_cluster_tag(detections, START_TAG)
+            return tag, START_TAG, "TAG11"
 
-        if tag11_cluster is not None:
-            return tag11_cluster, START_TAG, "TAG11"
+        if progress == "USE_TARGET":
+            tag = choose_best_cluster_tag(detections, TAG_7)
+            return tag, TAG_7, "TAG7"
 
         return None, None, ""
 
     if route_state == "MOVE_TO_6":
 
-        if central_6_real is not None:
+        if progress == "ARRIVED":
             start_turn_wait(TAG_6, "MOVE_TO_5")
             return None, None, ""
 
-        tag7_cluster = choose_best_cluster_tag(detections, TAG_7)
+        if progress == "USE_START":
+            tag = choose_best_cluster_tag(detections, TAG_7)
+            return tag, TAG_7, "TAG7"
 
-        if tag7_cluster is not None:
-            return tag7_cluster, TAG_7, "TAG7"
+        if progress == "USE_TARGET":
+            tag = choose_best_cluster_tag(detections, TAG_6)
+            return tag, TAG_6, "TAG6"
 
         return None, None, ""
 
     if route_state == "MOVE_TO_5":
 
-        if central_5_real is not None:
+        if progress == "ARRIVED":
             start_turn_wait(TAG_5, "MOVE_TO_9")
             return None, None, ""
 
-        tag6_cluster = choose_best_cluster_tag(detections, TAG_6)
+        if progress == "USE_START":
+            tag = choose_best_cluster_tag(detections, TAG_6)
+            return tag, TAG_6, "TAG6"
 
-        if tag6_cluster is not None:
-            return tag6_cluster, TAG_6, "TAG6"
+        if progress == "USE_TARGET":
+            tag = choose_best_cluster_tag(detections, TAG_5)
+            return tag, TAG_5, "TAG5"
 
         return None, None, ""
 
     if route_state == "MOVE_TO_9":
 
-        if central_9_real is not None:
+        if progress == "ARRIVED":
             stop_robot()
             route_state = "DONE"
 
-            print("RPI: Central Tag 9 detected.")
+            print("RPI: Landmark 9 cluster reached.")
             print("RPI: Final destination reached. Robot stopped.")
 
             return None, None, ""
 
-        tag5_cluster = choose_best_cluster_tag(detections, TAG_5)
+        if progress == "USE_START":
+            tag = choose_best_cluster_tag(detections, TAG_5)
+            return tag, TAG_5, "TAG5"
 
-        if tag5_cluster is not None:
-            return tag5_cluster, TAG_5, "TAG5"
+        if progress == "USE_TARGET":
+            tag = choose_best_cluster_tag(detections, TAG_9)
+            return tag, TAG_9, "TAG9"
 
         return None, None, ""
 
@@ -821,10 +966,9 @@ print("  helper tags 501-508 estimate the central landmark")
 print("  central tag is preferred if visible")
 print("  otherwise helper closest to image center is used")
 print("")
-print("Adaptive correction:")
-print("  small error  -> normal speed, normal correction")
-print("  medium error -> medium correction")
-print("  large error  -> slower speed, stronger correction")
+print("Travel monitor:")
+print("  before leaving start cluster, helpers belong to start landmark")
+print("  after leaving start cluster, helpers belong to target landmark")
 print("")
 print("Keys:")
 print("  s = start route")
@@ -904,6 +1048,8 @@ try:
 
                     print(
                         f"{label} CLUSTER_CORR "
+                        f"travel={travel_from_landmark}->{travel_to_landmark} "
+                        f"leftStart={left_start_cluster} "
                         f"seen={seen_tag_id} "
                         f"grid=({helper_x_grid},{helper_y_grid}) "
                         f"rawYaw={raw_yaw:.2f} "
@@ -1076,18 +1222,48 @@ try:
                         f"centerYerr={center_y_error_px:.1f}px"
                     )
 
-                    route_state = next_move_state_after_turn
+                    if turn_landmark_id == TAG_6:
+                        start_travel_segment(
+                            TAG_6,
+                            TAG_5,
+                            "MOVE_TO_5"
+                        )
 
-                    reset_correction_filter()
+                    elif turn_landmark_id == TAG_5:
+                        start_travel_segment(
+                            TAG_5,
+                            TAG_9,
+                            "MOVE_TO_9"
+                        )
+
+                    else:
+                        route_state = next_move_state_after_turn
+                        reset_correction_filter()
+
                     lock_heading_go()
 
             elif time.time() - post_turn_start_time > POST_TURN_VERIFY_TIMEOUT_SEC:
 
                 print("RPI: Post-turn verify timeout. Continuing with IMU heading.")
 
-                route_state = next_move_state_after_turn
+                if turn_landmark_id == TAG_6:
+                    start_travel_segment(
+                        TAG_6,
+                        TAG_5,
+                        "MOVE_TO_5"
+                    )
 
-                reset_correction_filter()
+                elif turn_landmark_id == TAG_5:
+                    start_travel_segment(
+                        TAG_5,
+                        TAG_9,
+                        "MOVE_TO_9"
+                    )
+
+                else:
+                    route_state = next_move_state_after_turn
+                    reset_correction_filter()
+
                 lock_heading_go()
 
         elif route_state == "DONE":
@@ -1126,10 +1302,20 @@ try:
 
         cv2.putText(
             frame,
-            f"TurnTag: {turn_landmark_id}",
+            f"Travel: {travel_from_landmark}->{travel_to_landmark} left:{left_start_cluster}",
             (40, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.65,
+            (255, 255, 255),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            f"TurnTag: {turn_landmark_id}",
+            (40, 130),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
             (255, 255, 255),
             2
         )
@@ -1137,9 +1323,9 @@ try:
         cv2.putText(
             frame,
             f"Drive: {last_drive_mode} L:{drive_left_pps} R:{drive_right_pps}",
-            (40, 130),
+            (40, 170),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.65,
             (255, 255, 255),
             2
         )
@@ -1147,25 +1333,25 @@ try:
         cv2.putText(
             frame,
             f"Visible: {visible_ids}",
-            (40, 170),
+            (40, 210),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.65,
             (255, 255, 255),
             2
         )
 
         cv2.putText(
             frame,
-            f"Good: {turn_tag_good_count}",
-            (40, 210),
+            f"Lost:{start_cluster_lost_count} Seen:{target_cluster_seen_count} Good:{turn_tag_good_count}",
+            (40, 250),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.65,
             (255, 255, 255),
             2
         )
 
         cv2.imshow(
-            "AGV Route 11-7-6-5-9 Cluster Adaptive",
+            "AGV Cluster Route With Leave-Reach Monitor",
             frame
         )
 
@@ -1208,11 +1394,13 @@ try:
                     if ok:
 
                         print("RPI: IMU calibrated.")
-                        print("RPI: Locking heading and starting movement to Tag 7.")
+                        print("RPI: Starting travel 11 -> 7.")
 
-                        reset_correction_filter()
-
-                        route_state = "MOVE_TO_7"
+                        start_travel_segment(
+                            START_TAG,
+                            TAG_7,
+                            "MOVE_TO_7"
+                        )
 
                         lock_heading_go()
 
