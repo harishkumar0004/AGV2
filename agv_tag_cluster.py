@@ -1493,6 +1493,7 @@ class AGVQtApp(QMainWindow):
                 self.update_ui_state()
 
 
+
     # -------------------------
     # Serial
     # -------------------------
@@ -1650,19 +1651,30 @@ class AGVQtApp(QMainWindow):
         if getattr(self, "skip_next_segment_lock", False):
             self.skip_next_segment_lock = False
 
+            # Straight pass-through case:
+            # Do not immediately clear the previous visual VEL command.
+            #
+            # Reason:
+            #   On a straight chain such as 15->14->13->12->11, the robot is
+            #   still physically leaving the previous cluster when the next
+            #   segment starts. If we send LOCK_HEADING_GO immediately here,
+            #   the active visual steering is removed and the robot may continue
+            #   on IMU hold while only the exit-side helper is visible.
+            #
+            # This does not affect turn waypoints because those use STOP/TURN_REL.
+            if self.last_drive_mode == "VISION":
+                self.append_log(
+                    "Skipped LOCK_HEADING_GO after straight pass-through; keeping visual correction carry-over."
+                )
+                return
+
             if self.last_drive_mode == "IMU":
                 self.append_log("Skipped LOCK_HEADING_GO after straight pass-through; already in IMU heading hold.")
                 return
 
-            # Do not carry the previous visual VEL command into the next segment.
-            self.filtered_correction = 0.0
-            self.send_esp32("LOCK_HEADING_GO")
-            self.last_drive_mode = "IMU"
-            self.append_log("LOCK_HEADING_GO sent after pass-through to clear visual VEL.")
-            return
-
         if self.last_drive_mode == "IMU":
             return
+
         self.filtered_correction = 0.0
         self.send_esp32("LOCK_HEADING_GO")
         self.last_drive_mode = "IMU"
@@ -2984,7 +2996,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: east_mirrors_west_single_xsign_map active")
+        self.append_log("BUILD: single_xsign_pass_through_carry active")
 
         self.active_path = list(self.path)
         self.path_index = 1
