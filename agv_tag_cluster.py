@@ -345,11 +345,40 @@ EXIT_CENTER_BY_HEADING = {
 #   501 is entry center for pair 508+501 or 501+502
 #   505 is entry center for pair 504+505 or 505+506
 #   507 is rejected because pair 506+507 or 507+508 is the exit side
+# Strict entry/exit sides by travel direction.
+#
+# For EAST travel, for example 15->14->13->12->11:
+#   target entry side = 506/507/508, center = 507
+#   current-tag exit side = 502/503/504, center = 503
+#
+# Therefore at 13->12, helper 508 must be treated as target-side
+# correction evidence, not as old Tag 13 correction.
+ENTRY_HELPER_IDS_BY_HEADING = {
+    WEST: {502, 503, 504},
+    EAST: {506, 507, 508},
+    NORTH: {504, 505, 506},
+    SOUTH: {508, 501, 502},
+}
+
+EXIT_HELPER_IDS_BY_HEADING = {
+    WEST: {506, 507, 508},
+    EAST: {502, 503, 504},
+    NORTH: {508, 501, 502},
+    SOUTH: {504, 505, 506},
+}
+
 VALID_ENTRY_CENTERS_BY_HEADING = {
-    WEST: {503, 501, 505},
-    EAST: {507, 501, 505},
-    NORTH: {503, 507, 505},
-    SOUTH: {503, 507, 501},
+    WEST: {503},
+    EAST: {507},
+    NORTH: {505},
+    SOUTH: {501},
+}
+
+ENTRY_CENTER_BY_HEADING_STRICT = {
+    WEST: 503,
+    EAST: 507,
+    NORTH: 505,
+    SOUTH: 501,
 }
 
 # Corner-only transition rule.
@@ -385,13 +414,6 @@ HELPER_GROUP_BY_CENTER = {
 }
 
 CLUSTER_LOST_FRAMES_REQUIRED = 5
-
-# Normal mission safety:
-# Do not use helper-only visibility from the previous landmark as OLD-cluster
-# steering after the old central tag is gone. On the 13->12 test, helper 508
-# from Tag 13 was treated as TAG13 correction and pulled the robot away.
-# Calibration 0->1 still uses old helper behavior separately.
-DISABLE_OLD_HELPER_ONLY_STEERING_IN_MISSION = True
 TARGET_CENTRAL_SEEN_FRAMES_REQUIRED = 2
 
 # Local helper arrival confirmation. Cross helpers are important.
@@ -1300,7 +1322,6 @@ class AGVQtApp(QMainWindow):
         )
 
 
-
     # -------------------------
     # Camera
     # -------------------------
@@ -1890,29 +1911,35 @@ class AGVQtApp(QMainWindow):
 
     def update_corner_single_arrival_candidates(self, detections):
         """
-        Track corner-only evidence.
+        Track direction-aware corner-only entry evidence.
 
-        If we see a corner helper without a side-pair, the next adjacent cross
-        helper may be a valid local-arrival single. This is not time-based or
-        frame-count based; it is a local-tag transition sequence.
+        Example EAST travel into Tag 13/12/11:
+            entry side is 506/507/508
+            if corner 506 or 508 appears alone, the next valid local center is 507
+
+        This is not time-based or frame-count based; it is a local tag sequence.
         """
         ids = visible_ids(detections)
         new_candidates = set()
 
-        for corner_id, centers in CORNER_TO_NEXT_SINGLE_CENTERS.items():
+        entry_center = ENTRY_CENTER_BY_HEADING_STRICT.get(self.segment_heading)
+        entry_helpers = ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set())
+
+        if entry_center is None:
+            return
+
+        for corner_id in CORNER_HELPERS:
             if corner_id not in ids:
                 continue
-
-            # Do not create a corner-only transition when a full side-pair is
-            # already visible; pair handling is stronger and happens first.
-            has_pair_with_corner = any(center in ids for center in centers)
-            if has_pair_with_corner:
+            if corner_id not in entry_helpers:
                 continue
 
-            for center_id in centers:
-                if center_id in self.valid_entry_centers_for_heading():
-                    if not self.helper_is_exit_side(center_id):
-                        new_candidates.add(center_id)
+            # If the center is already visible with this corner, pair handling
+            # is stronger and will run before single-center sequence handling.
+            if entry_center in ids:
+                continue
+
+            new_candidates.add(entry_center)
 
         if new_candidates:
             before = set(self.corner_single_arrival_candidates)
@@ -1921,7 +1948,7 @@ class AGVQtApp(QMainWindow):
             if added and time.time() - getattr(self, "_last_corner_candidate_log", 0.0) > 0.50:
                 self._last_corner_candidate_log = time.time()
                 self.append_log(
-                    "Corner-only evidence: only allow next local center(s) "
+                    "Direction entry-corner evidence: only allow next local center(s) "
                     + ", ".join(str(x) for x in sorted(added))
                     + f" for target {self.travel_to_landmark}"
                 )
@@ -2001,6 +2028,34 @@ class AGVQtApp(QMainWindow):
             return False, f"helper_{helper_id}_not_valid_for_heading_{HEADING_LABELS.get(self.segment_heading, '---')}"
 
         return True, f"valid_entry_center_{helper_id}"
+
+    def entry_side_helper_visible(self, detections):
+        """
+        Return a visible helper that belongs to the target entry side for the
+        current travel direction. Central target still wins elsewhere.
+
+        For EAST, entry side is 506/507/508. This fixes 13->12:
+        helper 508 is target-side correction evidence, not old Tag 13 correction.
+        """
+        entry_helpers = ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set())
+
+        best_tag = None
+        best_dist = 999999999.0
+
+        for tag in detections:
+            tid = int(tag.tag_id)
+            if tid not in entry_helpers:
+                continue
+
+            dx = tag.center[0] - CX
+            dy = tag.center[1] - CY
+            dist = dx * dx + dy * dy
+
+            if dist < best_dist:
+                best_dist = dist
+                best_tag = tag
+
+        return best_tag
 
     def remember_local_arrival_helper(self, helper_id):
         self.last_arrival_helper_id = int(helper_id)
@@ -2166,31 +2221,22 @@ class AGVQtApp(QMainWindow):
                 # Wait for a valid pair, valid corner->single sequence, or central tag.
                 return None, None, ""
 
-            # Normal mission safety:
-            # At this point old_central is not visible and no valid target
-            # side-pair/single was accepted. Do NOT steer using helper-only
-            # old-cluster evidence.
-            #
-            # This was the 13->12 failure:
-            #   seen=508 was treated as TAG13 correction, then the robot drifted
-            #   away before detecting Tag 12 / Tag 11.
-            #
-            # Safer behavior: consider the old central tag left, go to
-            # SEARCH_TARGET after the normal lost count, and let IMU hold until
-            # a valid target central/helper appears.
-            if DISABLE_OLD_HELPER_ONLY_STEERING_IN_MISSION:
-                self.cluster_lost_count += 1
-
-                if self.cluster_lost_count >= CLUSTER_LOST_FRAMES_REQUIRED:
-                    self.segment_phase = "SEARCH_TARGET"
+            # Direction-entry helper correction.
+            # If old central is gone and a helper from the target entry side is
+            # visible, steer as TARGET correction, not old correction.
+            entry_tag = self.entry_side_helper_visible(detections)
+            if entry_tag is not None:
+                if time.time() - getattr(self, "_last_entry_helper_corr_log", 0.0) > 0.80:
+                    self._last_entry_helper_corr_log = time.time()
                     self.append_log(
-                        f"Fully left Tag {self.travel_from_landmark} central. "
-                        f"Ignoring old helper-only steering; target {self.travel_to_landmark} can use central/valid helpers."
+                        f"ENTRY SIDE TARGET CORRECTION: seg={self.travel_from_landmark}->{self.travel_to_landmark} "
+                        f"heading={HEADING_LABELS.get(self.segment_heading, '---')} "
+                        f"seen={int(entry_tag.tag_id)} entrySide={sorted(ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set()))}"
                     )
+                return entry_tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
-                return None, None, ""
-
-            # Legacy fallback, kept disabled by default.
+            # Standalone fallback: helpers that are not valid target arrival remain
+            # old-cluster correction until a clean loss happens.
             if any_cluster_visible_now(detections, self.travel_from_landmark):
                 self.cluster_lost_count = 0
                 tag = choose_best_cluster_tag(detections, self.travel_from_landmark)
@@ -2232,7 +2278,6 @@ class AGVQtApp(QMainWindow):
                             "Correction only."
                         )
 
-                    # Do not steer from rejected helper evidence in SEARCH_TARGET either.
                     return None, None, ""
 
                 ready, center_y_error_px = self.local_helper_arrival_ready(
@@ -2260,6 +2305,12 @@ class AGVQtApp(QMainWindow):
             tag = choose_best_cluster_tag(detections, self.travel_to_landmark)
 
             if tag is not None:
+                if int(tag.tag_id) in HELPER_IDS:
+                    entry_tag = self.entry_side_helper_visible(detections)
+                    if entry_tag is None:
+                        return None, None, ""
+                    return entry_tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
+
                 return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
             return None, None, ""
@@ -2571,7 +2622,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: slow_safe_no_old_helper_steering active")
+        self.append_log("BUILD: strict_entry_side_target_correction active")
 
         self.active_path = list(self.path)
         self.path_index = 1
