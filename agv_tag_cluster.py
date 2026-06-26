@@ -37,19 +37,11 @@ travel_to_landmark = None
 left_start_cluster = False
 start_cluster_lost_count = 0
 target_cluster_seen_count = 0
-target_helper_reached_count = 0
 
 travel_segment_start_time = 0.0
 
 START_CLUSTER_LOST_FRAMES_REQUIRED = 4
 TARGET_CLUSTER_SEEN_FRAMES_REQUIRED = 2
-
-# Helper visible alone is not always enough.
-# The estimated target center must be close, unless a helper pattern is detected.
-TARGET_CENTER_Y_REACHED_PX = 35
-TARGET_CENTER_X_REACHED_M = 0.018
-TARGET_HELPER_REACHED_FRAMES_REQUIRED = 3
-
 MIN_TRAVEL_TIME_BEFORE_TARGET_SEC = 1.0
 
 
@@ -126,6 +118,9 @@ HELPER_GRID_OFFSET = {
     507: (-1, 0),
     508: (-1, -1),
 }
+
+CROSS_HELPERS = {501, 503, 505, 507}
+CORNER_HELPERS = {502, 504, 506, 508}
 
 CORRECTION_HELPER_PRIORITY = [501, 503, 505, 507]
 
@@ -509,15 +504,49 @@ def find_tag_by_id(detections, tag_id):
     return None
 
 
+def helper_group_stop_allowed_for_target(target_landmark):
+    """
+    Tag 7 is pass-through, so helper groups must never cause stop/nudge.
+
+    Tag 6 and Tag 5 are action/turn landmarks.
+    Tag 9 is final destination.
+
+    For these, only proper corner-side groups can cause nudge.
+    Single 501/503/505/507 must not cause stopping.
+    """
+
+    if target_landmark == TAG_7:
+        return False
+
+    if target_landmark in (TAG_6, TAG_5, TAG_9):
+        return True
+
+    return False
+
+
 def detect_target_helper_arrival_pattern(detections, target_landmark):
     """
-    Detects if the robot is clearly inside the next landmark helper cluster.
+    Detects side/corner group of target cluster.
 
-    Returns preferred cross helper:
-        503 for right side group 502/503/504
-        507 for left side group 506/507/508
-        501 for top side group 508/501/502
-        505 for bottom side group 506/505/504
+    Important:
+    Single 501, 503, 505, or 507 is NOT enough.
+    A valid pattern must contain:
+      - the side-center helper, and
+      - at least one corner helper from that side group.
+
+    Valid examples:
+      502 + 503       -> right side, nudge to 503
+      503 + 504       -> right side, nudge to 503
+      502 + 503 + 504 -> right side, nudge to 503
+
+      506 + 507       -> left side, nudge to 507
+      507 + 508       -> left side, nudge to 507
+
+      508 + 501       -> top side, nudge to 501
+      501 + 502       -> top side, nudge to 501
+
+      506 + 505       -> bottom side, nudge to 505
+      505 + 504       -> bottom side, nudge to 505
     """
 
     ids = visible_tag_ids(detections)
@@ -525,34 +554,39 @@ def detect_target_helper_arrival_pattern(detections, target_landmark):
     if target_landmark in ids:
         return None
 
-    right_count = len(ids.intersection({502, 503, 504}))
-    left_count = len(ids.intersection({506, 507, 508}))
-    top_count = len(ids.intersection({508, 501, 502}))
-    bottom_count = len(ids.intersection({506, 505, 504}))
+    if not helper_group_stop_allowed_for_target(target_landmark):
+        return None
 
-    groups = [
-        ("RIGHT", right_count, 503),
-        ("LEFT", left_count, 507),
-        ("TOP", top_count, 501),
-        ("BOTTOM", bottom_count, 505),
+    side_groups = [
+        ("RIGHT", {502, 503, 504}, 503),
+        ("LEFT", {506, 507, 508}, 507),
+        ("TOP", {508, 501, 502}, 501),
+        ("BOTTOM", {506, 505, 504}, 505),
     ]
 
-    best_group = None
-    best_count = 0
+    best_group_name = None
     best_helper = None
+    best_count = 0
 
-    for group_name, count, helper_id in groups:
-        if count > best_count:
-            best_count = count
-            best_group = group_name
-            best_helper = helper_id
+    for group_name, group_ids, center_helper in side_groups:
 
-    # Require at least two helpers from one side/corner group.
-    if best_count >= 2:
+        visible_in_group = ids.intersection(group_ids)
+        visible_count = len(visible_in_group)
+
+        has_side_center = center_helper in ids
+        has_corner = len(visible_in_group.intersection(CORNER_HELPERS)) > 0
+
+        if has_side_center and has_corner and visible_count >= 2:
+            if visible_count > best_count:
+                best_count = visible_count
+                best_group_name = group_name
+                best_helper = center_helper
+
+    if best_helper is not None:
         print(
             f"TARGET_HELPER_PATTERN "
             f"target={target_landmark} "
-            f"group={best_group} "
+            f"group={best_group_name} "
             f"count={best_count} "
             f"preferredHelper={best_helper}"
         )
@@ -642,7 +676,6 @@ def start_travel_segment(from_landmark, to_landmark, new_state):
     global left_start_cluster
     global start_cluster_lost_count
     global target_cluster_seen_count
-    global target_helper_reached_count
     global travel_segment_start_time
 
     travel_from_landmark = from_landmark
@@ -651,7 +684,6 @@ def start_travel_segment(from_landmark, to_landmark, new_state):
     left_start_cluster = False
     start_cluster_lost_count = 0
     target_cluster_seen_count = 0
-    target_helper_reached_count = 0
     travel_segment_start_time = time.time()
 
     reset_correction_filter()
@@ -668,16 +700,23 @@ def monitor_travel_progress(detections):
     """
     Returns:
         USE_START   = still near start cluster, correct using start landmark
-        USE_TARGET  = target cluster visible, but not yet centered/reached
-        ARRIVED     = target landmark confirmed
-        NUDGE_xxx   = helper pattern detected, enter arrival nudge
+        USE_TARGET  = target cluster visible, but not yet confirmed
+        ARRIVED     = central target landmark confirmed
+        NUDGE_xxx   = valid corner-side helper group detected
         NO_TAG      = no useful tag
+
+    Critical rule:
+        Single 501/503/505/507 does not stop the robot.
+        Those cross helpers are before/around the center and should be passed
+        if central tag can still become visible.
+
+        Corner-side groups can stop/nudge because they indicate the robot
+        may not be able to reach the central landmark from that approach.
     """
 
     global left_start_cluster
     global start_cluster_lost_count
     global target_cluster_seen_count
-    global target_helper_reached_count
 
     if travel_from_landmark is None or travel_to_landmark is None:
         return "NO_TAG"
@@ -707,7 +746,6 @@ def monitor_travel_progress(detections):
         if central_tag_visible(detections, travel_from_landmark):
             start_cluster_lost_count = 0
             target_cluster_seen_count = 0
-            target_helper_reached_count = 0
             return "USE_START"
 
         start_cluster_lost_count += 1
@@ -722,7 +760,6 @@ def monitor_travel_progress(detections):
         ):
             left_start_cluster = True
             target_cluster_seen_count = 0
-            target_helper_reached_count = 0
 
             print(
                 f"RPI: Left landmark {travel_from_landmark} central tag. "
@@ -743,9 +780,9 @@ def monitor_travel_progress(detections):
 
     if target_tag is None:
         target_cluster_seen_count = 0
-        target_helper_reached_count = 0
         return "NO_TAG"
 
+    # If central target is visible, arrival will be handled above.
     if target_tag.tag_id == travel_to_landmark:
         target_cluster_seen_count += 1
 
@@ -754,11 +791,8 @@ def monitor_travel_progress(detections):
 
         return "USE_TARGET"
 
-    # Special helper-pattern arrival:
-    # 502/503/504 -> nudge toward 503
-    # 506/507/508 -> nudge toward 507
-    # 508/501/502 -> nudge toward 501
-    # 506/505/504 -> nudge toward 505
+    # Valid corner-side pattern can trigger nudge.
+    # Single 501/503/505/507 does NOT trigger nudge.
     preferred_helper = detect_target_helper_arrival_pattern(
         detections,
         travel_to_landmark
@@ -767,48 +801,7 @@ def monitor_travel_progress(detections):
     if preferred_helper is not None:
         return f"NUDGE_{preferred_helper}"
 
-    # Normal helper-center arrival check.
-    pose = get_landmark_pose_from_cluster_tag(
-        target_tag,
-        travel_to_landmark
-    )
-
-    if pose is None:
-        return "USE_TARGET"
-
-    (
-        raw_yaw,
-        yaw_error,
-        center_x_m,
-        center_y_error_px,
-        seen_tag_id,
-        helper_x_grid,
-        helper_y_grid
-    ) = pose
-
-    helper_center_good = (
-        abs(center_y_error_px) <= TARGET_CENTER_Y_REACHED_PX
-        and abs(center_x_m) <= TARGET_CENTER_X_REACHED_M
-    )
-
-    if helper_center_good:
-        target_helper_reached_count += 1
-    else:
-        target_helper_reached_count = 0
-
-    print(
-        f"TARGET_HELPER_CHECK "
-        f"target={travel_to_landmark} "
-        f"seen={seen_tag_id} "
-        f"grid=({helper_x_grid},{helper_y_grid}) "
-        f"centerXM={center_x_m:.4f} "
-        f"centerYerr={center_y_error_px:.1f}px "
-        f"good={target_helper_reached_count}/{TARGET_HELPER_REACHED_FRAMES_REQUIRED}"
-    )
-
-    if target_helper_reached_count >= TARGET_HELPER_REACHED_FRAMES_REQUIRED:
-        return "ARRIVED"
-
+    # Otherwise, use the helper only for target correction and keep moving.
     return "USE_TARGET"
 
 
@@ -835,7 +828,7 @@ def start_arrival_nudge(landmark_id, preferred_helper_id, next_action):
     route_state = "ARRIVAL_NUDGE"
 
     print(
-        f"RPI: Target helper pattern reached for landmark {landmark_id}. "
+        f"RPI: Target corner-side helper group reached for landmark {landmark_id}. "
         f"Nudging toward helper {preferred_helper_id}."
     )
 
@@ -855,18 +848,10 @@ def finish_arrival_nudge():
         route_state = "DONE"
         print("RPI: Final destination reached. Robot stopped.")
 
-    elif arrival_nudge_next_action == "CONTINUE_TO_6":
-        start_travel_segment(
-            TAG_7,
-            TAG_6,
-            "MOVE_TO_6"
-        )
-        lock_heading_go()
-
 
 def arrival_nudge_velocity(tag):
     """
-    Move slowly front/back to center the selected helper tag in image Y.
+    Move slowly front/back to center the selected side-center helper tag in image Y.
     If this moves wrong direction, flip FB_SIGN.
     """
 
@@ -1067,14 +1052,13 @@ def choose_travel_landmark(detections):
     if route_state == "MOVE_TO_7":
 
         if progress == "ARRIVED":
-            print("RPI: Landmark 7 reached.")
+            print("RPI: Landmark 7 reached as pass-through. Continuing to Tag 6.")
             start_travel_segment(TAG_7, TAG_6, "MOVE_TO_6")
             return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
 
+        # Pass-through: never nudge or stop at Tag 7.
         if progress.startswith("NUDGE_"):
-            helper_id = int(progress.split("_")[1])
-            start_arrival_nudge(TAG_7, helper_id, "CONTINUE_TO_6")
-            return None, None, ""
+            return choose_best_cluster_tag(detections, TAG_7), TAG_7, "TAG7"
 
         if progress == "USE_START":
             return choose_best_cluster_tag(detections, START_TAG), START_TAG, "TAG11"
@@ -1227,9 +1211,10 @@ print("  At 5: stop, press c, then press t")
 print("  5 -> 9 and stop")
 print("")
 print("Helper arrival rule:")
-print("  central target tag visible -> reached")
-print("  helper pattern visible -> arrival nudge to 501/503/505/507")
-print("  helper visible only -> estimate central target position")
+print("  Tag 7 pass-through: never stop/nudge")
+print("  Single 501/503/505/507: do not stop, keep moving")
+print("  Corner-side group: nudge to 501/503/505/507")
+print("  Central target tag visible: reached")
 print("")
 print("Keys:")
 print("  s = start route")
@@ -1684,7 +1669,7 @@ try:
 
         cv2.putText(
             frame,
-            f"Lost:{start_cluster_lost_count} Seen:{target_cluster_seen_count} HelperGood:{target_helper_reached_count}",
+            f"Lost:{start_cluster_lost_count} Seen:{target_cluster_seen_count}",
             (40, 290),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -1693,7 +1678,7 @@ try:
         )
 
         cv2.imshow(
-            "AGV Cluster Route With Arrival Nudge",
+            "AGV Cluster Route With Correct Helper Priority",
             frame
         )
 
