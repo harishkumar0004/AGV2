@@ -387,42 +387,48 @@ ENTRY_CENTER_BY_HEADING_STRICT = {
 #   if the entry corner appears first, the next adjacent side-center is still
 #   valid target-side evidence.
 ENTRY_SEQUENCE_BY_HEADING = {
-    # entry/helper -> next helper or CENTRAL target.
+    # User-confirmed entry side -> expected next center/helper.
     #
     # Helpers are correction/sequence evidence only.
     # The landmark is reached only when the central target tag is visible.
-    WEST:  {502: 503, 503: "CENTRAL", 504: 503},
-    EAST:  {506: 507, 507: "CENTRAL", 508: 507},
-    NORTH: {504: 503, 505: "CENTRAL", 506: 507},
-    SOUTH: {508: 501, 501: "CENTRAL", 502: 501},
+    WEST:  {502: 503, 504: "CENTRAL", 501: 505},
+    EAST:  {506: 507, 508: "CENTRAL", 505: 501},
+    NORTH: {504: 505, 506: "CENTRAL", 503: 507},
+    SOUTH: {508: 501, 502: "CENTRAL", 507: 503},
 }
 
 CORNER_TO_NEXT_CENTER_BY_HEADING = {
     WEST: {
         502: {503},
-        504: {503},
+        501: {505},
     },
     EAST: {
         506: {507},
-        508: {507},
+        505: {501},
     },
     NORTH: {
-        504: {503},
-        506: {507},
+        504: {505},
+        503: {507},
     },
     SOUTH: {
         508: {501},
-        502: {501},
+        507: {503},
     },
 }
 # Valid helper centers for correction / sequence.
 # These are NOT final arrival points.
 # Final reached/pass-through is confirmed only by the central target tag.
+# Valid helper centers for correction / sequence.
+# These are NOT final arrival points.
+# Final reached/pass-through is confirmed only by the central target tag.
+# Valid helper centers for correction / sequence.
+# These are NOT final arrival points.
+# Final reached/pass-through is confirmed only by the central target tag.
 VALID_ENTRY_CENTERS_BY_HEADING = {
-    WEST: {503},
-    EAST: {507},
-    NORTH: {503, 505, 507},
-    SOUTH: {501},
+    WEST: {503, 504, 505},
+    EAST: {507, 508, 501},
+    NORTH: {505, 506, 507},
+    SOUTH: {501, 502, 503},
 }
 
 # Corner-only transition rule is heading-specific.
@@ -1361,8 +1367,6 @@ class AGVQtApp(QMainWindow):
             path=self.path,
             expected_tag=self.expected_next_tag,
         )
-
-
 
 
     # -------------------------
@@ -2349,12 +2353,19 @@ class AGVQtApp(QMainWindow):
                     )
                 return entry_tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
-            # Standalone fallback: helpers that are not valid target arrival remain
-            # old-cluster correction until a clean loss happens.
+            # Minimal leak fix:
+            # If old central is not visible, do NOT use arbitrary helper tags as
+            # old-cluster correction. This was the 13->12 drift case:
+            #   508 was valid EAST entry evidence,
+            #   501 was rejected,
+            #   but fallback still used 501 as old helper correction and sent
+            #   a strong wrong VEL.
+            #
+            # Old central correction is already handled above by old_central.
+            # Non-valid helper-only evidence should fall back to IMU hold.
             if any_cluster_visible_now(detections, self.travel_from_landmark):
                 self.cluster_lost_count = 0
-                tag = choose_best_cluster_tag(detections, self.travel_from_landmark)
-                return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
+                return None, None, ""
 
             self.cluster_lost_count += 1
 
@@ -2741,7 +2752,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: x_only_vision_helpers_correction active")
+        self.append_log("BUILD: x_only_user_confirmed_entry_sequence active")
 
         self.active_path = list(self.path)
         self.path_index = 1
