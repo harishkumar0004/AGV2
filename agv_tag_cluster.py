@@ -307,14 +307,24 @@ CORNER_HELPERS = {502, 504, 506, 508}
 #   EAST  approach: entry side 506/507/508, exit side 502/503/504
 #   NORTH approach: entry side 504/505/506, exit side 508/501/502
 #   SOUTH approach: entry side 508/501/502, exit side 504/505/506
+# These are not "only valid entry helpers".
+# They are mainly for logs and for rejecting the known EXIT side.
+#
+# The user corrected the logic:
+#   The sequence 502 -> 503 -> 504 is not itself the arrival logic.
+#   The middle helper is the side-center.
+#
+#   Valid side-pairs are:
+#       502+503 or 503+504 -> center 503
+#       508+501 or 501+502 -> center 501
+#       504+505 or 505+506 -> center 505
+#       506+507 or 507+508 -> center 507
+#
+# For a given movement direction, the side-center on the current tag exit side
+# is rejected. The other side-centers can be target entry centers.
 ENTRY_CENTER_BY_HEADING = {
-    # Tag numbers increase left; moving WEST means approaching the next tag
-    # through the 502/503/504 side.
     WEST: 503,
     EAST: 507,
-
-    # Tag rows increase north; moving NORTH means approaching the next tag
-    # through the 504/505/506 side.
     NORTH: 505,
     SOUTH: 501,
 }
@@ -325,6 +335,39 @@ EXIT_CENTER_BY_HEADING = {
     NORTH: 501,
     SOUTH: 505,
 }
+
+# For each movement heading, the side-center helper belonging to the exit side
+# of the current tag is rejected. The other three side centers are valid target
+# entry centers.
+#
+# Example when moving WEST:
+#   503 is entry center for pair 502+503 or 503+504
+#   501 is entry center for pair 508+501 or 501+502
+#   505 is entry center for pair 504+505 or 505+506
+#   507 is rejected because pair 506+507 or 507+508 is the exit side
+VALID_ENTRY_CENTERS_BY_HEADING = {
+    WEST: {503, 501, 505},
+    EAST: {507, 501, 505},
+    NORTH: {503, 507, 505},
+    SOUTH: {503, 507, 501},
+}
+
+# Corner-only transition rule.
+# If a corner is seen without a valid side-center pair, the next cross helper
+# beside that corner can be accepted as local arrival when it appears alone.
+#
+# This handles cases like:
+#   only 502 seen first -> next local center 501 can mark reached
+#   only 504 seen first -> next local center 505 can mark reached
+#
+# The direction gate below still rejects the known exit side.
+CORNER_TO_NEXT_SINGLE_CENTERS = {
+    502: {501, 503},
+    504: {503, 505},
+    506: {505, 507},
+    508: {501, 507},
+}
+
 
 HELPER_GROUP_BY_CENTER = {
     503: {502, 503, 504},
@@ -987,6 +1030,7 @@ class AGVQtApp(QMainWindow):
         self.expected_entry_helper_id = None
         self.expected_exit_helper_id = None
         self.segment_next_action = "UNKNOWN"
+        self.corner_single_arrival_candidates = set()
 
         self.filtered_correction = 0.0
 
@@ -1586,6 +1630,7 @@ class AGVQtApp(QMainWindow):
             self.segment_next_action = "STOP"
 
         self.all_helpers_cleared_once = False
+        self.corner_single_arrival_candidates = set()
 
         # Previous-local vs arrived-local protection:
         # Any helper IDs visible at the exact start of the new segment belong to
@@ -1601,7 +1646,7 @@ class AGVQtApp(QMainWindow):
 
         self.append_log(
             f"Direction rule {from_tag}->{to_tag}: heading={HEADING_LABELS.get(self.segment_heading, '---')} "
-            f"entryHelper={self.expected_entry_helper_id} "
+            f"validEntryCenters={sorted(self.valid_entry_centers_for_heading())} "
             f"exitHelper={self.expected_exit_helper_id} "
             f"nextAction={self.segment_next_action}"
         )
@@ -1714,6 +1759,7 @@ class AGVQtApp(QMainWindow):
         calibration target. Straight pass-through waypoints continue smoothly.
         """
         self.remember_local_arrival_helper(helper_id)
+        self.corner_single_arrival_candidates = set()
         self.local_arrival_landmark = int(landmark_id)
         self.local_arrival_helper_id = int(helper_id)
         self.local_arrival_good_count = 0
@@ -1774,12 +1820,11 @@ class AGVQtApp(QMainWindow):
 
     def update_previous_helper_blocks(self, detections):
         """
-        Remove a helper ID from previous_helper_block_ids only after that ID
-        disappears from the camera view.
+        Remove helper IDs from previous_helper_block_ids only after that exact
+        helper disappears from camera view.
 
-        Also records whether ALL helpers disappeared once. This is still useful
-        for diagnostics, but arrival is not allowed from the wrong helper side.
-        Direction decides which helper side can represent the new target.
+        Arrival is decided from side-pair CENTER helper, not from a sequence of
+        corner/center/corner helpers.
         """
         ids = visible_ids(detections)
         helper_ids_now = ids.intersection(HELPER_IDS)
@@ -1805,41 +1850,102 @@ class AGVQtApp(QMainWindow):
     def helper_is_previous_blocked(self, helper_id):
         return int(helper_id) in self.previous_helper_block_ids
 
-    def helper_matches_entry_side(self, helper_id):
+    def helper_is_exit_side(self, helper_id):
         return (
-            self.expected_entry_helper_id is not None
-            and int(helper_id) == int(self.expected_entry_helper_id)
+            self.expected_exit_helper_id is not None
+            and int(helper_id) == int(self.expected_exit_helper_id)
         )
+
+    def valid_entry_centers_for_heading(self):
+        if self.segment_heading is None:
+            return set()
+        return set(VALID_ENTRY_CENTERS_BY_HEADING.get(self.segment_heading, set()))
+
+    def update_corner_single_arrival_candidates(self, detections):
+        """
+        Track corner-only evidence.
+
+        If we see a corner helper without a side-pair, the next adjacent cross
+        helper may be a valid local-arrival single. This is not time-based or
+        frame-count based; it is a local-tag transition sequence.
+        """
+        ids = visible_ids(detections)
+        new_candidates = set()
+
+        for corner_id, centers in CORNER_TO_NEXT_SINGLE_CENTERS.items():
+            if corner_id not in ids:
+                continue
+
+            # Do not create a corner-only transition when a full side-pair is
+            # already visible; pair handling is stronger and happens first.
+            has_pair_with_corner = any(center in ids for center in centers)
+            if has_pair_with_corner:
+                continue
+
+            for center_id in centers:
+                if center_id in self.valid_entry_centers_for_heading():
+                    if not self.helper_is_exit_side(center_id):
+                        new_candidates.add(center_id)
+
+        if new_candidates:
+            before = set(self.corner_single_arrival_candidates)
+            self.corner_single_arrival_candidates.update(new_candidates)
+            added = self.corner_single_arrival_candidates.difference(before)
+            if added and time.time() - getattr(self, "_last_corner_candidate_log", 0.0) > 0.50:
+                self._last_corner_candidate_log = time.time()
+                self.append_log(
+                    "Corner-only evidence: allow next single local center(s) "
+                    + ", ".join(str(x) for x in sorted(added))
+                    + f" for target {self.travel_to_landmark}"
+                )
+
+    def single_helper_allowed_by_corner_sequence(self, helper_id):
+        helper_id = int(helper_id)
+
+        if helper_id not in self.corner_single_arrival_candidates:
+            return False, f"single_{helper_id}_has_no_corner_evidence"
+
+        if self.helper_is_previous_blocked(helper_id):
+            return False, f"single_{helper_id}_still_previous_blocked"
+
+        if self.helper_is_exit_side(helper_id):
+            return False, f"single_{helper_id}_is_exit_side"
+
+        if helper_id not in self.valid_entry_centers_for_heading():
+            return False, f"single_{helper_id}_not_valid_for_heading"
+
+        return True, f"corner_then_single_{helper_id}"
 
     def start_pair_helper_allowed(self, helper_id):
         """
         Direction-based false-positive eliminator.
 
-        A helper pair can mark the target reached only if its side-center helper
-        matches the expected ENTRY side for the current approach direction.
+        detect_local_arrival_helper() returns only the middle/center helper of a
+        valid side-pair:
+            502+503 or 503+504 -> 503
+            508+501 or 501+502 -> 501
+            504+505 or 505+506 -> 505
+            506+507 or 507+508 -> 507
 
-        Example for WEST movement, such as 1 -> 2 or 8 -> 9:
-          entry side = 502/503/504 -> center 503
-          exit side  = 506/507/508 -> center 507
-
-        Therefore if the robot reached a tag using 503 and then sees 507, 507 is
-        the exit side of the same tag, not the next tag.
+        For the current movement heading:
+          - reject the known exit-side center
+          - accept the other side-center pairs as possible target entry
+          - still block a helper if the exact same helper is visible from the
+            previous segment start and has not disappeared once
         """
         helper_id = int(helper_id)
 
-        if self.expected_entry_helper_id is None:
-            return False, "no_expected_entry_helper"
-
-        if helper_id != int(self.expected_entry_helper_id):
-            return (
-                False,
-                f"expected_entry_{self.expected_entry_helper_id}_got_{helper_id}"
-            )
-
         if self.helper_is_previous_blocked(helper_id):
-            return False, f"entry_{helper_id}_still_previous_blocked"
+            return False, f"helper_{helper_id}_still_previous_blocked"
 
-        return True, "direction_entry_match"
+        valid_centers = self.valid_entry_centers_for_heading()
+
+        if helper_id not in valid_centers:
+            if self.helper_is_exit_side(helper_id):
+                return False, f"exit_side_{helper_id}_for_heading_{HEADING_LABELS.get(self.segment_heading, '---')}"
+            return False, f"helper_{helper_id}_not_valid_for_heading_{HEADING_LABELS.get(self.segment_heading, '---')}"
+
+        return True, f"valid_entry_center_{helper_id}"
 
     def remember_local_arrival_helper(self, helper_id):
         self.last_arrival_helper_id = int(helper_id)
@@ -1877,6 +1983,7 @@ class AGVQtApp(QMainWindow):
           - single-helper early arrival
         """
         self.update_previous_helper_blocks(detections)
+        self.update_corner_single_arrival_candidates(detections)
 
         central_target = find_tag(detections, self.travel_to_landmark)
 
@@ -1941,16 +2048,14 @@ class AGVQtApp(QMainWindow):
                         self.append_log(
                             f"PAIR REJECTED BY DIRECTION: target={self.travel_to_landmark} "
                             f"helper={helper_id} group={helper_group_name(helper_id)} "
-                            f"expectedEntry={self.expected_entry_helper_id} "
+                            f"validEntryCenters={sorted(self.valid_entry_centers_for_heading())} "
                             f"exitSide={self.expected_exit_helper_id} "
                             f"reason={reason}. Correction only."
                         )
 
-                    # If it is the exit side of the current/previous tag, correct as old.
-                    # Otherwise use it for target correction but do not mark reached.
                     tag = find_tag(detections, helper_id)
                     if tag is not None:
-                        if self.expected_exit_helper_id is not None and int(helper_id) == int(self.expected_exit_helper_id):
+                        if self.helper_is_exit_side(helper_id):
                             return tag, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
                         return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
@@ -1963,7 +2068,9 @@ class AGVQtApp(QMainWindow):
                 self.append_log(
                     f"MISSION START PAIR ACCEPTED: target={self.travel_to_landmark} "
                     f"helper={helper_id} group={helper_group_name(helper_id)} "
-                    f"reason={reason} nextAction={self.segment_next_action} "
+                    f"validEntryCenters={sorted(self.valid_entry_centers_for_heading())} "
+                    f"reason={reason} exitSide={self.expected_exit_helper_id} "
+                    f"nextAction={self.segment_next_action} "
                     f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px."
                 )
                 self.start_local_arrival(self.travel_to_landmark, helper_id)
@@ -1973,12 +2080,30 @@ class AGVQtApp(QMainWindow):
             single_helper = detect_single_cross_helper(detections, self.travel_to_landmark)
 
             if single_helper is not None:
+                allowed_single, single_reason = self.single_helper_allowed_by_corner_sequence(single_helper)
+
+                if allowed_single:
+                    ready, center_y_error_px = self.local_helper_arrival_ready(
+                        detections,
+                        single_helper,
+                        "SINGLE"
+                    )
+
+                    self.append_log(
+                        f"SINGLE HELPER ACCEPTED AFTER CORNER: target={self.travel_to_landmark} "
+                        f"helper={single_helper} reason={single_reason} "
+                        f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px."
+                    )
+                    self.start_local_arrival(self.travel_to_landmark, single_helper)
+                    return None, None, ""
+
                 if time.time() - getattr(self, "_last_single_log", 0.0) > 0.90:
                     self._last_single_log = time.time()
                     self.append_log(
                         f"SINGLE HELPER CORRECTION ONLY: target={self.travel_to_landmark} "
-                        f"helper={single_helper} expectedEntry={self.expected_entry_helper_id} "
-                        f"exitSide={self.expected_exit_helper_id} phase=START_CLUSTER; not reached."
+                        f"helper={single_helper} exitSide={self.expected_exit_helper_id} "
+                        f"cornerCandidates={sorted(self.corner_single_arrival_candidates)} "
+                        f"reason={single_reason}; not reached."
                     )
 
                 tag = find_tag(detections, single_helper)
@@ -2026,7 +2151,7 @@ class AGVQtApp(QMainWindow):
                         self._last_pair_wait_log = time.time()
                         self.append_log(
                             f"SEARCH HELPER REJECTED BY DIRECTION: target={self.travel_to_landmark} "
-                            f"helper={helper_id} expectedEntry={self.expected_entry_helper_id} reason={reason}. "
+                            f"helper={helper_id} exitSide={self.expected_exit_helper_id} reason={reason}. "
                             "Correction only."
                         )
 
