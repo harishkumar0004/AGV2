@@ -362,10 +362,18 @@ VALID_ENTRY_CENTERS_BY_HEADING = {
 #
 # The direction gate below still rejects the known exit side.
 CORNER_TO_NEXT_SINGLE_CENTERS = {
-    502: {501, 503},
-    504: {503, 505},
-    506: {505, 507},
-    508: {501, 507},
+    # User-confirmed corner transition:
+    #   only 502 seen first -> next local center must be 501
+    #   only 504 seen first -> next local center must be 505
+    #
+    # Do NOT allow 502->503 or 504->503. That caused Tag 10 local 503
+    # to be accepted as Tag 15 after seeing 504.
+    502: {501},
+    504: {505},
+
+    # Symmetric corner transitions for the other two corners.
+    506: {505},
+    508: {501},
 }
 
 
@@ -1283,8 +1291,6 @@ class AGVQtApp(QMainWindow):
             expected_tag=self.expected_next_tag,
         )
 
-
-
     # -------------------------
     # Camera
     # -------------------------
@@ -1347,6 +1353,7 @@ class AGVQtApp(QMainWindow):
                 self.dock_tag_confirmed = True
                 self.waiting_for_manual_alignment = True
                 self.update_ui_state()
+
 
     # -------------------------
     # Serial
@@ -1899,7 +1906,7 @@ class AGVQtApp(QMainWindow):
             if added and time.time() - getattr(self, "_last_corner_candidate_log", 0.0) > 0.50:
                 self._last_corner_candidate_log = time.time()
                 self.append_log(
-                    "Corner-only evidence: allow next single local center(s) "
+                    "Corner-only evidence: only allow next local center(s) "
                     + ", ".join(str(x) for x in sorted(added))
                     + f" for target {self.travel_to_landmark}"
                 )
@@ -1920,6 +1927,30 @@ class AGVQtApp(QMainWindow):
             return False, f"single_{helper_id}_not_valid_for_heading"
 
         return True, f"corner_then_single_{helper_id}"
+
+    def pair_matches_corner_sequence(self, helper_id):
+        """
+        If a corner-only transition has already been observed, then the next
+        accepted center must match that corner's allowed next center.
+
+        This blocks the false case:
+            10 local 504 seen first,
+            then 10 local 503 appears,
+            old code accepted 503 as target 15.
+        With this rule, 504 allows only 505, so 503 is rejected.
+        """
+        helper_id = int(helper_id)
+
+        if not self.corner_single_arrival_candidates:
+            return True, "no_corner_sequence_active"
+
+        if helper_id in self.corner_single_arrival_candidates:
+            return True, f"pair_matches_corner_sequence_{helper_id}"
+
+        return False, (
+            "pair_does_not_match_corner_sequence_"
+            + ",".join(str(x) for x in sorted(self.corner_single_arrival_candidates))
+        )
 
     def start_pair_helper_allowed(self, helper_id):
         """
@@ -1942,6 +1973,10 @@ class AGVQtApp(QMainWindow):
 
         if self.helper_is_previous_blocked(helper_id):
             return False, f"helper_{helper_id}_still_previous_blocked"
+
+        corner_ok, corner_reason = self.pair_matches_corner_sequence(helper_id)
+        if not corner_ok:
+            return False, corner_reason
 
         valid_centers = self.valid_entry_centers_for_heading()
 
