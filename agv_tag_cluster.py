@@ -79,6 +79,14 @@ COLS = 5
 
 CELL_DISTANCE_M = 0.50
 
+# Fixed ESP32 tuning defaults.
+# These are kept as normal Python values so they cannot be deleted by Qt layout cleanup.
+DEFAULT_BASE_PPS = 6500
+DEFAULT_IMU_MAX_CORR = 350
+DEFAULT_IMU_KP = 70.0
+DEFAULT_ACCEL_PPS_PER_SEC = 7000
+DEFAULT_DECEL_PPS_PER_SEC = 9000
+
 NORTH = 0
 EAST = 1
 SOUTH = 2
@@ -1000,9 +1008,9 @@ class AGVQtApp(QMainWindow):
         tuning.addWidget(QLabel("DECEL"), 4, 0)
         tuning.addWidget(self.decel_spin, 4, 1)
         tuning.addWidget(self.apply_tuning_btn, 5, 0, 1, 2)
-        # Tuning widgets are kept for defaults, but the panel is hidden to save RPi4 screen space.
-        # Use apply_esp32_tuning() to send these defaults before calibration/mission.
-        tuning_group.setVisible(False)
+        # Tuning panel removed from visible UI. Defaults are sent from Python constants.
+        self.tuning_group = tuning_group
+        self.tuning_group.setVisible(False)
 
         dest_group = QGroupBox("Destination / A-Star Path")
         dest = QVBoxLayout(dest_group)
@@ -1199,10 +1207,17 @@ class AGVQtApp(QMainWindow):
         return False
 
     def apply_esp32_tuning(self):
-        self.send_esp32(f"SET_BASE {self.base_pps_spin.value()}")
-        self.send_esp32(f"SET_IMU_MAX {self.imu_max_spin.value()}")
-        self.send_esp32(f"SET_IMU_KP {self.imu_kp_spin.value():.1f}")
-        self.send_esp32(f"SET_RAMP {self.accel_spin.value()} {self.decel_spin.value()}")
+        """
+        Send fixed ESP32 tuning values.
+
+        Do not read hidden QSpinBox widgets here. In the compact UI those widgets
+        may be removed/garbage-collected, so reading them can crash with:
+        RuntimeError: wrapped C/C++ object of type QSpinBox has been deleted
+        """
+        self.send_esp32(f"SET_BASE {DEFAULT_BASE_PPS}")
+        self.send_esp32(f"SET_IMU_MAX {DEFAULT_IMU_MAX_CORR}")
+        self.send_esp32(f"SET_IMU_KP {DEFAULT_IMU_KP:.1f}")
+        self.send_esp32(f"SET_RAMP {DEFAULT_ACCEL_PPS_PER_SEC} {DEFAULT_DECEL_PPS_PER_SEC}")
 
     def send_velocity(self, left_pps, right_pps, force=False):
         now = time.time()
