@@ -386,33 +386,43 @@ ENTRY_CENTER_BY_HEADING_STRICT = {
 # Corner-only entry sequence:
 #   if the entry corner appears first, the next adjacent side-center is still
 #   valid target-side evidence.
+ENTRY_SEQUENCE_BY_HEADING = {
+    # entry/helper -> next helper or CENTRAL target.
+    #
+    # Helpers are correction/sequence evidence only.
+    # The landmark is reached only when the central target tag is visible.
+    WEST:  {502: 503, 503: "CENTRAL", 504: 503},
+    EAST:  {506: 507, 507: "CENTRAL", 508: 507},
+    NORTH: {504: 503, 505: "CENTRAL", 506: 507},
+    SOUTH: {508: 501, 501: "CENTRAL", 502: 501},
+}
+
 CORNER_TO_NEXT_CENTER_BY_HEADING = {
     WEST: {
-        502: {501},
-        504: {505},
+        502: {503},
+        504: {503},
     },
     EAST: {
-        506: {505},
-        508: {501},
+        506: {507},
+        508: {507},
     },
     NORTH: {
         504: {503},
         506: {507},
     },
     SOUTH: {
-        508: {507},
-        502: {503},
+        508: {501},
+        502: {501},
     },
 }
-
-# Valid pair/single centers for target-side arrival.
-# This includes the strict entry center plus the valid next side-centers from
-# the entry-corner sequence.
+# Valid helper centers for correction / sequence.
+# These are NOT final arrival points.
+# Final reached/pass-through is confirmed only by the central target tag.
 VALID_ENTRY_CENTERS_BY_HEADING = {
-    WEST: {503, 501, 505},
-    EAST: {507, 505, 501},
-    NORTH: {505, 503, 507},
-    SOUTH: {501, 507, 503},
+    WEST: {503},
+    EAST: {507},
+    NORTH: {503, 505, 507},
+    SOUTH: {501},
 }
 
 # Corner-only transition rule is heading-specific.
@@ -1335,6 +1345,7 @@ class AGVQtApp(QMainWindow):
         )
 
 
+
     # -------------------------
     # Camera
     # -------------------------
@@ -1946,6 +1957,18 @@ class AGVQtApp(QMainWindow):
             if corner_id not in ids:
                 continue
 
+            # Important pass-through protection:
+            # If this corner was visible at segment start, it belongs to the
+            # previous target cluster. Do not use it to create a corner->center
+            # sequence for the new target.
+            #
+            # Failure fixed:
+            #   5->10 accepted helper 504,
+            #   then 10->15 immediately used the same 504 to allow 503,
+            #   so the robot stopped at 10 instead of 15.
+            if self.helper_is_previous_blocked(corner_id):
+                continue
+
             for center_id in next_centers:
                 if center_id in valid_centers and not self.helper_is_exit_side(center_id):
                     # If the center is already visible with the corner, pair
@@ -2065,50 +2088,10 @@ class AGVQtApp(QMainWindow):
             tid = int(tag.tag_id)
             if tid not in allowed_helpers:
                 continue
-            if self.helper_is_exit_side(tid):
-                continue
 
-            dx = tag.center[0] - CX
-            dy = tag.center[1] - CY
-            dist = dx * dx + dy * dy
-
-            if dist < best_dist:
-                best_dist = dist
-                best_tag = tag
-
-        return best_tag
-
-    def entry_side_arrival_helper_visible(self, detections):
-        """
-        Entry-side single reached rule.
-
-        Once the old central tag is gone, any helper on the target entry side is
-        enough to consider the target cluster reached.
-
-        Examples:
-          NORTH target entry side: 504 / 505 / 506
-          EAST  target entry side: 506 / 507 / 508
-
-        Also allow valid corner-sequence centers:
-          NORTH: 504 -> 503, 506 -> 507
-          EAST : 506 -> 505, 508 -> 501
-
-        Still protect against previous-segment residue: if the same helper was
-        visible at segment start, it must disappear once before being accepted.
-        """
-        entry_helpers = set(ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set()))
-        sequence_centers = set(getattr(self, "corner_single_arrival_candidates", set()))
-        allowed_helpers = entry_helpers.union(sequence_centers)
-
-        best_tag = None
-        best_dist = 999999999.0
-
-        for tag in detections:
-            tid = int(tag.tag_id)
-
-            if tid not in allowed_helpers:
-                continue
-
+            # Do not even correct from a helper that belongs to the previous
+            # segment start. It must disappear once before it can be used for
+            # the new target.
             if self.helper_is_previous_blocked(tid):
                 continue
 
@@ -2124,6 +2107,27 @@ class AGVQtApp(QMainWindow):
                 best_tag = tag
 
         return best_tag
+
+    def entry_side_arrival_helper_visible(self, detections):
+        """
+        Helpers never directly confirm arrival in this build.
+
+        Entry helpers and sequence helpers are correction-only evidence.
+        The target is reached only when the central target tag is visible.
+        """
+        return None
+
+    def helper_sequence_note(self, helper_id):
+        seq = ENTRY_SEQUENCE_BY_HEADING.get(self.segment_heading, {})
+        nxt = seq.get(int(helper_id), None)
+
+        if nxt is None:
+            return "no_sequence"
+
+        if nxt == "CENTRAL":
+            return f"helper_{helper_id}_expect_central_tag_{self.travel_to_landmark}"
+
+        return f"helper_{helper_id}_expect_helper_{nxt}"
 
     def remember_local_arrival_helper(self, helper_id):
         self.last_arrival_helper_id = int(helper_id)
@@ -2210,25 +2214,9 @@ class AGVQtApp(QMainWindow):
                 self.cluster_lost_count = 0
                 return old_central, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
 
-            # Entry-side single reached rule.
-            # If any target entry-side helper is visible after old central is gone,
-            # the robot has reached the target cluster area.
-            #
-            # This prevents overshooting cases like 10->15 where 504 was already
-            # visible but the previous version only used it for weak correction and
-            # kept moving.
-            entry_arrival_tag = self.entry_side_arrival_helper_visible(detections)
-            if entry_arrival_tag is not None:
-                helper_id = int(entry_arrival_tag.tag_id)
-                self.append_log(
-                    f"ENTRY SIDE SINGLE ACCEPTED: target={self.travel_to_landmark} "
-                    f"helper={helper_id} heading={HEADING_LABELS.get(self.segment_heading, '---')} "
-                    f"entrySide={sorted(ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set()))} "
-                    f"sequenceCandidates={sorted(self.corner_single_arrival_candidates)}"
-                )
-                self.start_local_arrival(self.travel_to_landmark, helper_id)
-                return None, None, ""
-
+            # Helper arrival disabled:
+            # helpers are correction / sequence evidence only.
+            # The target is reached only when the central target tag is visible.
             # Valid side-pair is strong enough to mark target reached.
             helper_id, evidence_type = detect_local_arrival_helper(
                 detections,
@@ -2264,14 +2252,16 @@ class AGVQtApp(QMainWindow):
                 )
 
                 self.append_log(
-                    f"MISSION START PAIR ACCEPTED: target={self.travel_to_landmark} "
+                    f"HELPER PAIR CORRECTION ONLY: target={self.travel_to_landmark} "
                     f"helper={helper_id} group={helper_group_name(helper_id)} "
                     f"validEntryCenters={sorted(self.valid_entry_centers_for_heading())} "
-                    f"reason={reason} exitSide={self.expected_exit_helper_id} "
-                    f"nextAction={self.segment_next_action} "
-                    f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px."
+                    f"reason={reason} seq={self.helper_sequence_note(helper_id)} "
+                    f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px. "
+                    "Waiting for central tag."
                 )
-                self.start_local_arrival(self.travel_to_landmark, helper_id)
+                tag = find_tag(detections, helper_id)
+                if tag is not None:
+                    return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
                 return None, None, ""
 
             # Single cross helper while START_CLUSTER is only correction.
@@ -2288,11 +2278,15 @@ class AGVQtApp(QMainWindow):
                     )
 
                     self.append_log(
-                        f"SINGLE HELPER ACCEPTED AFTER CORNER: target={self.travel_to_landmark} "
+                        f"SINGLE HELPER CORRECTION ONLY AFTER CORNER: target={self.travel_to_landmark} "
                         f"helper={single_helper} reason={single_reason} "
-                        f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px."
+                        f"seq={self.helper_sequence_note(single_helper)} "
+                        f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px. "
+                        "Waiting for central tag."
                     )
-                    self.start_local_arrival(self.travel_to_landmark, single_helper)
+                    tag = find_tag(detections, single_helper)
+                    if tag is not None:
+                        return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
                     return None, None, ""
 
                 if time.time() - getattr(self, "_last_single_log", 0.0) > 0.90:
@@ -2318,7 +2312,9 @@ class AGVQtApp(QMainWindow):
                     self.append_log(
                         f"ENTRY SIDE TARGET CORRECTION: seg={self.travel_from_landmark}->{self.travel_to_landmark} "
                         f"heading={HEADING_LABELS.get(self.segment_heading, '---')} "
-                        f"seen={int(entry_tag.tag_id)} entrySide={sorted(ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set()))}"
+                        f"seen={int(entry_tag.tag_id)} "
+                        f"seq={self.helper_sequence_note(int(entry_tag.tag_id))} "
+                        f"entrySide={sorted(ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set()))}"
                     )
                 return entry_tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
@@ -2347,18 +2343,7 @@ class AGVQtApp(QMainWindow):
 
             allow_single = not self.calibrating_move_to_tag1
 
-            entry_arrival_tag = self.entry_side_arrival_helper_visible(detections)
-            if entry_arrival_tag is not None:
-                helper_id = int(entry_arrival_tag.tag_id)
-                self.append_log(
-                    f"SEARCH ENTRY SIDE SINGLE ACCEPTED: target={self.travel_to_landmark} "
-                    f"helper={helper_id} heading={HEADING_LABELS.get(self.segment_heading, '---')} "
-                    f"entrySide={sorted(ENTRY_HELPER_IDS_BY_HEADING.get(self.segment_heading, set()))} "
-                    f"sequenceCandidates={sorted(self.corner_single_arrival_candidates)}"
-                )
-                self.start_local_arrival(self.travel_to_landmark, helper_id)
-                return None, None, ""
-
+            # Helper arrival disabled in SEARCH_TARGET as well.
             helper_id, evidence_type = detect_local_arrival_helper(
                 detections,
                 self.travel_to_landmark,
@@ -2394,7 +2379,11 @@ class AGVQtApp(QMainWindow):
                     )
 
                 if ready:
-                    self.start_local_arrival(self.travel_to_landmark, helper_id)
+                    # Helper is only correction / sequence evidence.
+                    # Do not mark target reached until central target tag is visible.
+                    tag = find_tag(detections, helper_id)
+                    if tag is not None:
+                        return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
                     return None, None, ""
 
                 tag = find_tag(detections, helper_id)
@@ -2721,7 +2710,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: entry_side_single_reached_plus_stronger_correction active")
+        self.append_log("BUILD: helpers_correction_only_central_reached active")
 
         self.active_path = list(self.path)
         self.path_index = 1
