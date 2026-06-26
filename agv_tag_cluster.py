@@ -661,7 +661,7 @@ class TagGridWidget(QWidget):
         self.goal_tag = None
         self.path = []
         self.expected_tag = None
-        self.setMinimumSize(600, 360)
+        self.setMinimumSize(460, 255)
 
     def set_state(self, current_tag=None, goal_tag=None, path=None, expected_tag=None):
         self.current_tag = current_tag
@@ -759,7 +759,13 @@ class AGVQtApp(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("AGV Qt A-Star Closed Loop - Old Cluster Vision Behavior")
-        self.resize(1500, 930)
+        # Raspberry Pi 4 display friendly size.
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            self.resize(int(geo.width() * 0.96), int(geo.height() * 0.92))
+        else:
+            self.resize(1024, 700)
 
         # Calibration flags.
         self.calibration_started = False
@@ -796,7 +802,7 @@ class AGVQtApp(QMainWindow):
         self.turning_waiting = False
         self.pending_after_turn_segment = False
         self.turn_start_time = 0.0
-        self.turn_timeout_sec = 6.0
+        self.turn_timeout_sec = 20.0
 
         # Camera state.
         self.latest_detections = []
@@ -846,7 +852,7 @@ class AGVQtApp(QMainWindow):
         camera_layout = QVBoxLayout(camera_group)
         self.camera_label = QLabel("Camera not started")
         self.camera_label.setAlignment(Qt.AlignCenter)
-        self.camera_label.setMinimumSize(640, 360)
+        self.camera_label.setMinimumSize(460, 255)
         self.camera_label.setStyleSheet("background:#111;color:white;border:1px solid #555;")
         self.camera_status = QLabel("Camera status: idle")
         self.camera_status.setStyleSheet("font-weight:bold;")
@@ -974,7 +980,7 @@ class AGVQtApp(QMainWindow):
 
         self.path_text = QTextEdit()
         self.path_text.setReadOnly(True)
-        self.path_text.setMinimumHeight(100)
+        self.path_text.setMinimumHeight(70)
 
         dest.addWidget(QLabel("Select destination:"))
         dest.addWidget(self.destination_combo)
@@ -986,7 +992,7 @@ class AGVQtApp(QMainWindow):
         log_layout = QVBoxLayout(log_group)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMinimumHeight(180)
+        self.log.setMinimumHeight(110)
         log_layout.addWidget(self.log)
         right.addWidget(log_group, 1)
 
@@ -1406,9 +1412,8 @@ class AGVQtApp(QMainWindow):
             done = any("OK TURN_DONE" in line for line in lines)
             timeout = (time.time() - self.turn_start_time) > self.turn_timeout_sec
 
-            if done or timeout:
-                if timeout:
-                    self.append_log("Turn timeout. Continuing carefully.")
+            if done:
+                self.append_log("ESP32 reported OK TURN_DONE")
                 self.turning_waiting = False
                 self.route_state = "MOVE"
                 if self.path_index < len(self.active_path):
@@ -1416,6 +1421,19 @@ class AGVQtApp(QMainWindow):
                     self.start_segment(self.current_tag, next_tag)
                     self.lock_heading_go()
                 self.update_ui_state()
+
+            elif timeout:
+                # Do NOT continue movement on timeout.
+                # The previous version continued after timeout, which can make
+                # a slow 90 degree turn look like only 45 degrees before travel starts.
+                self.append_log("Turn timeout: stopping. ESP32 did not report OK TURN_DONE.")
+                self.turning_waiting = False
+                self.mission_running = False
+                self.route_state = "TURN_TIMEOUT"
+                self.expected_next_tag = None
+                self.stop_robot()
+                self.update_ui_state()
+
             return
 
         if self.route_state == "MOVE":
