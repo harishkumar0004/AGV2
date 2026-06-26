@@ -1493,6 +1493,7 @@ class AGVQtApp(QMainWindow):
                 self.update_ui_state()
 
 
+
     # -------------------------
     # Serial
     # -------------------------
@@ -1812,10 +1813,39 @@ class AGVQtApp(QMainWindow):
         self.corner_single_arrival_candidates = set()
 
         # Previous-local vs arrived-local protection:
-        # Any helper IDs visible at the exact start of the new segment belong to
-        # the previous landmark. Do not accept those IDs as arrival for the next
-        # landmark until they disappear once.
+        # Any helper IDs visible at the exact start of the new segment usually
+        # belong to the previous landmark. Do not accept those IDs as arrival for
+        # the next landmark until they disappear once.
         self.previous_helper_block_ids = visible_ids(self.latest_detections).intersection(HELPER_IDS)
+
+        # Straight pass-through correction fix:
+        # When two consecutive segments have the same heading, the strict entry
+        # center helper is expected to be the first useful target-side helper.
+        #
+        # Example EAST:
+        #   14->13 starts while 507 is already visible.
+        #   507 is the EAST entry-center helper, so blocking it makes the robot
+        #   ignore the correct early correction and then wait until 507 appears
+        #   again later.
+        #
+        # Therefore do not previous-block the strict entry center when continuing
+        # straight in the same heading. This is generic:
+        #   WEST  keeps 503 usable
+        #   EAST  keeps 507 usable
+        #   NORTH keeps 505 usable
+        #   SOUTH keeps 501 usable
+        if (
+            getattr(self, "last_arrival_heading", None) is not None
+            and self.segment_heading == self.last_arrival_heading
+            and self.segment_next_action in ("STRAIGHT", "STOP")
+        ):
+            strict_entry_center = ENTRY_CENTER_BY_HEADING_STRICT.get(self.segment_heading)
+            if strict_entry_center is not None and int(strict_entry_center) in self.previous_helper_block_ids:
+                self.previous_helper_block_ids.discard(int(strict_entry_center))
+                self.append_log(
+                    f"Straight continuation: not blocking entry-center helper {int(strict_entry_center)} "
+                    f"for heading={HEADING_LABELS.get(self.segment_heading, '---')}."
+                )
 
         if self.previous_helper_block_ids:
             self.append_log(
@@ -2678,6 +2708,7 @@ class AGVQtApp(QMainWindow):
 
         return None, None, ""
 
+
     def control_tick(self):
         # Read ESP32 output.
         lines = self.read_esp32_available()
@@ -2757,7 +2788,7 @@ class AGVQtApp(QMainWindow):
                 if now - getattr(self, "_last_keep_visual_on_reject_log", 0.0) > 1.0:
                     self._last_keep_visual_on_reject_log = now
                     self.append_log(
-                    "Rejected helper visible; keeping previous visual VEL instead of LOCK_HEADING_GO."
+                        "Rejected helper visible; keeping previous visual VEL instead of LOCK_HEADING_GO."
                     )
                 return
 
@@ -2995,7 +3026,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: generic_local_center_reached active")
+        self.append_log("BUILD: keep_visual_on_rejected_helper active")
 
         self.active_path = list(self.path)
         self.path_index = 1

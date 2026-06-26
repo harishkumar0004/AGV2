@@ -533,9 +533,20 @@ KP_X_STRONG_PPS_PER_M = 85000
 # This is the only X-sign source used by travel correction.
 X_SIGN_BY_HEADING = {
     NORTH: -1.0,
-    EAST: 1.0,
+    EAST: -1.0,
     SOUTH: -1.0,
     WEST: -1.0,
+}
+
+# EAST-only lateral authority.
+# The 15->14->13->12 log showed EAST drift compounding while other headings
+# behaved correctly. Keep the proven signs/gains for the other headings, but
+# make EAST pull back harder once the target-side helper/central tag is seen.
+X_GAIN_BY_HEADING = {
+    NORTH: 1.0,
+    EAST: 1.55,
+    SOUTH: 1.0,
+    WEST: 1.0,
 }
 
 # IMPORTANT:
@@ -1723,7 +1734,8 @@ class AGVQtApp(QMainWindow):
 
         yaw_corr = kp_yaw * yaw_for_control
         direction_x_sign = X_SIGN_BY_HEADING.get(getattr(self, "segment_heading", None), -1.0)
-        x_corr = kp_x * x_for_control * direction_x_sign
+        direction_x_gain = X_GAIN_BY_HEADING.get(getattr(self, "segment_heading", None), 1.0)
+        x_corr = kp_x * x_for_control * direction_x_sign * direction_x_gain
 
         if abs(x_for_control) > X_DEADBAND_M:
             if yaw_corr * x_corr < 0:
@@ -2779,6 +2791,7 @@ class AGVQtApp(QMainWindow):
                         f"phase={self.segment_phase} seen={seen_tag_id} grid=({helper_x_grid},{helper_y_grid}) "
                         f"yawErr={yaw_error:.2f} centerXM={center_x_m:.4f} level={error_level} "
                         f"xSign={X_SIGN_BY_HEADING.get(getattr(self, 'segment_heading', None), -1.0):.1f} "
+                        f"xGain={X_GAIN_BY_HEADING.get(getattr(self, 'segment_heading', None), 1.0):.2f} "
                         f"corr={correction} L={left} R={right}"
                     )
         elif self.route_state == "MOVE":
