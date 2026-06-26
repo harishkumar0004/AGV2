@@ -260,7 +260,7 @@ TARGET_HELPER_SEEN_FRAMES_REQUIRED = 1
 # No time-based arrival and no single-helper arrival.
 # A side-pair helper is accepted only when the estimated landmark center
 # is reasonably close to the camera center line.
-LOCAL_PAIR_CENTER_Y_OK_PX = 70
+LOCAL_PAIR_CENTER_Y_OK_PX = 9999
 LOCAL_SINGLE_CENTER_Y_OK_PX = 90
 # Minimum time after segment start before helpers are allowed to confirm target arrival.
 # Prevents immediately accepting old-cluster helpers at segment start.
@@ -1130,7 +1130,6 @@ class AGVQtApp(QMainWindow):
             expected_tag=self.expected_next_tag,
         )
 
-
     # -------------------------
     # Camera
     # -------------------------
@@ -1523,58 +1522,72 @@ class AGVQtApp(QMainWindow):
 
     def local_helper_arrival_ready(self, detections, helper_id, evidence_type):
         """
-        Geometry-only helper confirmation.
+        Helper confirmation.
 
-        No timing and no repeated-frame requirement.
+        PAIR:
+          accepted immediately when helper-arrival is allowed.
+          This matches the standalone local-arrival decision better. The previous
+          centerY gate blocked Tag 3 even though the side-pair was visible.
+
+        SINGLE:
+          accepted only in SEARCH_TARGET for normal mission and only when the
+          estimated cluster center is reasonably near the camera center line.
         """
         helper = find_tag(detections, helper_id)
         if helper is None:
             return False, None
 
         pose = get_landmark_pose_from_cluster_tag(helper, self.travel_to_landmark)
-        if pose is None:
-            return False, None
+        center_y_error_px = None
 
-        (
-            raw_yaw,
-            yaw_error,
-            center_x_m,
-            center_y_error_px,
-            seen_tag_id,
-            helper_x_grid,
-            helper_y_grid,
-        ) = pose
+        if pose is not None:
+            (
+                raw_yaw,
+                yaw_error,
+                center_x_m,
+                center_y_error_px,
+                seen_tag_id,
+                helper_x_grid,
+                helper_y_grid,
+            ) = pose
 
         if evidence_type == "PAIR":
-            limit = LOCAL_PAIR_CENTER_Y_OK_PX
-        else:
-            limit = LOCAL_SINGLE_CENTER_Y_OK_PX
+            return True, center_y_error_px
 
-        ready = abs(center_y_error_px) <= limit
+        if center_y_error_px is None:
+            return False, None
+
+        ready = abs(center_y_error_px) <= LOCAL_SINGLE_CENTER_Y_OK_PX
         return ready, center_y_error_px
 
     def choose_move_correction(self, detections):
         """
-        Final helper rule set.
+        Improved previous-local vs arrived-local logic.
+
+        Core idea:
+          - A valid side-pair is strong arrival evidence.
+          - A single cross helper is useful, but ambiguous.
 
         0 -> 1 calibration:
-          - START_CLUSTER: helpers are OLD Tag 0, never reached.
-          - SEARCH_TARGET: central target OR side-pair only.
-          - single helper is not accepted.
+          START_CLUSTER:
+            helpers 501-508 are OLD Tag 0, never reached.
+          SEARCH_TARGET:
+            central target or valid side-pair can stop.
+            single helper is not accepted.
 
         Normal A* mission:
-          - START_CLUSTER:
-              central target can stop.
-              side-pair near center can stop.
-              single 501/503/505/507 is correction only, not reached.
-          - SEARCH_TARGET:
-              central target can stop.
-              side-pair can stop.
-              single 501/503/505/507 can stop when centered.
+          START_CLUSTER:
+            exact old central visible -> keep old correction.
+            valid side-pair -> target reached.
+            single 501/503/505/507 -> correction only, not reached.
+          SEARCH_TARGET:
+            valid side-pair -> target reached.
+            single 501/503/505/507 -> target reached only if centered.
 
         Removed:
           - time-based helper arrival
           - frame-count helper arrival
+          - pair centerY gate
           - single-helper early arrival
         """
         central_target = find_tag(detections, self.travel_to_landmark)
@@ -1592,11 +1605,13 @@ class AGVQtApp(QMainWindow):
         self.target_central_seen_count = 0
         old_central = find_tag(detections, self.travel_from_landmark)
 
+        # ------------------------------------------------------------
+        # START_CLUSTER
+        # ------------------------------------------------------------
         if self.segment_phase == "START_CLUSTER":
 
-            # Calibration/docking 0 -> 1:
-            # strict standalone behavior. Do not accept helper arrival while
-            # Tag 0 helpers are still around.
+            # Docking/calibration 0 -> 1 protection:
+            # no helper arrival while Tag 0 cluster is still present.
             if self.calibrating_move_to_tag1:
                 if any_cluster_visible_now(detections, self.travel_from_landmark):
                     self.cluster_lost_count = 0
@@ -1614,41 +1629,35 @@ class AGVQtApp(QMainWindow):
 
                 return None, None, ""
 
-            # Normal mission: if exact old central is still visible, do not accept helpers.
+            # Normal mission: if exact old central is visible, it is definitely
+            # still the previous landmark. Do not accept helpers yet.
             if old_central is not None:
                 self.cluster_lost_count = 0
                 return old_central, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
 
-            # Normal mission START_CLUSTER:
-            # side-pair can stop, but single cross helper is correction only.
+            # Valid side-pair is strong enough to mark target reached.
             helper_id, evidence_type = detect_local_arrival_helper(
                 detections,
                 self.travel_to_landmark,
                 allow_single_cross=False
             )
 
-            if helper_id is not None:
+            if helper_id is not None and evidence_type == "PAIR":
                 ready, center_y_error_px = self.local_helper_arrival_ready(
                     detections,
                     helper_id,
                     evidence_type
                 )
 
-                if time.time() - getattr(self, "_last_pair_log", 0.0) > 0.60:
-                    self._last_pair_log = time.time()
-                    self.append_log(
-                        f"MISSION START {evidence_type} target={self.travel_to_landmark} helper={helper_id} "
-                        f"centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px ready={ready}"
-                    )
+                self.append_log(
+                    f"MISSION START PAIR ACCEPTED: target={self.travel_to_landmark} "
+                    f"helper={helper_id} centerY={center_y_error_px if center_y_error_px is not None else 999:.1f}px. "
+                    "Pair is strong arrival evidence."
+                )
+                self.start_local_arrival(self.travel_to_landmark, helper_id)
+                return None, None, ""
 
-                if ready:
-                    self.start_local_arrival(self.travel_to_landmark, helper_id)
-                    return None, None, ""
-
-                tag = find_tag(detections, helper_id)
-                if tag is not None:
-                    return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
-
+            # Single cross helper while START_CLUSTER is only correction.
             single_helper = detect_single_cross_helper(detections, self.travel_to_landmark)
 
             if single_helper is not None:
@@ -1663,8 +1672,8 @@ class AGVQtApp(QMainWindow):
                 if tag is not None:
                     return tag, self.travel_to_landmark, f"TAG{self.travel_to_landmark}"
 
-            # Standalone fallback: if helpers are visible but not safe target arrival,
-            # keep correcting relative to old cluster.
+            # Standalone fallback: helpers that are not valid target arrival remain
+            # old-cluster correction until a clean loss happens.
             if any_cluster_visible_now(detections, self.travel_from_landmark):
                 self.cluster_lost_count = 0
                 tag = choose_best_cluster_tag(detections, self.travel_from_landmark)
@@ -1676,11 +1685,14 @@ class AGVQtApp(QMainWindow):
                 self.segment_phase = "SEARCH_TARGET"
                 self.append_log(
                     f"Fully left Tag {self.travel_from_landmark}. "
-                    f"Now target {self.travel_to_landmark} can use central, side-pair, or single cross helper."
+                    f"Now target {self.travel_to_landmark} can use central, side-pair, or centered single cross helper."
                 )
 
             return None, None, ""
 
+        # ------------------------------------------------------------
+        # SEARCH_TARGET
+        # ------------------------------------------------------------
         if self.segment_phase == "SEARCH_TARGET":
 
             allow_single = not self.calibrating_move_to_tag1
