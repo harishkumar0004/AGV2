@@ -484,7 +484,7 @@ TARGET_HELPER_SEEN_FRAMES_REQUIRED = 1
 # No time-based arrival and no single-helper arrival.
 # A side-pair helper is accepted only when the estimated landmark center
 # is reasonably close to the camera center line.
-LOCAL_PAIR_CENTER_Y_OK_PX = 90
+LOCAL_PAIR_CENTER_Y_OK_PX = 9999
 LOCAL_SINGLE_CENTER_Y_OK_PX = 90
 # Minimum time after segment start before helpers are allowed to confirm target arrival.
 # Prevents immediately accepting old-cluster helpers at segment start.
@@ -523,6 +523,22 @@ KP_YAW_STRONG_PPS_PER_DEG = 42
 KP_X_STRONG_PPS_PER_M = 85000
 
 X_SIGN = -1.0
+
+# Direction-specific X correction sign.
+#
+# Do not change the entry table for this.
+# The table decides which helper is valid.
+# This only decides which wheel direction is used for lateral X correction.
+#
+# Current finding:
+#   EAST travel correction is physically opposite, so flip EAST only.
+# Keep NORTH/SOUTH/WEST same as the previous stable build.
+X_SIGN_BY_HEADING = {
+    NORTH: -1.0,
+    EAST: 1.0,
+    SOUTH: -1.0,
+    WEST: -1.0,
+}
 
 # IMPORTANT:
 # During grid travel the ESP32/IMU owns heading hold.
@@ -1478,6 +1494,8 @@ class AGVQtApp(QMainWindow):
                 self.waiting_for_manual_alignment = True
                 self.update_ui_state()
 
+
+
     # -------------------------
     # Serial
     # -------------------------
@@ -1694,7 +1712,8 @@ class AGVQtApp(QMainWindow):
             x_for_control = 0.0
 
         yaw_corr = kp_yaw * yaw_for_control
-        x_corr = kp_x * x_for_control * X_SIGN
+        direction_x_sign = X_SIGN_BY_HEADING.get(getattr(self, "segment_heading", None), X_SIGN)
+        x_corr = kp_x * x_for_control * direction_x_sign
 
         if abs(x_for_control) > X_DEADBAND_M:
             if yaw_corr * x_corr < 0:
@@ -1963,11 +1982,7 @@ class AGVQtApp(QMainWindow):
             ) = pose
 
         if evidence_type == "PAIR":
-            if center_y_error_px is None:
-                return False, None
-            ready = abs(center_y_error_px) <= LOCAL_PAIR_CENTER_Y_OK_PX
-            return ready, center_y_error_px
-            
+            return True, center_y_error_px
 
         if center_y_error_px is None:
             return False, None
@@ -2698,6 +2713,7 @@ class AGVQtApp(QMainWindow):
                         f"{label} CORR seg={self.travel_from_landmark}->{self.travel_to_landmark} "
                         f"phase={self.segment_phase} seen={seen_tag_id} grid=({helper_x_grid},{helper_y_grid}) "
                         f"yawErr={yaw_error:.2f} centerXM={center_x_m:.4f} level={error_level} "
+                        f"xSign={X_SIGN_BY_HEADING.get(getattr(self, 'segment_heading', None), X_SIGN):.1f} "
                         f"corr={correction} L={left} R={right}"
                     )
         elif self.route_state == "MOVE":
@@ -2935,7 +2951,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: exact_table_local_center_reached active")
+        self.append_log("BUILD: exact_table_local_center_east_xsign active")
 
         self.active_path = list(self.path)
         self.path_index = 1
