@@ -510,6 +510,21 @@ KP_X_STRONG_PPS_PER_M = 85000
 
 X_SIGN = -1.0
 
+# Direction-specific X correction sign.
+#
+# Use this when one travel direction corrects in the opposite physical direction.
+# Your latest log shows NORTH travel 5->10 / 10->15:
+#   seen=504 centerXM=-0.0093 corr=+225 L=3625 R=4075
+# and you reported the correction is physically wrong.
+#
+# Therefore flip only NORTH first. Do not change EAST/WEST/SOUTH yet.
+X_SIGN_BY_HEADING = {
+    NORTH: 1.0,
+    EAST: -1.0,
+    SOUTH: -1.0,
+    WEST: -1.0,
+}
+
 # IMPORTANT:
 # During grid travel the ESP32/IMU owns heading hold.
 # Camera correction should mainly correct lateral X offset.
@@ -1680,7 +1695,8 @@ class AGVQtApp(QMainWindow):
             x_for_control = 0.0
 
         yaw_corr = kp_yaw * yaw_for_control
-        x_corr = kp_x * x_for_control * X_SIGN
+        direction_x_sign = X_SIGN_BY_HEADING.get(getattr(self, "segment_heading", None), X_SIGN)
+        x_corr = kp_x * x_for_control * direction_x_sign
 
         if abs(x_for_control) > X_DEADBAND_M:
             if yaw_corr * x_corr < 0:
@@ -2629,6 +2645,7 @@ class AGVQtApp(QMainWindow):
                         f"{label} CORR seg={self.travel_from_landmark}->{self.travel_to_landmark} "
                         f"phase={self.segment_phase} seen={seen_tag_id} grid=({helper_x_grid},{helper_y_grid}) "
                         f"yawErr={yaw_error:.2f} centerXM={center_x_m:.4f} level={error_level} "
+                        f"xSign={X_SIGN_BY_HEADING.get(getattr(self, 'segment_heading', None), X_SIGN):.1f} "
                         f"corr={correction} L={left} R={right}"
                     )
         elif self.route_state == "MOVE":
@@ -2866,7 +2883,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: exact_table_expected_helper_logic active")
+        self.append_log("BUILD: exact_table_north_xsign_flip active")
 
         self.active_path = list(self.path)
         self.path_index = 1
