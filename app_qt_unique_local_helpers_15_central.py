@@ -286,11 +286,25 @@ FB_SIGN = 1
 TAG_SIZE_M = 0.010
 CLUSTER_SPACING_M = 0.015
 
-# New printed unique local tags report about 180 deg for the same
-# physical orientation as the previous tags. Use 180 deg as the
-# visual yaw reference so the logged yawErr/correction becomes 0 deg
-# when the robot/tag orientation is physically correct.
+# New printed unique local tags report about 180 deg when the robot is
+# facing the tag in the NORTH/docking orientation. After the robot turns,
+# the same fixed floor tag appears rotated in the camera by the segment
+# heading. Therefore yaw reference must be heading-specific, not one
+# global value.
 EXPECTED_TAG_YAW_DEG = 180.0
+
+EXPECTED_TAG_YAW_BY_HEADING = {
+    NORTH: 180.0,
+    WEST: -90.0,
+    EAST: 90.0,
+    SOUTH: 0.0,
+}
+
+
+def expected_tag_yaw_for_heading(heading):
+    if heading in EXPECTED_TAG_YAW_BY_HEADING:
+        return EXPECTED_TAG_YAW_BY_HEADING[heading]
+    return EXPECTED_TAG_YAW_DEG
 
 # =====================================================
 # UNIQUE LOCAL HELPER TAGS
@@ -552,10 +566,10 @@ LOCAL_NUDGE_CENTER_Y_OK_PX = 30
 LOCAL_NUDGE_GOOD_FRAMES_REQUIRED = 3
 LOCAL_NUDGE_TIMEOUT_SEC = 5.0
 
-# Accept local helper tags as arrival evidence where enabled; EAST mirrors WEST and uses them as correction-only.
+# Local helper tags are correction evidence only; central tag confirms reached/pass-through.
 LOCAL_HELPER_SEEN_FRAMES_REQUIRED = 1
 
-# Local-center reached rule from ENTRY_SEQUENCE_BY_HEADING.
+# Local-center helpers are correction-only in the unique helper layout.
 #
 # Integer VALUES in the table are local center helpers and may confirm reached
 # after their entry helper created them as candidates.
@@ -567,7 +581,7 @@ LOCAL_HELPER_SEEN_FRAMES_REQUIRED = 1
 #   506 -> 505       # 505 can confirm reached after 506
 #   507 -> CENTRAL   # 507 cannot confirm reached by itself
 #   508 -> 501       # 501 can confirm reached after 508
-ACCEPT_EXPECTED_LOCAL_CENTER_AS_REACHED = True
+ACCEPT_EXPECTED_LOCAL_CENTER_AS_REACHED = False
 
 # Extra gate for expected local-center reached.
 # Example EAST 508 -> 501:
@@ -888,15 +902,18 @@ def get_helper_grid_offset(tag_id, central_tag_id):
     return LOCAL_HELPER_GRID_OFFSET.get(pos)
 
 
-def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
+def get_landmark_pose_from_cluster_tag(tag, central_tag_id, expected_yaw_deg=None):
     grid_offset = get_helper_grid_offset(tag.tag_id, central_tag_id)
     if grid_offset is None:
         return None
 
     helper_x_grid, helper_y_grid = grid_offset
 
+    if expected_yaw_deg is None:
+        expected_yaw_deg = EXPECTED_TAG_YAW_DEG
+
     raw_yaw = compute_yaw_deg(tag)
-    yaw_error = normalize_angle(raw_yaw - EXPECTED_TAG_YAW_DEG)
+    yaw_error = normalize_angle(raw_yaw - expected_yaw_deg)
 
     helper_x_m = compute_lateral_x_m(tag)
     center_x_m = helper_x_m - (helper_x_grid * CLUSTER_SPACING_M)
@@ -917,9 +934,12 @@ def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
     )
 
 
-def get_visible_tag_pose(tag):
+def get_visible_tag_pose(tag, expected_yaw_deg=None):
+    if expected_yaw_deg is None:
+        expected_yaw_deg = EXPECTED_TAG_YAW_DEG
+
     raw_yaw = compute_yaw_deg(tag)
-    yaw_error = normalize_angle(raw_yaw - EXPECTED_TAG_YAW_DEG)
+    yaw_error = normalize_angle(raw_yaw - expected_yaw_deg)
     visible_x_error_px = float(tag.center[0] - CX)
     visible_y_error_px = float(tag.center[1] - CY)
     return raw_yaw, yaw_error, visible_x_error_px, visible_y_error_px, tag.tag_id
@@ -2112,7 +2132,11 @@ class AGVQtApp(QMainWindow):
         if helper is None:
             return False, None
 
-        pose = get_landmark_pose_from_cluster_tag(helper, self.travel_to_landmark)
+        pose = get_landmark_pose_from_cluster_tag(
+            helper,
+            self.travel_to_landmark,
+            expected_tag_yaw_for_heading(self.segment_heading),
+        )
         center_y_error_px = None
 
         if pose is not None:
@@ -2461,36 +2485,20 @@ class AGVQtApp(QMainWindow):
 
     def helper_can_confirm_reached_now(self, helper_id, center_y_error_px=None):
         """
-        Reached/pass-through decision.
+        Helpers are correction-only in the unique local-helper layout.
 
-        Generic rule for every heading:
-          - A helper that maps to "CENTRAL" is correction-only.
-            Example EAST: 507 -> CENTRAL. 507 guides toward the target tag,
-            but does not confirm reached by itself.
-          - An integer VALUE helper from ENTRY_SEQUENCE_BY_HEADING can confirm
-            reached only after its entry corner created it as a candidate.
-            Example EAST: 508 -> 501. 501 can confirm reached only after 508.
-          - Even then, it must be near the camera center line.
+        The latest log showed early pass-through at Tag 2:
+            helper 112 created candidate 113,
+            helper 113 was accepted as reached,
+            segment changed to 2->3 before the robot was physically centered
+            on Tag 2.
 
-        This keeps the table as the single source of direction logic and does
-        not use separate EAST parameters.
+        With unique helper IDs there is no need to use helper-only reached
+        confirmation. The central target tag is the clean reached/pass-through
+        signal. Helpers still steer/correct toward the target.
         """
-        helper_id = int(helper_id)
+        return False
 
-        if not ACCEPT_EXPECTED_LOCAL_CENTER_AS_REACHED:
-            return False
-
-        # Only integer VALUE helpers that were created by a valid entry corner
-        # may confirm reached. Direct "CENTRAL" helpers such as EAST 507 or
-        # WEST 503 remain correction-only unless the actual central tag appears.
-        if helper_id not in set(getattr(self, "corner_single_arrival_candidates", set())):
-            return False
-
-        if center_y_error_px is None:
-            return False
-
-        gate = globals().get("EXPECTED_LOCAL_CENTER_REACHED_Y_OK_PX", LOCAL_PAIR_CENTER_Y_OK_PX)
-        return abs(center_y_error_px) <= gate
 
     def remember_local_arrival_helper(self, helper_id):
         self.last_arrival_helper_id = int(helper_id)
@@ -2876,7 +2884,11 @@ class AGVQtApp(QMainWindow):
         tag, landmark_id, label = self.choose_move_correction(detections)
 
         if tag is not None and self.route_state == "MOVE":
-            pose = get_landmark_pose_from_cluster_tag(tag, landmark_id)
+            pose = get_landmark_pose_from_cluster_tag(
+                tag,
+                landmark_id,
+                expected_tag_yaw_for_heading(self.segment_heading),
+            )
 
             if pose is not None:
                 (
@@ -2964,7 +2976,10 @@ class AGVQtApp(QMainWindow):
             self.handle_landmark_arrival(self.local_arrival_landmark)
             return
 
-        raw_yaw, yaw_error, visible_x_error_px, visible_y_error_px, seen_tag_id = get_visible_tag_pose(helper)
+        raw_yaw, yaw_error, visible_x_error_px, visible_y_error_px, seen_tag_id = get_visible_tag_pose(
+            helper,
+            expected_tag_yaw_for_heading(self.segment_heading),
+        )
 
         if abs(visible_y_error_px) <= LOCAL_NUDGE_CENTER_Y_OK_PX:
             self.local_arrival_good_count += 1
@@ -3178,7 +3193,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: unique_local_helpers_15_with_dock_yaw180ref active")
+        self.append_log("BUILD: unique_local_helpers_15_central_reached_only active")
 
         self.active_path = list(self.path)
         self.path_index = 1
