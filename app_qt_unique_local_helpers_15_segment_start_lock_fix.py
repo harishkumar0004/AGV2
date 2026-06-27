@@ -1901,7 +1901,21 @@ class AGVQtApp(QMainWindow):
         self.target_helper_seen_count = 0
         self.target_central_seen_count = 0
         self.filtered_correction = 0.0
-        self.last_drive_mode = "IMU"
+
+        # Important:
+        # A new segment must be allowed to send LOCK_HEADING_GO.
+        # Do NOT pre-mark the drive mode as IMU here.
+        #
+        # Previous bug:
+        #   start_segment() set last_drive_mode = "IMU"
+        #   then old central Tag 1 was visible,
+        #   choose_move_correction() returned no visual target,
+        #   process_move_state() called lock_heading_go(),
+        #   but lock_heading_go() returned early because it thought IMU was already active.
+        #
+        # Result in log:
+        #   repeated RUN mode=0, L=0/R=0 while mission state was MOVE.
+        self.last_drive_mode = "SEGMENT_START"
 
         self.segment_heading = heading_between_tags(
             self.travel_from_landmark,
@@ -2601,6 +2615,9 @@ class AGVQtApp(QMainWindow):
                         f"Old central Tag {self.travel_from_landmark} still visible; "
                         "using IMU hold, not visual correction from old tag."
                     )
+                # Let process_move_state() enter the no-visual-target fallback.
+                # Since last_drive_mode is SEGMENT_START/STOP/VISION, that fallback
+                # will send LOCK_HEADING_GO and the robot will continue moving forward.
                 return None, None, ""
 
             # Helper arrival disabled:
@@ -3211,7 +3228,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: unique_local_helpers_15_target_only_correction active")
+        self.append_log("BUILD: unique_local_helpers_15_segment_start_lock_fix active")
 
         self.active_path = list(self.path)
         self.path_index = 1
