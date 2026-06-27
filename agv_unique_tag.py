@@ -286,25 +286,11 @@ FB_SIGN = 1
 TAG_SIZE_M = 0.010
 CLUSTER_SPACING_M = 0.015
 
-# New printed unique local tags report about 180 deg when the robot is
-# facing the tag in the NORTH/docking orientation. After the robot turns,
-# the same fixed floor tag appears rotated in the camera by the segment
-# heading. Therefore yaw reference must be heading-specific, not one
-# global value.
+# New printed unique local tags report about 180 deg for the same
+# physical orientation as the previous tags. Use 180 deg as the
+# visual yaw reference so the logged yawErr/correction becomes 0 deg
+# when the robot/tag orientation is physically correct.
 EXPECTED_TAG_YAW_DEG = 180.0
-
-EXPECTED_TAG_YAW_BY_HEADING = {
-    NORTH: 180.0,
-    WEST: -90.0,
-    EAST: 90.0,
-    SOUTH: 0.0,
-}
-
-
-def expected_tag_yaw_for_heading(heading):
-    if heading in EXPECTED_TAG_YAW_BY_HEADING:
-        return EXPECTED_TAG_YAW_BY_HEADING[heading]
-    return EXPECTED_TAG_YAW_DEG
 
 # =====================================================
 # UNIQUE LOCAL HELPER TAGS
@@ -902,18 +888,15 @@ def get_helper_grid_offset(tag_id, central_tag_id):
     return LOCAL_HELPER_GRID_OFFSET.get(pos)
 
 
-def get_landmark_pose_from_cluster_tag(tag, central_tag_id, expected_yaw_deg=None):
+def get_landmark_pose_from_cluster_tag(tag, central_tag_id):
     grid_offset = get_helper_grid_offset(tag.tag_id, central_tag_id)
     if grid_offset is None:
         return None
 
     helper_x_grid, helper_y_grid = grid_offset
 
-    if expected_yaw_deg is None:
-        expected_yaw_deg = EXPECTED_TAG_YAW_DEG
-
     raw_yaw = compute_yaw_deg(tag)
-    yaw_error = normalize_angle(raw_yaw - expected_yaw_deg)
+    yaw_error = normalize_angle(raw_yaw - EXPECTED_TAG_YAW_DEG)
 
     helper_x_m = compute_lateral_x_m(tag)
     center_x_m = helper_x_m - (helper_x_grid * CLUSTER_SPACING_M)
@@ -934,12 +917,9 @@ def get_landmark_pose_from_cluster_tag(tag, central_tag_id, expected_yaw_deg=Non
     )
 
 
-def get_visible_tag_pose(tag, expected_yaw_deg=None):
-    if expected_yaw_deg is None:
-        expected_yaw_deg = EXPECTED_TAG_YAW_DEG
-
+def get_visible_tag_pose(tag):
     raw_yaw = compute_yaw_deg(tag)
-    yaw_error = normalize_angle(raw_yaw - expected_yaw_deg)
+    yaw_error = normalize_angle(raw_yaw - EXPECTED_TAG_YAW_DEG)
     visible_x_error_px = float(tag.center[0] - CX)
     visible_y_error_px = float(tag.center[1] - CY)
     return raw_yaw, yaw_error, visible_x_error_px, visible_y_error_px, tag.tag_id
@@ -1330,6 +1310,7 @@ class AGVQtApp(QMainWindow):
         self.control_timer.start(60)
 
         QTimer.singleShot(300, self.start_camera_feedback)
+
 
 
     # -------------------------
@@ -2133,11 +2114,7 @@ class AGVQtApp(QMainWindow):
         if helper is None:
             return False, None
 
-        pose = get_landmark_pose_from_cluster_tag(
-            helper,
-            self.travel_to_landmark,
-            expected_tag_yaw_for_heading(self.segment_heading),
-        )
+        pose = get_landmark_pose_from_cluster_tag(helper, self.travel_to_landmark)
         center_y_error_px = None
 
         if pose is not None:
@@ -2522,6 +2499,7 @@ class AGVQtApp(QMainWindow):
         self.last_arrival_heading = self.segment_heading
 
 
+
     def choose_move_correction(self, detections):
         """
         Improved previous-local vs arrived-local logic.
@@ -2901,11 +2879,7 @@ class AGVQtApp(QMainWindow):
         tag, landmark_id, label = self.choose_move_correction(detections)
 
         if tag is not None and self.route_state == "MOVE":
-            pose = get_landmark_pose_from_cluster_tag(
-                tag,
-                landmark_id,
-                expected_tag_yaw_for_heading(self.segment_heading),
-            )
+            pose = get_landmark_pose_from_cluster_tag(tag, landmark_id)
 
             if pose is not None:
                 (
@@ -2993,10 +2967,7 @@ class AGVQtApp(QMainWindow):
             self.handle_landmark_arrival(self.local_arrival_landmark)
             return
 
-        raw_yaw, yaw_error, visible_x_error_px, visible_y_error_px, seen_tag_id = get_visible_tag_pose(
-            helper,
-            expected_tag_yaw_for_heading(self.segment_heading),
-        )
+        raw_yaw, yaw_error, visible_x_error_px, visible_y_error_px, seen_tag_id = get_visible_tag_pose(helper)
 
         if abs(visible_y_error_px) <= LOCAL_NUDGE_CENTER_Y_OK_PX:
             self.local_arrival_good_count += 1
@@ -3210,7 +3181,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: unique_local_helpers_15_heading_yaw_ref active")
+        self.append_log("BUILD: unique_local_helpers_15_with_dock_yaw180ref active")
 
         self.active_path = list(self.path)
         self.path_index = 1
