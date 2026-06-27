@@ -286,7 +286,11 @@ FB_SIGN = 1
 TAG_SIZE_M = 0.010
 CLUSTER_SPACING_M = 0.015
 
-EXPECTED_TAG_YAW_DEG = 0.0
+# New printed unique local tags report about 180 deg for the same
+# physical orientation as the previous tags. Use 180 deg as the
+# visual yaw reference so the logged yawErr/correction becomes 0 deg
+# when the robot/tag orientation is physically correct.
+EXPECTED_TAG_YAW_DEG = 180.0
 
 # =====================================================
 # UNIQUE LOCAL HELPER TAGS
@@ -2180,7 +2184,6 @@ class AGVQtApp(QMainWindow):
         )
 
 
-
     def update_corner_single_arrival_candidates(self, detections):
         """
         Track direction-aware corner -> next-side-center sequence for the
@@ -2494,6 +2497,7 @@ class AGVQtApp(QMainWindow):
     def remember_local_arrival_helper(self, helper_id):
         self.last_arrival_helper_id = int(helper_id)
         self.last_arrival_heading = self.segment_heading
+
 
 
     def choose_move_correction(self, detections):
@@ -3177,7 +3181,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: unique_local_helpers_15_with_dock active")
+        self.append_log("BUILD: unique_local_helpers_15_with_dock_yaw180ref active")
 
         self.active_path = list(self.path)
         self.path_index = 1
