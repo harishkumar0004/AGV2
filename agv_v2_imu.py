@@ -3015,6 +3015,7 @@ class AGVQtApp(QMainWindow):
         except Exception:
             pass
 
+
         event.accept()
 
 
