@@ -1900,6 +1900,8 @@ class AGVQtApp(QMainWindow):
         self.cluster_lost_count = 0
         self.target_helper_seen_count = 0
         self.target_central_seen_count = 0
+        self.filtered_correction = 0.0
+        self.last_drive_mode = "IMU"
 
         self.segment_heading = heading_between_tags(
             self.travel_from_landmark,
@@ -2579,11 +2581,27 @@ class AGVQtApp(QMainWindow):
 
                 return None, None, ""
 
-            # Normal mission: if exact old central is visible, it is definitely
-            # still the previous landmark. Do not accept helpers yet.
+            # Normal mission:
+            # If the previous central tag is still visible, do NOT correct from it.
+            # The latest drift log showed this exact failure:
+            #   1->2 started, old Tag 1 was still visible,
+            #   visual correction used Tag 1 centerXM,
+            #   the robot curved away before target Tag 2 helpers arrived.
+            #
+            # With unique local helper IDs, travel correction should be target-owned:
+            #   - target central tag
+            #   - target helper tags
+            # Previous central is only proof that we have not fully left the old tag.
+            # Keep IMU heading hold until target-owned evidence appears.
             if old_central is not None:
                 self.cluster_lost_count = 0
-                return old_central, self.travel_from_landmark, f"TAG{self.travel_from_landmark}"
+                if time.time() - getattr(self, "_last_old_central_imu_log", 0.0) > 0.80:
+                    self._last_old_central_imu_log = time.time()
+                    self.append_log(
+                        f"Old central Tag {self.travel_from_landmark} still visible; "
+                        "using IMU hold, not visual correction from old tag."
+                    )
+                return None, None, ""
 
             # Helper arrival disabled:
             # helpers are correction / sequence evidence only.
@@ -3193,7 +3211,7 @@ class AGVQtApp(QMainWindow):
                 return
             self.apply_esp32_tuning()
 
-        self.append_log("BUILD: unique_local_helpers_15_central_reached_only active")
+        self.append_log("BUILD: unique_local_helpers_15_target_only_correction active")
 
         self.active_path = list(self.path)
         self.path_index = 1
